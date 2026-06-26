@@ -1,0 +1,24 @@
+[package]
+name = "kowitodb-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kowitodb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+sha2.workspace = true
+
+# Tantivy for full-text search
+[dependencies.tantivy]
+version = "0.22"
+features = ["mmap", "lz4-compression"]
