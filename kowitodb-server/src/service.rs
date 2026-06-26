@@ -1,18 +1,22 @@
+use std::sync::Arc;
+use std::time::Instant;
+
 use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::db::KowitoDBEngine;
+use crate::metrics::MetricsCollector;
 use crate::proto;
 use crate::proto::kowito_db_server::KowitoDb;
 
-/// gRPC service wrapping the KowitoDB engine.
 pub struct KowitoDBService {
     engine: KowitoDBEngine,
+    metrics: Arc<MetricsCollector>,
 }
 
 impl KowitoDBService {
-    pub fn new(engine: KowitoDBEngine) -> Self {
-        Self { engine }
+    pub fn new(engine: KowitoDBEngine, metrics: Arc<MetricsCollector>) -> Self {
+        Self { engine, metrics }
     }
 }
 
@@ -45,14 +49,17 @@ impl KowitoDb for KowitoDBService {
             obj.importance = req.importance.clamp(0.0, 1.0);
         }
 
-        let id = self
-            .engine
-            .insert(obj)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        info!("Insert request completed: {}", id);
-        Ok(Response::new(proto::InsertResponse { id: id.to_string() }))
+        match self.engine.insert(obj).await {
+            Ok(id) => {
+                self.metrics.record_insert();
+                info!("Insert: {}", id);
+                Ok(Response::new(proto::InsertResponse { id: id.to_string() }))
+            }
+            Err(e) => {
+                self.metrics.record_error();
+                Err(Status::internal(e.to_string()))
+            }
+        }
     }
 
     async fn get(
@@ -63,11 +70,10 @@ impl KowitoDb for KowitoDBService {
         let id =
             uuid::Uuid::parse_str(&req.id).map_err(|_| Status::invalid_argument("Invalid UUID"))?;
 
-        let obj = self
-            .engine
-            .get(id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let obj = self.engine.get(id).await.map_err(|e| {
+            self.metrics.record_error();
+            Status::internal(e.to_string())
+        })?;
 
         Ok(Response::new(match obj {
             Some(o) => proto::GetResponse {
@@ -111,11 +117,10 @@ impl KowitoDb for KowitoDBService {
         let id =
             uuid::Uuid::parse_str(&req.id).map_err(|_| Status::invalid_argument("Invalid UUID"))?;
 
-        let existed = self
-            .engine
-            .delete(id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let existed = self.engine.delete(id).await.map_err(|e| {
+            self.metrics.record_error();
+            Status::internal(e.to_string())
+        })?;
 
         Ok(Response::new(proto::DeleteResponse { existed }))
     }
@@ -127,11 +132,16 @@ impl KowitoDb for KowitoDBService {
         let req = request.into_inner();
         let max_results = req.top_k.max(1).min(100) as usize;
 
+        let start = Instant::now();
         let response = self
             .engine
             .ask(&req.query, max_results)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                self.metrics.record_error();
+                Status::internal(e.to_string())
+            })?;
+        self.metrics.record_ask(start.elapsed());
 
         let results: Vec<proto::SearchResult> = response
             .results
@@ -144,16 +154,13 @@ impl KowitoDb for KowitoDBService {
             })
             .collect();
 
-        let total = results.len() as i32;
-
         Ok(Response::new(proto::SearchResponse {
+            total_found: results.len() as i32,
             results,
             plan_explanation: response.plan_explanation,
-            total_found: total,
         }))
     }
 
-    /// The core AI API: `ai.ask(question)`
     async fn ask(
         &self,
         request: Request<proto::AskRequest>,
@@ -163,11 +170,16 @@ impl KowitoDb for KowitoDBService {
 
         info!("ai.ask(): \"{}\"", req.question);
 
+        let start = Instant::now();
         let response = self
             .engine
             .ask(&req.question, max_results)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                self.metrics.record_error();
+                Status::internal(e.to_string())
+            })?;
+        self.metrics.record_ask(start.elapsed());
 
         Ok(Response::new(proto::AskResponse {
             results: response.results,
@@ -176,7 +188,6 @@ impl KowitoDb for KowitoDBService {
         }))
     }
 
-    /// The `ai.remember()` API: simplified insert with auto-embedding.
     async fn remember(
         &self,
         request: Request<proto::RememberRequest>,
@@ -193,12 +204,12 @@ impl KowitoDb for KowitoDBService {
         obj.keywords = req.keywords;
         obj.importance = req.importance.clamp(0.0, 1.0);
 
-        let id = self
-            .engine
-            .insert(obj)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let id = self.engine.insert(obj).await.map_err(|e| {
+            self.metrics.record_error();
+            Status::internal(e.to_string())
+        })?;
 
+        self.metrics.record_remember();
         info!("ai.remember(): stored {}", id);
         Ok(Response::new(proto::RememberResponse {
             id: id.to_string(),
@@ -209,16 +220,17 @@ impl KowitoDb for KowitoDBService {
         &self,
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
-        let stats = self
-            .engine
-            .stats()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let stats = self.engine.stats().await.map_err(|e| {
+            self.metrics.record_error();
+            Status::internal(e.to_string())
+        })?;
+
+        let snapshot = self.metrics.snapshot();
 
         Ok(Response::new(proto::StatsResponse {
             total_objects: stats.total_objects,
             vector_count: stats.vector_count,
-            index_size_bytes: stats.index_size_bytes,
+            index_size_bytes: stats.index_size_bytes + snapshot.ask_count,
         }))
     }
 }
