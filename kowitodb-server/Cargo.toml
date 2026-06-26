@@ -23,6 +23,7 @@ tracing.workspace = true
 bytes.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
+dashmap.workspace = true
 
 [build-dependencies]
 tonic-build = "0.12"

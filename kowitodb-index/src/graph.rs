@@ -107,7 +107,7 @@ impl GraphIndex {
         self.reverse.read().get(&id).cloned().unwrap_or_default()
     }
 
-    /// BFS traversal starting from one or more seed nodes.
+    /// BFS traversal starting from one or more seed nodes, following forward edges.
     ///
     /// Returns all reachable object IDs within `max_depth` hops, including
     /// the seeds themselves.
@@ -186,6 +186,86 @@ impl GraphIndex {
         relation_filter: Option<&str>,
     ) -> Vec<(ObjectId, f32)> {
         let bfs_results = self.bfs_traverse(seeds, max_depth, relation_filter);
+        bfs_results
+            .into_iter()
+            .map(|(id, depth)| {
+                let score = 1.0 / (1.0 + depth as f32);
+                (id, score)
+            })
+            .collect()
+    }
+
+    /// Bidirectional BFS: follows both forward and reverse edges.
+    ///
+    /// This is the right traversal for entity queries like
+    /// "who invested in X?" or "what does X reference?"
+    pub fn bidirectional_traverse(
+        &self,
+        seeds: &[ObjectId],
+        max_depth: usize,
+        relation_filter: Option<&str>,
+    ) -> Vec<(ObjectId, usize)> {
+        let forward_results = self.bfs_traverse(seeds, max_depth, relation_filter);
+
+        // Also traverse reverse edges (incoming)
+        let mut results = forward_results.clone();
+        let visited: HashMap<ObjectId, usize> =
+            forward_results.iter().map(|(id, d)| (*id, *d)).collect();
+        let mut queue: VecDeque<(ObjectId, usize)> = forward_results
+            .into_iter()
+            .filter(|(_, d)| *d < max_depth)
+            .collect();
+
+        let reverse = self.reverse.read();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+
+            if let Some(incoming) = reverse.get(&current) {
+                for (rel_type, source_id) in incoming {
+                    if let Some(filter) = relation_filter {
+                        if rel_type != filter {
+                            continue;
+                        }
+                    }
+
+                    let next_depth = depth + 1;
+                    if let Some(&existing) = visited.get(source_id) {
+                        if next_depth < existing {
+                            if let Some((_, d)) =
+                                results.iter_mut().find(|(id, _)| *id == *source_id)
+                            {
+                                *d = next_depth;
+                            }
+                            queue.push_back((*source_id, next_depth));
+                        }
+                    } else {
+                        results.push((*source_id, next_depth));
+                        queue.push_back((*source_id, next_depth));
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Graph bidirectional: {} seeds, found {} nodes",
+            seeds.len(),
+            results.len()
+        );
+
+        results
+    }
+
+    /// Scored bidirectional traversal.
+    pub fn scored_bidirectional_traverse(
+        &self,
+        seeds: &[ObjectId],
+        max_depth: usize,
+        relation_filter: Option<&str>,
+    ) -> Vec<(ObjectId, f32)> {
+        let bfs_results = self.bidirectional_traverse(seeds, max_depth, relation_filter);
         bfs_results
             .into_iter()
             .map(|(id, depth)| {

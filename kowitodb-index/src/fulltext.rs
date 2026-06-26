@@ -55,7 +55,7 @@ impl FullTextIndex {
 
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(|e| KowitoError::Index(e.to_string()))?;
 
@@ -158,8 +158,14 @@ impl FullTextIndex {
     pub fn commit(&self) -> Result<()> {
         let mut writer_guard = self.writer.write();
         if let Some(writer) = writer_guard.as_mut() {
-            let _ = writer.commit();
+            writer
+                .commit()
+                .map_err(|e| KowitoError::Index(e.to_string()))?;
         }
+        // Force reader to pick up the commit
+        self.reader
+            .reload()
+            .map_err(|e| KowitoError::Index(e.to_string()))?;
         Ok(())
     }
 }

@@ -144,11 +144,15 @@ impl IntentAnalyzer {
             return Intent::CodeSearch;
         }
         if lower.contains("company")
+            || lower.contains("companies")
             || lower.contains("startup")
             || lower.contains("funding")
             || lower.contains("raised")
             || lower.contains("founder")
             || lower.contains("investor")
+            || lower.contains("invested")
+            || lower.contains("enterprise")
+            || lower.contains("customer")
         {
             return Intent::EntitySearch;
         }

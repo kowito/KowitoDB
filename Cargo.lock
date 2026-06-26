@@ -1254,6 +1254,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "dashmap",
  "kowitodb-core",
  "kowitodb-index",
  "kowitodb-planner",

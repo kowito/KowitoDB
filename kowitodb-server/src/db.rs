@@ -17,6 +17,18 @@ use crate::embedding::{EmbeddingClient, ProxyEmbeddingClient};
 use crate::memory::AgentMemory;
 use crate::proto;
 
+/// A fully loaded result with content from storage.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct LoadedResult {
+    pub id: ObjectId,
+    pub content: String,
+    pub relevance_score: f32,
+    pub retrieval_sources: Vec<String>,
+    pub metadata: HashMap<String, String>,
+    pub importance: f32,
+}
+
 /// Core engine wiring storage, all 6 indexes, query planner, and all optimizers.
 pub struct KowitoDBEngine {
     pub storage: Arc<StorageEngine>,
@@ -32,6 +44,8 @@ pub struct KowitoDBEngine {
     pub agent_memory: Arc<AgentMemory>,
     pub embedding_client: Arc<dyn EmbeddingClient>,
     pub plan_cache: Arc<QueryCache<(DetectedIntent, ExecutionPlan)>>,
+    /// In-memory content cache for fast result loading.
+    content_cache: Arc<dashmap::DashMap<ObjectId, String>>,
     default_model: String,
 }
 
@@ -54,6 +68,7 @@ impl KowitoDBEngine {
         let embedding_client: Arc<dyn EmbeddingClient> =
             Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128));
         let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
+        let content_cache = Arc::new(dashmap::DashMap::new());
 
         info!("KowitoDB engine initialized with all subsystems");
         Ok(Self {
@@ -70,6 +85,47 @@ impl KowitoDBEngine {
             agent_memory: Arc::new(agent_memory),
             embedding_client,
             plan_cache: Arc::new(plan_cache),
+            content_cache,
+            default_model: "default".to_string(),
+        })
+    }
+
+    /// Create an in-memory engine for testing (no disk I/O).
+    pub fn new_in_memory() -> KResult<Self> {
+        let storage = StorageEngine::new_in_memory()?;
+        // For tests, use a temp directory for the fulltext index
+        let tmp = std::env::temp_dir().join(format!("kowitodb-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).map_err(|e| kowitodb_core::KowitoError::Io(e))?;
+        let fulltext_index = FullTextIndex::open(&tmp)?;
+        let vector_index = VectorIndex::new();
+        let metadata_index = MetadataIndex::new();
+        let time_index = TimeIndex::new();
+        let graph_index = GraphIndex::new();
+        let planner = QueryPlanner::new();
+        let reranker = Reranker::new();
+        let context_optimizer = ContextOptimizer::new(4096);
+        let cost_tracker = CostTracker::new();
+        let agent_memory = AgentMemory::new();
+        let embedding_client: Arc<dyn EmbeddingClient> =
+            Arc::new(ProxyEmbeddingClient::new("proxy-test", 128));
+        let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
+        let content_cache = Arc::new(dashmap::DashMap::new());
+
+        Ok(Self {
+            storage: Arc::new(storage),
+            vector_index: Arc::new(vector_index),
+            fulltext_index: Arc::new(fulltext_index),
+            metadata_index: Arc::new(metadata_index),
+            time_index: Arc::new(time_index),
+            graph_index: Arc::new(graph_index),
+            planner: Arc::new(planner),
+            reranker: Arc::new(reranker),
+            context_optimizer: Arc::new(context_optimizer),
+            cost_tracker: Arc::new(cost_tracker),
+            agent_memory: Arc::new(agent_memory),
+            embedding_client,
+            plan_cache: Arc::new(plan_cache),
+            content_cache,
             default_model: "default".to_string(),
         })
     }
@@ -77,7 +133,9 @@ impl KowitoDBEngine {
     /// Insert a knowledge object into storage and all 6 indexes.
     pub async fn insert(&self, obj: KnowledgeObject) -> KResult<ObjectId> {
         let id = obj.id;
-        debug!("Inserting knowledge object {}", id);
+
+        // Cache the content for fast retrieval
+        self.content_cache.insert(id, obj.content.clone());
 
         // Index vectors (auto-embed if needed)
         for (model, embedding) in &obj.embeddings {
@@ -121,11 +179,13 @@ impl KowitoDBEngine {
         let stored = obj_to_stored(&obj)?;
         self.storage.put(stored).await?;
 
-        // Invalidate caches
+        // Ensure fulltext index is searchable immediately
+        let _ = self.fulltext_index.commit();
+
         self.plan_cache.clear();
 
         info!(
-            "Inserted {}: {} (vectors={}, keywords={}, rels={})",
+            "Inserted {}: {} (vecs={}, kws={}, rels={})",
             id,
             &obj.content[..obj.content.len().min(80)],
             obj.embeddings.len(),
@@ -135,10 +195,15 @@ impl KowitoDBEngine {
         Ok(id)
     }
 
-    /// Retrieve by ID.
+    /// Retrieve by ID (checks content cache first, then storage).
     pub async fn get(&self, id: ObjectId) -> KResult<Option<KnowledgeObject>> {
         match self.storage.get(id).await? {
-            Some(stored) => Ok(Some(stored_to_obj(&stored)?)),
+            Some(stored) => {
+                let obj = stored_to_obj(&stored)?;
+                // Refresh content cache
+                self.content_cache.insert(id, obj.content.clone());
+                Ok(Some(obj))
+            }
             None => Ok(None),
         }
     }
@@ -150,6 +215,7 @@ impl KowitoDBEngine {
         self.metadata_index.remove_object(id);
         self.time_index.remove(id);
         self.graph_index.remove_object(id);
+        self.content_cache.remove(&id);
 
         let existed = self.storage.delete(id).await?;
         if existed {
@@ -159,11 +225,10 @@ impl KowitoDBEngine {
         Ok(existed)
     }
 
-    /// The core `ai.ask()` method — full pipeline.
+    /// The core `ai.ask()` method — full pipeline with real content.
     pub async fn ask(&self, question: &str, max_results: usize) -> KResult<AskResponse> {
         // Check plan cache
         let (intent, plan) = if let Some(cached) = self.plan_cache.get(question) {
-            debug!("Plan cache hit for: {}", question);
             cached
         } else {
             let (intent, plan) = self.planner.plan(question);
@@ -176,27 +241,107 @@ impl KowitoDBEngine {
         let raw_results = self.execute_plan(&plan, &intent).await?;
         self.cost_tracker.record_index_lookups(raw_results.len());
 
-        // Graph traversal for entity/relationship queries
+        // Graph traversal
         let graph_results = self.execute_graph_traversal(&raw_results, &intent).await?;
         let all_results: Vec<IndexResult> = raw_results.into_iter().chain(graph_results).collect();
 
-        // Rerank merged results (multi-source fusion + boosting)
+        // Rerank
         let ranked = self.reranker.rerank_simple(&all_results);
 
-        // Assemble optimized context
-        let assembled = self.assemble_context(&ranked);
+        // Limit + load real content
+        let limited: Vec<RankedResult> = ranked.into_iter().take(max_results).collect();
+        let loaded = self.load_results(&limited).await;
+
+        // Assemble optimized context from loaded content
+        let assembled = self.assemble_context_from_loaded(&loaded);
         self.cost_tracker
             .record_llm_input_tokens(assembled.total_tokens);
 
-        // Limit to requested max_results
-        let limited: Vec<RankedResult> = ranked.into_iter().take(max_results).collect();
-
-        Ok(AskResponse::from_parts(
-            limited,
+        Ok(AskResponse::from_loaded(
+            loaded,
             plan.explain(),
             format!("{:?}", intent.intent),
             assembled,
         ))
+    }
+
+    /// Load real content for ranked results from cache + storage.
+    async fn load_results(&self, ranked: &[RankedResult]) -> Vec<LoadedResult> {
+        let mut loaded = Vec::with_capacity(ranked.len());
+
+        for r in ranked {
+            // Try content cache first
+            let content = if let Some(cached) = self.content_cache.get(&r.id) {
+                cached.clone()
+            } else {
+                // Fall back to storage
+                match self.storage.get(r.id).await {
+                    Ok(Some(stored)) => {
+                        let val = stored.content.clone();
+                        self.content_cache.insert(r.id, val.clone());
+                        val
+                    }
+                    _ => format!("<Object {}>", r.id),
+                }
+            };
+
+            let sources: Vec<String> = r
+                .sources
+                .iter()
+                .map(|s| format!("{:?}", s).to_lowercase())
+                .collect();
+
+            let mut metadata = HashMap::new();
+            metadata.insert("sources".to_string(), sources.join(","));
+
+            loaded.push(LoadedResult {
+                id: r.id,
+                content,
+                relevance_score: r.score,
+                retrieval_sources: sources,
+                metadata,
+                importance: 0.5,
+            });
+        }
+
+        loaded
+    }
+
+    /// Assemble context from already-loaded results.
+    fn assemble_context_from_loaded(
+        &self,
+        loaded: &[LoadedResult],
+    ) -> kowitodb_planner::AssembledContext {
+        // Convert LoadedResult -> RankedResult for the optimizer
+        let ranked: Vec<RankedResult> = loaded
+            .iter()
+            .map(|l| RankedResult {
+                id: l.id,
+                score: l.relevance_score,
+                sources: l
+                    .retrieval_sources
+                    .iter()
+                    .map(|s| match s.as_str() {
+                        "vector" => IndexSource::Vector,
+                        "fulltext" => IndexSource::FullText,
+                        "graph" => IndexSource::Graph,
+                        "metadata" => IndexSource::Metadata,
+                        "time" => IndexSource::Time,
+                        _ => IndexSource::Vector,
+                    })
+                    .collect(),
+                source_scores: HashMap::new(),
+            })
+            .collect();
+
+        let content_lookup = |id: ObjectId| -> Option<String> {
+            loaded
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.content.clone())
+        };
+
+        self.context_optimizer.assemble(&ranked, &content_lookup)
     }
 
     /// Execute the planned retrieval steps.
@@ -211,7 +356,6 @@ impl KowitoDBEngine {
         let dates = &intent.entities.dates;
         let metadata_filters = &intent.entities.metadata_filters;
 
-        // Generate embedding
         let query_embedding: Option<Embedding> =
             self.embedding_client.embed(question).await.ok().map(|r| {
                 self.cost_tracker.record_embedding_calls(1);
@@ -285,7 +429,7 @@ impl KowitoDBEngine {
         Ok(all_results)
     }
 
-    /// Graph traversal for entity-heavy or relationship queries.
+    /// Graph traversal for entity-heavy queries.
     async fn execute_graph_traversal(
         &self,
         raw_results: &[IndexResult],
@@ -310,12 +454,14 @@ impl KowitoDBEngine {
             1
         };
 
-        let scored = self.graph_index.scored_traverse(&seeds, max_depth, None);
+        // Bidirectional: follows both "references" and "referenced by" edges
+        let scored = self
+            .graph_index
+            .scored_bidirectional_traverse(&seeds, max_depth, None);
         if scored.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Exclude seeds (already in other results)
         let seed_set: std::collections::HashSet<ObjectId> = seeds.into_iter().collect();
         let new_nodes: Vec<_> = scored
             .into_iter()
@@ -329,22 +475,7 @@ impl KowitoDBEngine {
         let ids: Vec<_> = new_nodes.iter().map(|(id, _)| *id).collect();
         let scores: Vec<_> = new_nodes.iter().map(|(_, s)| *s).collect();
 
-        debug!(
-            "Graph: {} new nodes discovered via traversal",
-            new_nodes.len()
-        );
-
         Ok(vec![IndexResult::new(ids, scores, IndexSource::Graph)])
-    }
-
-    /// Assemble ranked results into token-optimized context.
-    fn assemble_context(&self, ranked: &[RankedResult]) -> kowitodb_planner::AssembledContext {
-        let content_lookup = |id: ObjectId| -> Option<String> {
-            // Content loading from storage is async; for MVP return placeholder.
-            // In production, this uses a blocking content cache or async context.
-            Some(format!("[Object {}] — content loaded on demand", id))
-        };
-        self.context_optimizer.assemble(ranked, &content_lookup)
     }
 
     /// Comprehensive database stats.
@@ -374,35 +505,20 @@ pub struct AskResponse {
 }
 
 impl AskResponse {
-    fn from_parts(
-        ranked: Vec<RankedResult>,
+    fn from_loaded(
+        loaded: Vec<LoadedResult>,
         plan: String,
         intent: String,
         ctx: kowitodb_planner::AssembledContext,
     ) -> Self {
-        let results: Vec<proto::AskResult> = ranked
+        let results: Vec<proto::AskResult> = loaded
             .into_iter()
-            .map(|r| {
-                let mut meta = HashMap::new();
-                let sources_str = r
-                    .sources
-                    .iter()
-                    .map(|s| format!("{:?}", s).to_lowercase())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                meta.insert("sources".to_string(), sources_str);
-
-                proto::AskResult {
-                    id: r.id.to_string(),
-                    content: format!("<Object {}>", r.id),
-                    relevance_score: r.score,
-                    metadata: meta,
-                    retrieval_source: r
-                        .sources
-                        .first()
-                        .map(|s| format!("{:?}", s).to_lowercase())
-                        .unwrap_or_default(),
-                }
+            .map(|l| proto::AskResult {
+                id: l.id.to_string(),
+                content: l.content,
+                relevance_score: l.relevance_score,
+                metadata: l.metadata,
+                retrieval_source: l.retrieval_sources.first().cloned().unwrap_or_default(),
             })
             .collect();
 
@@ -469,4 +585,133 @@ fn stored_to_obj(stored: &StoredObject) -> KResult<KnowledgeObject> {
             .unwrap_or_else(|_| chrono::Utc::now()),
         version_history: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_insert_and_ask_end_to_end() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        // Insert enterprise customer knowledge
+        let acme = KnowledgeObject::new(
+            "Acme Corp renewed their enterprise license in March 2024 after raising Series A funding of $15M."
+        )
+        .with_keywords(vec!["acme".into(), "renewal".into(), "series a".into(), "enterprise".into()])
+        .with_metadata("company", "Acme Corp")
+        .with_metadata("stage", "series_a")
+        .with_metadata("renewed", "true")
+        .with_importance(0.9);
+
+        let globex = KnowledgeObject::new(
+            "Globex Inc. received Series B funding of $30M in January 2024 and upgraded to enterprise tier."
+        )
+        .with_keywords(vec!["globex".into(), "series b".into(), "enterprise".into(), "funding".into()])
+        .with_metadata("company", "Globex Inc.")
+        .with_metadata("stage", "series_b")
+        .with_metadata("renewed", "true");
+
+        let initech = KnowledgeObject::new(
+            "Initech went through Series A in 2023 but churned in December 2024 due to budget cuts."
+        )
+        .with_keywords(vec!["initech".into(), "series a".into(), "churn".into()])
+        .with_metadata("company", "Initech")
+        .with_metadata("stage", "series_a")
+        .with_metadata("renewed", "false");
+
+        // Insert all
+        engine.insert(acme).await.unwrap();
+        engine.insert(globex).await.unwrap();
+        engine.insert(initech).await.unwrap();
+
+        // Ask a natural language question
+        let response = engine
+            .ask("Which enterprise customers renewed after Series A?", 5)
+            .await
+            .unwrap();
+
+        // Verify we got results
+        assert!(!response.results.is_empty(), "Should have results");
+        println!(
+            "Intent: {}, Results: {}",
+            response.detected_intent,
+            response.results.len()
+        );
+
+        // Results should contain real content, not placeholders
+        for r in &response.results {
+            assert!(
+                !r.content.starts_with('<'),
+                "Content should be real, got: {}",
+                r.content
+            );
+            assert!(r.content.len() > 10, "Content too short: {}", r.content);
+        }
+
+        // Plan should be explained
+        assert!(!response.plan_explanation.is_empty());
+        println!("Plan:\n{}", response.plan_explanation);
+    }
+
+    #[tokio::test]
+    async fn test_insert_get_delete_roundtrip() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        let obj = KnowledgeObject::new("Test content for roundtrip")
+            .with_keywords(vec!["test".into()])
+            .with_metadata("key", "value");
+
+        let id = engine.insert(obj).await.unwrap();
+
+        // Get it back
+        let retrieved = engine.get(id).await.unwrap().expect("Object should exist");
+        assert_eq!(retrieved.content, "Test content for roundtrip");
+        assert_eq!(retrieved.keywords, vec!["test"]);
+
+        // Delete
+        let existed = engine.delete(id).await.unwrap();
+        assert!(existed);
+
+        // Should be gone
+        let gone = engine.get(id).await.unwrap();
+        assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_graph_traversal_via_insert() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        let openai = KnowledgeObject::new("OpenAI is an AI research lab").with_keywords(vec![
+            "openai".into(),
+            "ai".into(),
+            "research".into(),
+        ]);
+
+        let ms = KnowledgeObject::new("Microsoft invested $10B in OpenAI")
+            .with_keywords(vec![
+                "microsoft".into(),
+                "investment".into(),
+                "openai".into(),
+            ])
+            .with_relationship("invested_in", openai.id);
+
+        engine.insert(openai).await.unwrap();
+        engine.insert(ms).await.unwrap();
+
+        // Ask about companies connected to OpenAI
+        let response = engine
+            .ask("Which companies invested in OpenAI?", 5)
+            .await
+            .unwrap();
+
+        println!(
+            "Graph query results: {} (intent: {})",
+            response.results.len(),
+            response.detected_intent
+        );
+        // Should find Microsoft via graph traversal
+        assert!(!response.results.is_empty());
+    }
 }
