@@ -1,11 +1,13 @@
 mod db;
 mod embedding;
 mod memory;
+mod openai;
 mod service;
 
 pub use db::KowitoDBEngine;
 pub use embedding::{EmbeddingClient, EmbeddingResult, ProxyEmbeddingClient};
 pub use memory::{AgentMemory, AgentSession, ConversationTurn, TurnRole};
+pub use openai::{OpenAiConfig, OpenAiEmbeddingClient};
 pub use service::KowitoDBService;
 
 // Re-export generated proto code

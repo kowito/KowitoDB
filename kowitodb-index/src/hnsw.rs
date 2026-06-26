@@ -41,9 +41,10 @@ impl Ord for OrdFloat {
 /// A node in the HNSW graph.
 #[derive(Debug, Clone)]
 struct HnswNode {
+    #[allow(dead_code)]
     id: ObjectId,
     vector: Embedding,
-    /// Which layers this node participates in (0 = base layer).
+    #[allow(dead_code)]
     max_layer: usize,
     /// Per-layer neighbor sets: layer → set of neighbor IDs.
     neighbors: HashMap<usize, HashSet<ObjectId>>,
@@ -139,7 +140,7 @@ impl HnswIndex {
 
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
-            if let Some(ref ep_node) = curr_ep_node {
+            if let Some(ref _ep_node) = curr_ep_node {
                 let (nearest, _) = self.search_layer_greedy(&vector, &[curr_ep], lc, 1, &nodes);
                 if let Some(nearest_id) = nearest.into_iter().next() {
                     curr_ep = nearest_id;

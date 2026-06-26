@@ -46,8 +46,8 @@ pub struct KowitoDBEngine {
     pub agent_memory: Arc<AgentMemory>,
     pub embedding_client: Arc<dyn EmbeddingClient>,
     pub plan_cache: Arc<QueryCache<(DetectedIntent, ExecutionPlan)>>,
-    /// In-memory content cache for fast result loading.
     content_cache: Arc<dashmap::DashMap<ObjectId, String>>,
+    #[allow(dead_code)]
     default_model: String,
 }
 
