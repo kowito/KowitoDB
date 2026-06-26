@@ -9,6 +9,7 @@ kowitodb-core.workspace = true
 kowitodb-storage.workspace = true
 kowitodb-index.workspace = true
 kowitodb-planner.workspace = true
+kowitodb-sql.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 prost.workspace = true

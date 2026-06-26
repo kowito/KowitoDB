@@ -4,6 +4,7 @@ members = [
     "kowitodb-storage",
     "kowitodb-index",
     "kowitodb-planner",
+    "kowitodb-sql",
     "kowitodb-server",
     "kowitodb",
 ]
@@ -45,4 +46,5 @@ kowitodb-core = { path = "kowitodb-core" }
 kowitodb-storage = { path = "kowitodb-storage" }
 kowitodb-index = { path = "kowitodb-index" }
 kowitodb-planner = { path = "kowitodb-planner" }
+kowitodb-sql = { path = "kowitodb-sql" }
 kowitodb-server = { path = "kowitodb-server" }

@@ -87,6 +87,20 @@ enum Commands {
         index_path: PathBuf,
     },
 
+    /// Execute a SQL query over knowledge objects
+    Sql {
+        /// The SQL query
+        query: Vec<String>,
+
+        /// Storage path
+        #[arg(short, long, default_value = "./data/storage")]
+        storage_path: PathBuf,
+
+        /// Index path
+        #[arg(short, long, default_value = "./data/index")]
+        index_path: PathBuf,
+    },
+
     /// Show database statistics
     Stats {
         /// Storage path
@@ -257,6 +271,38 @@ async fn main() -> anyhow::Result<()> {
             println!("✅ Inserted knowledge object: {}", id);
             println!("   Keywords: {}", all_metadata.len());
             println!("   Metadata keys: {}", all_metadata.len());
+        }
+
+        Commands::Sql {
+            query,
+            storage_path,
+            index_path,
+        } => {
+            let sql = query.join(" ");
+            let engine = KowitoDBEngine::new(&storage_path, &index_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+
+            println!("📊 SQL: {}\n", sql);
+
+            let results = engine
+                .sql_query(&sql)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+            if results.is_empty() {
+                println!("  (no results)");
+            } else {
+                println!("  {} row(s):\n", results.len());
+                for (i, r) in results.iter().enumerate() {
+                    println!("  {}. {}", i + 1, r.id);
+                    let preview: String = r.content.chars().take(150).collect();
+                    println!("     {}", preview);
+                    if r.content.len() > 150 {
+                        println!("     ... ({} more chars)", r.content.len() - 150);
+                    }
+                    println!();
+                }
+            }
         }
 
         Commands::Stats {

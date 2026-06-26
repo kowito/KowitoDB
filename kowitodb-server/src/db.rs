@@ -478,6 +478,126 @@ impl KowitoDBEngine {
         Ok(vec![IndexResult::new(ids, scores, IndexSource::Graph)])
     }
 
+    /// Execute a SQL query against knowledge objects.
+    ///
+    /// Maps SQL WHERE clauses to the metadata, keyword, and time indexes.
+    /// Results are loaded from storage with real content.
+    pub async fn sql_query(&self, sql: &str) -> KResult<Vec<LoadedResult>> {
+        let stmt = kowitodb_sql::parse_sql(sql)
+            .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))?;
+
+        let (where_clauses, limit) = match stmt {
+            kowitodb_sql::SqlStatement::Select {
+                where_clauses,
+                limit,
+                ..
+            } => (where_clauses, limit),
+        };
+
+        let mut candidate_sets: Vec<Vec<ObjectId>> = Vec::new();
+
+        for clause in &where_clauses {
+            match clause {
+                kowitodb_sql::WhereClause::MetadataEquals { key, value } => {
+                    let ids = self.metadata_index.query_exact(key, value);
+                    if !ids.is_empty() {
+                        candidate_sets.push(ids);
+                    }
+                }
+                kowitodb_sql::WhereClause::MetadataContains { key, substring } => {
+                    let ids = self.metadata_index.query_contains(key, substring);
+                    if !ids.is_empty() {
+                        candidate_sets.push(ids);
+                    }
+                }
+                kowitodb_sql::WhereClause::KeywordContains { substring } => {
+                    // Use full-text search for keyword contains
+                    if let Ok(results) = self.fulltext_index.search(substring, 100) {
+                        if !results.is_empty() {
+                            candidate_sets.push(results.into_iter().map(|(id, _)| id).collect());
+                        }
+                    }
+                }
+                kowitodb_sql::WhereClause::ContentContains { substring } => {
+                    if let Ok(results) = self.fulltext_index.search(substring, 100) {
+                        if !results.is_empty() {
+                            candidate_sets.push(results.into_iter().map(|(id, _)| id).collect());
+                        }
+                    }
+                }
+                kowitodb_sql::WhereClause::CreatedAfter { timestamp } => {
+                    // Parse timestamp to milliseconds
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+                        let ids = self.time_index.after(dt.timestamp_millis());
+                        if !ids.is_empty() {
+                            candidate_sets.push(ids);
+                        }
+                    }
+                }
+                kowitodb_sql::WhereClause::CreatedBefore { timestamp } => {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+                        let ids = self.time_index.before(dt.timestamp_millis());
+                        if !ids.is_empty() {
+                            candidate_sets.push(ids);
+                        }
+                    }
+                }
+                _ => {
+                    debug!("SQL clause not yet routed to index: {:?}", clause);
+                }
+            }
+        }
+
+        // Intersect candidate sets (AND semantics)
+        let final_ids: Vec<ObjectId> = if candidate_sets.is_empty() {
+            // No WHERE clauses: get all objects
+            self.storage.list_ids().await?
+        } else if candidate_sets.len() == 1 {
+            candidate_sets.into_iter().next().unwrap()
+        } else {
+            // Intersect all sets
+            let mut sets: Vec<std::collections::HashSet<ObjectId>> = candidate_sets
+                .into_iter()
+                .map(|v| v.into_iter().collect())
+                .collect();
+            let (first, rest) = sets.split_at_mut(1);
+            first[0].retain(|id| rest.iter().all(|s| s.contains(id)));
+            first[0].iter().copied().collect()
+        };
+
+        // Apply limit
+        let final_ids: Vec<ObjectId> = if let Some(lim) = limit {
+            final_ids.into_iter().take(lim).collect()
+        } else {
+            final_ids
+        };
+
+        // Load content for results
+        let mut loaded = Vec::with_capacity(final_ids.len());
+        for id in &final_ids {
+            let content = if let Some(cached) = self.content_cache.get(id) {
+                cached.clone()
+            } else if let Ok(Some(stored)) = self.storage.get(*id).await {
+                let val = stored.content.clone();
+                self.content_cache.insert(*id, val.clone());
+                val
+            } else {
+                format!("<Object {}>", id)
+            };
+
+            loaded.push(LoadedResult {
+                id: *id,
+                content,
+                relevance_score: 1.0,
+                retrieval_sources: vec!["sql".to_string()],
+                metadata: HashMap::new(),
+                importance: 0.5,
+            });
+        }
+
+        Ok(loaded)
+    }
+
     /// Comprehensive database stats.
     pub async fn stats(&self) -> KResult<StatsResponse> {
         Ok(StatsResponse {
@@ -713,5 +833,40 @@ mod tests {
         );
         // Should find Microsoft via graph traversal
         assert!(!response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sql_query_metadata_filter() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        let acme = KnowledgeObject::new("Acme Corp content")
+            .with_keywords(vec!["acme".into()])
+            .with_metadata("company", "Acme Corp")
+            .with_metadata("stage", "series_a");
+        let globex = KnowledgeObject::new("Globex Inc. content")
+            .with_keywords(vec!["globex".into()])
+            .with_metadata("company", "Globex Inc.")
+            .with_metadata("stage", "series_b");
+
+        engine.insert(acme).await.unwrap();
+        engine.insert(globex).await.unwrap();
+
+        // SQL: filter by metadata
+        let results = engine
+            .sql_query("SELECT * FROM knowledge WHERE metadata.stage = 'series_a'")
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Acme"));
+
+        // SQL: with LIMIT
+        let results = engine
+            .sql_query("SELECT content FROM knowledge WHERE metadata.company LIKE '%Inc%' LIMIT 5")
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("Globex"));
     }
 }

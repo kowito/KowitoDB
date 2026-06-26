@@ -1258,6 +1258,7 @@ dependencies = [
  "kowitodb-core",
  "kowitodb-index",
  "kowitodb-planner",
+ "kowitodb-sql",
  "kowitodb-storage",
  "parking_lot 0.12.5",
  "prost",
@@ -1268,6 +1269,23 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "kowitodb-sql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "kowitodb-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
