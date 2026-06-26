@@ -17,6 +17,7 @@ parking_lot.workspace = true
 dashmap.workspace = true
 hex.workspace = true
 sha2.workspace = true
+rand = "0.8"
 
 # Tantivy for full-text search
 [dependencies.tantivy]

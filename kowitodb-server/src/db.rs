@@ -4,7 +4,8 @@ use std::sync::Arc;
 use kowitodb_core::Result as KResult;
 use kowitodb_core::{Embedding, KnowledgeObject, ObjectId};
 use kowitodb_index::{
-    FullTextIndex, GraphIndex, IndexResult, IndexSource, MetadataIndex, TimeIndex, VectorIndex,
+    FullTextIndex, GraphIndex, HnswIndex, HnswParams, IndexResult, IndexSource, MetadataIndex,
+    TimeIndex, VectorIndex,
 };
 use kowitodb_planner::{
     cache::QueryCache, context::ContextOptimizer, cost::CostTracker, reranker::Reranker,
@@ -32,6 +33,7 @@ pub struct LoadedResult {
 /// Core engine wiring storage, all 6 indexes, query planner, and all optimizers.
 pub struct KowitoDBEngine {
     pub storage: Arc<StorageEngine>,
+    pub hnsw_index: Arc<HnswIndex>,
     pub vector_index: Arc<VectorIndex>,
     pub fulltext_index: Arc<FullTextIndex>,
     pub metadata_index: Arc<MetadataIndex>,
@@ -57,6 +59,7 @@ impl KowitoDBEngine {
         let storage = StorageEngine::open(storage_path)?;
         let fulltext_index = FullTextIndex::open(index_path)?;
         let vector_index = VectorIndex::new();
+        let hnsw_index = HnswIndex::new(HnswParams::default());
         let metadata_index = MetadataIndex::new();
         let time_index = TimeIndex::new();
         let graph_index = GraphIndex::new();
@@ -73,6 +76,7 @@ impl KowitoDBEngine {
         info!("KowitoDB engine initialized with all subsystems");
         Ok(Self {
             storage: Arc::new(storage),
+            hnsw_index: Arc::new(hnsw_index),
             vector_index: Arc::new(vector_index),
             fulltext_index: Arc::new(fulltext_index),
             metadata_index: Arc::new(metadata_index),
@@ -98,6 +102,7 @@ impl KowitoDBEngine {
         std::fs::create_dir_all(&tmp).map_err(|e| kowitodb_core::KowitoError::Io(e))?;
         let fulltext_index = FullTextIndex::open(&tmp)?;
         let vector_index = VectorIndex::new();
+        let hnsw_index = HnswIndex::new(HnswParams::default());
         let metadata_index = MetadataIndex::new();
         let time_index = TimeIndex::new();
         let graph_index = GraphIndex::new();
@@ -113,6 +118,7 @@ impl KowitoDBEngine {
 
         Ok(Self {
             storage: Arc::new(storage),
+            hnsw_index: Arc::new(hnsw_index),
             vector_index: Arc::new(vector_index),
             fulltext_index: Arc::new(fulltext_index),
             metadata_index: Arc::new(metadata_index),
@@ -138,12 +144,12 @@ impl KowitoDBEngine {
         self.content_cache.insert(id, obj.content.clone());
 
         // Index vectors (auto-embed if needed)
-        for (model, embedding) in &obj.embeddings {
-            self.vector_index.insert(id, model, embedding.clone())?;
+        for (_model, embedding) in &obj.embeddings {
+            self.hnsw_index.insert(id, embedding.clone());
         }
         if obj.embeddings.is_empty() && !obj.content.is_empty() {
             if let Ok(result) = self.embedding_client.embed(&obj.content).await {
-                self.vector_index.insert(id, &result.model, result.vector)?;
+                self.hnsw_index.insert(id, result.vector);
                 self.cost_tracker.record_embedding_calls(1);
             }
         }
@@ -210,6 +216,7 @@ impl KowitoDBEngine {
 
     /// Delete from all indexes and storage.
     pub async fn delete(&self, id: ObjectId) -> KResult<bool> {
+        self.hnsw_index.remove(id);
         self.vector_index.remove(id);
         let _ = self.fulltext_index.remove(id);
         self.metadata_index.remove_object(id);
@@ -366,11 +373,7 @@ impl KowitoDBEngine {
             match step.step_type {
                 kowitodb_planner::PlanStepType::VectorSearch => {
                     if let Some(ref emb) = query_embedding {
-                        let results = self.vector_index.search(
-                            emb,
-                            &self.default_model,
-                            step.limit.unwrap_or(20),
-                        )?;
+                        let results = self.hnsw_index.search(emb, step.limit.unwrap_or(20));
                         if !results.is_empty() {
                             let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
                             let scores: Vec<_> = results.iter().map(|(_, s)| *s).collect();
@@ -602,7 +605,7 @@ impl KowitoDBEngine {
     pub async fn stats(&self) -> KResult<StatsResponse> {
         Ok(StatsResponse {
             total_objects: self.storage.count().await? as u64,
-            vector_count: self.vector_index.len() as u64,
+            vector_count: self.hnsw_index.len() as u64,
             graph_nodes: self.graph_index.node_count() as u64,
             graph_edges: self.graph_index.edge_count() as u64,
             index_size_bytes: 0,

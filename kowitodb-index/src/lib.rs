@@ -1,11 +1,13 @@
 mod fulltext;
 mod graph;
+mod hnsw;
 mod metadata;
 mod time_index;
 mod vector;
 
 pub use fulltext::FullTextIndex;
 pub use graph::GraphIndex;
+pub use hnsw::{HnswIndex, HnswParams};
 pub use metadata::MetadataIndex;
 pub use time_index::TimeIndex;
 pub use vector::VectorIndex;
