@@ -222,11 +222,11 @@ impl ContextOptimizer {
             }
             let words_i = word_set(&chunks[i].content);
 
-            for j in (i + 1)..chunks.len() {
+            for (j, chunk_j) in chunks.iter().enumerate().skip(i + 1) {
                 if drop_set.contains(&j) {
                     continue;
                 }
-                let words_j = word_set(&chunks[j].content);
+                let words_j = word_set(&chunk_j.content);
                 let similarity = jaccard_similarity(&words_i, &words_j);
 
                 if similarity >= self.dedup_threshold {

@@ -10,8 +10,10 @@ use kowitodb_core::ObjectId;
 use serde::{Deserialize, Serialize};
 
 mod parser;
+mod provider;
 
 pub use parser::parse as parse_sql;
+pub use provider::{KnowledgeTableProvider, SqlContext, TABLE_KNOWLEDGE, TABLE_OBJECTS};
 
 /// Parsed representation of a SQL-like query against knowledge objects.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package kowitodb;
+
+// ---- Knowledge Object ----
+
+message KnowledgeObject {
+  string id = 1;
+  string content = 2;
+  map<string, EmbeddingVector> embeddings = 3;
+  map<string, string> metadata = 4;
+  repeated string keywords = 5;
+  repeated Relationship relationships = 6;
+  float importance = 7;
+  string created_at = 8;
+  string updated_at = 9;
+}
+
+message EmbeddingVector {
+  repeated float values = 1;
+}
+
+message Relationship {
+  string relation_type = 1;
+  string target_id = 2;
+  optional float weight = 3;
+}
+
+// ---- Insert ----
+
+message InsertRequest {
+  string content = 1;
+  map<string, EmbeddingVector> embeddings = 2;
+  map<string, string> metadata = 3;
+  repeated string keywords = 4;
+  repeated RelationshipInput relationships = 5;
+  float importance = 6;
+}
+
+message RelationshipInput {
+  string relation_type = 1;
+  string target_id = 2;
+  optional float weight = 3;
+}
+
+message InsertResponse {
+  string id = 1;
+}
+
+// ---- Get ----
+
+message GetRequest {
+  string id = 1;
+}
+
+message GetResponse {
+  optional KnowledgeObject object = 1;
+}
+
+// ---- Delete ----
+
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {
+  bool existed = 1;
+}
+
+// ---- Search ----
+
+message SearchRequest {
+  string query = 1;
+  int32 top_k = 2;
+}
+
+message SearchResult {
+  string id = 1;
+  string content = 2;
+  float score = 3;
+  map<string, string> metadata = 4;
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+  string plan_explanation = 2;
+  int32 total_found = 3;
+}
+
+// ---- ai.ask() ----
+
+message AskRequest {
+  string question = 1;
+  int32 max_results = 2;
+  int32 max_context_tokens = 3;
+}
+
+message AskResponse {
+  repeated AskResult results = 1;
+  string plan_explanation = 2;
+  string detected_intent = 3;
+}
+
+message AskResult {
+  string id = 1;
+  string content = 2;
+  float relevance_score = 3;
+  map<string, string> metadata = 4;
+  string retrieval_source = 5; // vector, keyword, graph, metadata, time
+}
+
+// ---- ai.remember() ----
+
+message RememberRequest {
+  string content = 1;
+  map<string, EmbeddingVector> embeddings = 2;
+  map<string, string> metadata = 3;
+  repeated string keywords = 4;
+  float importance = 5;
+}
+
+message RememberResponse {
+  string id = 1;
+}
+
+// ---- Stats ----
+
+message StatsRequest {}
+
+message StatsResponse {
+  uint64 total_objects = 1;
+  uint64 vector_count = 2;
+  uint64 index_size_bytes = 3;
+}
+
+// ---- Service ----
+
+service KowitoDB {
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // High-level AI API
+  rpc Ask(AskRequest) returns (AskResponse);
+  rpc Remember(RememberRequest) returns (RememberResponse);
+
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}

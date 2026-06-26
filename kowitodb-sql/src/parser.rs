@@ -250,44 +250,34 @@ fn parse_content_clause(s: &str) -> Result<WhereClause, SqlError> {
 }
 
 fn parse_importance_clause(s: &str) -> Result<WhereClause, SqlError> {
-    if s.starts_with(">=") {
-        let val = s[2..]
-            .trim()
+    let parse = |v: &str| {
+        v.trim()
             .parse::<f32>()
-            .map_err(|_| SqlError::Parse("Invalid importance".into()))?;
-        return Ok(WhereClause::ImportanceGe { value: val });
+            .map_err(|_| SqlError::Parse("Invalid importance".into()))
+    };
+    // Order matters: check the two-char operators before the one-char ones.
+    if let Some(rest) = s.strip_prefix(">=") {
+        return Ok(WhereClause::ImportanceGe { value: parse(rest)? });
     }
-    if s.starts_with("<=") {
-        let val = s[2..]
-            .trim()
-            .parse::<f32>()
-            .map_err(|_| SqlError::Parse("Invalid importance".into()))?;
-        return Ok(WhereClause::ImportanceLe { value: val });
+    if let Some(rest) = s.strip_prefix("<=") {
+        return Ok(WhereClause::ImportanceLe { value: parse(rest)? });
     }
-    if s.starts_with('>') {
-        let val = s[1..]
-            .trim()
-            .parse::<f32>()
-            .map_err(|_| SqlError::Parse("Invalid importance".into()))?;
-        return Ok(WhereClause::ImportanceGe { value: val });
+    if let Some(rest) = s.strip_prefix('>') {
+        return Ok(WhereClause::ImportanceGe { value: parse(rest)? });
     }
-    if s.starts_with('<') {
-        let val = s[1..]
-            .trim()
-            .parse::<f32>()
-            .map_err(|_| SqlError::Parse("Invalid importance".into()))?;
-        return Ok(WhereClause::ImportanceLe { value: val });
+    if let Some(rest) = s.strip_prefix('<') {
+        return Ok(WhereClause::ImportanceLe { value: parse(rest)? });
     }
     Err(SqlError::Parse(format!("Invalid importance clause: {}", s)))
 }
 
 fn parse_created_clause(s: &str) -> Result<WhereClause, SqlError> {
-    if s.starts_with('>') {
-        let value = extract_string_value(&s[1..])?;
+    if let Some(rest) = s.strip_prefix('>') {
+        let value = extract_string_value(rest)?;
         return Ok(WhereClause::CreatedAfter { timestamp: value });
     }
-    if s.starts_with('<') {
-        let value = extract_string_value(&s[1..])?;
+    if let Some(rest) = s.strip_prefix('<') {
+        let value = extract_string_value(rest)?;
         return Ok(WhereClause::CreatedBefore { timestamp: value });
     }
     Err(SqlError::Parse(format!("Invalid created_at clause: {}", s)))
@@ -316,11 +306,11 @@ fn find_operator(s: &str, op: &str) -> Option<usize> {
 
 fn extract_string_value(s: &str) -> Result<String, SqlError> {
     let s = s.trim();
-    if s.starts_with('\'') {
-        if let Some(end) = s[1..].find('\'') {
-            return Ok(s[1..end + 1].to_string());
+    if let Some(rest) = s.strip_prefix('\'') {
+        if let Some(end) = rest.find('\'') {
+            return Ok(rest[..end].to_string());
         }
-        return Ok(s[1..].trim_end_matches('\'').to_string());
+        return Ok(rest.trim_end_matches('\'').to_string());
     }
     Ok(s.split_whitespace().next().unwrap_or("").to_string())
 }

@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             println!("🤖 Asking: \"{}\"\n", question);
 
             let response = engine
-                .ask(&question, max_results.max(1).min(20))
+                .ask(&question, max_results.clamp(1, 20))
                 .await
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -205,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
 
             let (text, file_kws, file_meta) = if let Some(path) = file {
                 let raw = std::fs::read_to_string(&path)?;
-                if path.extension().map_or(false, |e| e == "json") {
+                if path.extension().is_some_and(|e| e == "json") {
                     let v: serde_json::Value = serde_json::from_str(&raw)?;
                     let content = v["content"].as_str().unwrap_or(&raw).to_string();
                     let kws: Vec<String> = v["keywords"]

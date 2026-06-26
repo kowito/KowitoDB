@@ -130,7 +130,7 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::SearchRequest>,
     ) -> Result<Response<proto::SearchResponse>, Status> {
         let req = request.into_inner();
-        let max_results = req.top_k.max(1).min(100) as usize;
+        let max_results = req.top_k.clamp(1, 100) as usize;
 
         let start = Instant::now();
         let response = self
@@ -166,7 +166,7 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::AskRequest>,
     ) -> Result<Response<proto::AskResponse>, Status> {
         let req = request.into_inner();
-        let max_results = req.max_results.max(1).min(100) as usize;
+        let max_results = req.max_results.clamp(1, 100) as usize;
 
         info!("ai.ask(): \"{}\"", req.question);
 

@@ -32,7 +32,7 @@ pub struct LoadedResult {
 
 /// Core engine wiring storage, all 6 indexes, query planner, and all optimizers.
 pub struct KowitoDBEngine {
-    pub storage: Arc<StorageEngine>,
+    pub storage: Arc<dyn StorageBackend>,
     pub hnsw_index: Arc<HnswIndex>,
     pub vector_index: Arc<VectorIndex>,
     pub fulltext_index: Arc<FullTextIndex>,
@@ -56,84 +56,63 @@ impl KowitoDBEngine {
         storage_path: impl AsRef<std::path::Path>,
         index_path: impl AsRef<std::path::Path>,
     ) -> KResult<Self> {
-        let storage = StorageEngine::open(storage_path)?;
+        let storage: Arc<dyn StorageBackend> = Arc::new(StorageEngine::open(storage_path)?);
         let fulltext_index = FullTextIndex::open(index_path)?;
-        let vector_index = VectorIndex::new();
-        let hnsw_index = HnswIndex::new(HnswParams::default());
-        let metadata_index = MetadataIndex::new();
-        let time_index = TimeIndex::new();
-        let graph_index = GraphIndex::new();
-        let planner = QueryPlanner::new();
-        let reranker = Reranker::new();
-        let context_optimizer = ContextOptimizer::new(4096);
-        let cost_tracker = CostTracker::new();
-        let agent_memory = AgentMemory::new();
-        let embedding_client: Arc<dyn EmbeddingClient> =
-            Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128));
-        let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
-        let content_cache = Arc::new(dashmap::DashMap::new());
+        let engine = Self::assemble(storage, fulltext_index);
+        info!("KowitoDB engine initialized with all subsystems (sled storage)");
+        Ok(engine)
+    }
 
-        info!("KowitoDB engine initialized with all subsystems");
-        Ok(Self {
-            storage: Arc::new(storage),
-            hnsw_index: Arc::new(hnsw_index),
-            vector_index: Arc::new(vector_index),
-            fulltext_index: Arc::new(fulltext_index),
-            metadata_index: Arc::new(metadata_index),
-            time_index: Arc::new(time_index),
-            graph_index: Arc::new(graph_index),
-            planner: Arc::new(planner),
-            reranker: Arc::new(reranker),
-            context_optimizer: Arc::new(context_optimizer),
-            cost_tracker: Arc::new(cost_tracker),
-            agent_memory: Arc::new(agent_memory),
-            embedding_client,
-            plan_cache: Arc::new(plan_cache),
-            content_cache,
-            default_model: "default".to_string(),
-        })
+    /// Create an engine backed by a [Lance](https://lancedb.github.io/lance/)
+    /// dataset instead of the default sled store. Requires the `lance` feature.
+    #[cfg(feature = "lance")]
+    pub async fn new_with_lance(
+        lance_uri: impl Into<String>,
+        index_path: impl AsRef<std::path::Path>,
+    ) -> KResult<Self> {
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(kowitodb_storage::LanceStorage::open(lance_uri).await?);
+        let fulltext_index = FullTextIndex::open(index_path)?;
+        let engine = Self::assemble(storage, fulltext_index);
+        info!("KowitoDB engine initialized with all subsystems (Lance storage)");
+        Ok(engine)
     }
 
     /// Create an in-memory engine for testing (no disk I/O).
     pub fn new_in_memory() -> KResult<Self> {
-        let storage = StorageEngine::new_in_memory()?;
+        let storage: Arc<dyn StorageBackend> = Arc::new(StorageEngine::new_in_memory()?);
         // For tests, use a temp directory for the fulltext index
         let tmp = std::env::temp_dir().join(format!("kowitodb-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).map_err(|e| kowitodb_core::KowitoError::Io(e))?;
+        std::fs::create_dir_all(&tmp).map_err(kowitodb_core::KowitoError::Io)?;
         let fulltext_index = FullTextIndex::open(&tmp)?;
-        let vector_index = VectorIndex::new();
-        let hnsw_index = HnswIndex::new(HnswParams::default());
-        let metadata_index = MetadataIndex::new();
-        let time_index = TimeIndex::new();
-        let graph_index = GraphIndex::new();
-        let planner = QueryPlanner::new();
-        let reranker = Reranker::new();
-        let context_optimizer = ContextOptimizer::new(4096);
-        let cost_tracker = CostTracker::new();
-        let agent_memory = AgentMemory::new();
-        let embedding_client: Arc<dyn EmbeddingClient> =
-            Arc::new(ProxyEmbeddingClient::new("proxy-test", 128));
-        let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
-        let content_cache = Arc::new(dashmap::DashMap::new());
+        Ok(Self::assemble(storage, fulltext_index))
+    }
 
-        Ok(Self {
-            storage: Arc::new(storage),
-            hnsw_index: Arc::new(hnsw_index),
-            vector_index: Arc::new(vector_index),
+    /// Assemble the full engine (all indexes, planner, optimizers) over a given
+    /// storage backend and full-text index. Shared by every constructor.
+    fn assemble(storage: Arc<dyn StorageBackend>, fulltext_index: FullTextIndex) -> Self {
+        let embedding_client: Arc<dyn EmbeddingClient> =
+            Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128));
+        let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
+
+        Self {
+            storage,
+            hnsw_index: Arc::new(HnswIndex::new(HnswParams::default())),
+            vector_index: Arc::new(VectorIndex::new()),
             fulltext_index: Arc::new(fulltext_index),
-            metadata_index: Arc::new(metadata_index),
-            time_index: Arc::new(time_index),
-            graph_index: Arc::new(graph_index),
-            planner: Arc::new(planner),
-            reranker: Arc::new(reranker),
-            context_optimizer: Arc::new(context_optimizer),
-            cost_tracker: Arc::new(cost_tracker),
-            agent_memory: Arc::new(agent_memory),
+            metadata_index: Arc::new(MetadataIndex::new()),
+            time_index: Arc::new(TimeIndex::new()),
+            graph_index: Arc::new(GraphIndex::new()),
+            planner: Arc::new(QueryPlanner::new()),
+            reranker: Arc::new(Reranker::new()),
+            context_optimizer: Arc::new(ContextOptimizer::new(4096)),
+            cost_tracker: Arc::new(CostTracker::new()),
+            agent_memory: Arc::new(AgentMemory::new()),
             embedding_client,
             plan_cache: Arc::new(plan_cache),
-            content_cache,
+            content_cache: Arc::new(dashmap::DashMap::new()),
             default_model: "default".to_string(),
-        })
+        }
     }
 
     /// Insert a knowledge object into storage and all 6 indexes.
@@ -144,7 +123,7 @@ impl KowitoDBEngine {
         self.content_cache.insert(id, obj.content.clone());
 
         // Index vectors (auto-embed if needed)
-        for (_model, embedding) in &obj.embeddings {
+        for embedding in obj.embeddings.values() {
             self.hnsw_index.insert(id, embedding.clone());
         }
         if obj.embeddings.is_empty() && !obj.content.is_empty() {
@@ -601,6 +580,21 @@ impl KowitoDBEngine {
         Ok(loaded)
     }
 
+    /// Execute arbitrary SQL through the DataFusion engine.
+    ///
+    /// Unlike [`Self::sql_query`] (which routes a small parsed subset to the
+    /// native indexes), this runs the full DataFusion planner over the
+    /// `knowledge` table provider — supporting projections, `ORDER BY`,
+    /// `GROUP BY`, aggregates, and complex predicates. Rows are returned as
+    /// ordered column-name → stringified-value maps.
+    pub async fn sql_select(&self, sql: &str) -> KResult<Vec<HashMap<String, String>>> {
+        let ctx = kowitodb_sql::SqlContext::new(self.storage.clone())
+            .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))?;
+        ctx.query_rows(sql)
+            .await
+            .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))
+    }
+
     /// Comprehensive database stats.
     pub async fn stats(&self) -> KResult<StatsResponse> {
         Ok(StatsResponse {
@@ -836,6 +830,55 @@ mod tests {
         );
         // Should find Microsoft via graph traversal
         assert!(!response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sql_select_datafusion_aggregate_and_order() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        engine
+            .insert(
+                KnowledgeObject::new("Acme Corp content")
+                    .with_metadata("stage", "series_a")
+                    .with_importance(0.9),
+            )
+            .await
+            .unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("Globex Inc. content")
+                    .with_metadata("stage", "series_b")
+                    .with_importance(0.4),
+            )
+            .await
+            .unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("Initech content")
+                    .with_metadata("stage", "series_a")
+                    .with_importance(0.7),
+            )
+            .await
+            .unwrap();
+
+        // Aggregate via DataFusion (not expressible through the index-routed path).
+        let rows = engine
+            .sql_select("SELECT COUNT(*) AS n FROM knowledge")
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["n"], "3");
+
+        // Projection + filter + ORDER BY, all executed by DataFusion.
+        let rows = engine
+            .sql_select(
+                "SELECT content, importance FROM knowledge \
+                 WHERE importance >= 0.5 ORDER BY importance DESC",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0]["content"].contains("Acme"));
+        assert!(rows[1]["content"].contains("Initech"));
     }
 
     #[tokio::test]

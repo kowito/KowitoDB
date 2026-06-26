@@ -5,6 +5,9 @@ use kowitodb_core::{ObjectId, Relationship};
 use parking_lot::RwLock;
 use tracing::debug;
 
+/// Adjacency list mapping a node to its outgoing/incoming edges of type `T`.
+type Adjacency<T> = Arc<RwLock<HashMap<ObjectId, Vec<T>>>>;
+
 /// In-memory knowledge graph index for relationship traversal.
 ///
 /// Stores directed edges between knowledge objects. Supports:
@@ -13,9 +16,9 @@ use tracing::debug;
 /// - Reverse-lookups ("which objects reference X?")
 pub struct GraphIndex {
     /// Forward adjacency list: source_id -> [(relation_type, target_id)]
-    forward: Arc<RwLock<HashMap<ObjectId, Vec<Relationship>>>>,
+    forward: Adjacency<Relationship>,
     /// Reverse adjacency list: target_id -> [(relation_type, source_id)]
-    reverse: Arc<RwLock<HashMap<ObjectId, Vec<(String, ObjectId)>>>>,
+    reverse: Adjacency<(String, ObjectId)>,
 }
 
 impl GraphIndex {
@@ -292,8 +295,8 @@ impl GraphIndex {
 
             if let Some(edges) = forward.get(&current) {
                 for rel in edges {
-                    if !visited.contains_key(&rel.target_id) {
-                        visited.insert(rel.target_id, depth + 1);
+                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(rel.target_id) {
+                        e.insert(depth + 1);
                         queue.push_back((rel.target_id, depth + 1));
                     }
                 }

@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 kowitodb-core.workspace = true
+kowitodb-storage.workspace = true
+datafusion.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true

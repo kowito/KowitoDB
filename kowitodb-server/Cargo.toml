@@ -27,5 +27,9 @@ async-trait.workspace = true
 dashmap.workspace = true
 reqwest = { version = "0.12", features = ["json"] }
 
+[features]
+# Use a Lance dataset as the storage backend instead of the default sled store.
+lance = ["kowitodb-storage/lance"]
+
 [build-dependencies]
 tonic-build = "0.12"

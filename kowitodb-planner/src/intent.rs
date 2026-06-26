@@ -175,7 +175,7 @@ impl IntentAnalyzer {
         let words: Vec<&str> = text.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-            if clean.len() > 1 && clean.chars().next().map_or(false, |c| c.is_uppercase()) && i > 0
+            if clean.len() > 1 && clean.chars().next().is_some_and(|c| c.is_uppercase()) && i > 0
             // skip first word (could be sentence start)
             {
                 entities.named.push(clean);

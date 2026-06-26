@@ -39,7 +39,7 @@ impl FullTextIndex {
         let schema = schema_builder.build();
 
         let index_path = path.as_ref().join("tantivy");
-        std::fs::create_dir_all(&index_path).map_err(|e| KowitoError::Io(e))?;
+        std::fs::create_dir_all(&index_path).map_err(KowitoError::Io)?;
 
         let index = if index_path.join("meta.json").exists() {
             Index::open_in_dir(&index_path)

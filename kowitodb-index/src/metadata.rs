@@ -5,6 +5,9 @@ use kowitodb_core::ObjectId;
 use parking_lot::RwLock;
 use tracing::debug;
 
+/// Maps each distinct metadata value to the objects carrying it.
+type ValueIndex = HashMap<String, Vec<ObjectId>>;
+
 /// In-memory metadata index.
 ///
 /// Maps metadata key-value pairs to object IDs for fast filtering
@@ -12,7 +15,7 @@ use tracing::debug;
 /// a columnar store or SQLite.
 pub struct MetadataIndex {
     /// key -> (value -> set of object IDs)
-    index: Arc<RwLock<HashMap<String, HashMap<String, Vec<ObjectId>>>>>,
+    index: Arc<RwLock<HashMap<String, ValueIndex>>>,
 }
 
 impl MetadataIndex {

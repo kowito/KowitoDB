@@ -213,7 +213,7 @@ impl HnswIndex {
         }
 
         // Update entry point if it was this node
-        if entry_point.map_or(false, |ep| ep == id) {
+        if entry_point.is_some_and(|ep| ep == id) {
             *entry_point = nodes.keys().next().copied();
         }
     }
@@ -246,7 +246,7 @@ impl HnswIndex {
 
         // Take top-k
         let mut results: Vec<(ObjectId, f32)> =
-            candidates.into_iter().zip(distances.into_iter()).collect();
+            candidates.into_iter().zip(distances).collect();
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.truncate(k);

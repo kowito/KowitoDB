@@ -33,8 +33,10 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     pub fn new() -> Self {
-        let mut metrics = ServerMetrics::default();
-        metrics.started_at = Some(Instant::now());
+        let metrics = ServerMetrics {
+            started_at: Some(Instant::now()),
+            ..Default::default()
+        };
         Self {
             metrics: Arc::new(RwLock::new(metrics)),
         }
