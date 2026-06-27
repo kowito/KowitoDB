@@ -183,6 +183,7 @@ is unset the server uses a deterministic dev proxy; set it to use a real model:
 | `KOWITODB_EMBEDDING_MODEL` | Model name (default `text-embedding-3-small`, or `nomic-embed-text` for Ollama). |
 | `KOWITODB_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`). |
 | `KOWITODB_VECTOR_QUANTIZE` | `1` to int8-quantize stored vectors (~4× less memory, ~few points recall). Off by default. |
+| `KOWITODB_CONTEXTUAL_RETRIEVAL` | `0` to disable Contextual Retrieval (embedding/BM25 over a metadata+keyword-augmented text). On by default. |
 
 Logging is controlled by `RUST_LOG` (via `tracing-subscriber`'s `EnvFilter`);
 it defaults to `info`:

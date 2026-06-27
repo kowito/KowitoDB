@@ -50,6 +50,47 @@ fn vector_index_params() -> HnswParams {
     }
 }
 
+/// Whether Contextual Retrieval augmentation is enabled (default on; disable
+/// with `KOWITODB_CONTEXTUAL_RETRIEVAL=0`).
+fn contextual_retrieval_enabled() -> bool {
+    std::env::var("KOWITODB_CONTEXTUAL_RETRIEVAL")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(true)
+}
+
+/// Build the text to embed / full-text index: a deterministic context preamble
+/// (sorted metadata + keywords) prepended to the content. Returns the original
+/// content unchanged when disabled or when there is nothing to add.
+///
+/// This is the first-cut, no-LLM form of Anthropic's Contextual Retrieval — the
+/// context comes from the object's structured fields rather than a generative
+/// model. The stored/returned content is never modified.
+fn contextualize_for_index(obj: &KnowledgeObject) -> String {
+    if !contextual_retrieval_enabled() {
+        return obj.content.clone();
+    }
+
+    let mut context = String::new();
+    let mut metadata: Vec<_> = obj.metadata.iter().collect();
+    metadata.sort_by(|a, b| a.0.cmp(b.0)); // deterministic ordering
+    for (key, value) in metadata {
+        let val = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        context.push_str(&format!("{key}: {val}. "));
+    }
+    if !obj.keywords.is_empty() {
+        context.push_str(&format!("Keywords: {}. ", obj.keywords.join(", ")));
+    }
+
+    if context.is_empty() {
+        obj.content.clone()
+    } else {
+        format!("{context}\n{}", obj.content)
+    }
+}
+
 /// Bounded LRU cache of object content keyed by id, used to avoid storage
 /// round-trips for hot objects without growing without limit.
 struct ContentCache(Mutex<LruCache<ObjectId, String>>);
@@ -319,8 +360,14 @@ impl KowitoDBEngine {
     pub async fn insert(&self, mut obj: KnowledgeObject) -> KResult<ObjectId> {
         let id = obj.id;
 
-        // Cache the content for fast retrieval
+        // Cache the *original* content for retrieval/display.
         self.content_cache.insert(id, obj.content.clone());
+
+        // Contextual Retrieval (Anthropic, 2024): embed and full-text index a
+        // context-augmented version of the text while storage returns the
+        // original. The dense vector and BM25 index then capture structured
+        // context (metadata/keywords), improving recall.
+        let indexed_text = contextualize_for_index(&obj);
 
         // Index vectors (auto-embed if needed). The generated embedding is
         // written back onto the object so it is persisted to storage and can be
@@ -329,17 +376,17 @@ impl KowitoDBEngine {
             self.hnsw_index.insert(id, embedding.clone());
         }
         if obj.embeddings.is_empty() && !obj.content.is_empty() {
-            if let Ok(result) = self.embedding_client.embed(&obj.content).await {
+            if let Ok(result) = self.embedding_client.embed(&indexed_text).await {
                 self.hnsw_index.insert(id, result.vector.clone());
                 obj.embeddings.insert(result.model, result.vector);
                 self.cost_tracker.record_embedding_calls(1);
             }
         }
 
-        // Full-text index
+        // Full-text index (over the context-augmented text).
         self.fulltext_index.insert(
             id,
-            &obj.content,
+            &indexed_text,
             &obj.keywords,
             &serde_json::to_string(&obj.metadata).unwrap_or_default(),
         )?;
@@ -1324,6 +1371,47 @@ mod tests {
         assert!(!engine.ask("document", 5).await.unwrap().results.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_contextualize_for_index() {
+        let obj = KnowledgeObject::new("Quarterly results were strong.")
+            .with_metadata("company", "Acme")
+            .with_keywords(vec!["renewal".into()]);
+        let text = contextualize_for_index(&obj);
+        assert!(text.contains("company: Acme"));
+        assert!(text.contains("Keywords: renewal"));
+        assert!(text.contains("Quarterly results were strong."));
+        // The object's stored content is never modified.
+        assert_eq!(obj.content, "Quarterly results were strong.");
+    }
+
+    #[tokio::test]
+    async fn test_contextual_retrieval_finds_metadata_terms() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        // Content does NOT mention "Acme"; only metadata does.
+        let id = engine
+            .insert(
+                KnowledgeObject::new("Quarterly results were strong and the team grew.")
+                    .with_metadata("company", "Acme"),
+            )
+            .await
+            .unwrap();
+
+        // The metadata term is findable because it was folded into the embedded /
+        // full-text-indexed text (Contextual Retrieval).
+        let resp = engine.ask("Acme", 5).await.unwrap();
+        assert!(
+            resp.results.iter().any(|r| r.id == id.to_string()),
+            "contextual retrieval should make metadata-only terms findable"
+        );
+
+        // Stored content remains the original (un-augmented).
+        let stored = engine.get(id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.content,
+            "Quarterly results were strong and the team grew."
+        );
     }
 
     #[tokio::test]
