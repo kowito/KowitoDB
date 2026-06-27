@@ -306,6 +306,68 @@ impl Ord for OrdFloat {
     }
 }
 
+/// Min-heap entry (closest popped first) for the beam frontier.
+#[derive(Debug)]
+struct Candidate {
+    id: ObjectId,
+    dist: OrdFloat,
+}
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist
+    }
+}
+impl Eq for Candidate {}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse so the BinaryHeap (a max-heap) yields the smallest distance.
+        other.dist.cmp(&self.dist)
+    }
+}
+
+/// Max-heap entry (worst popped first) for the bounded result set.
+#[derive(Debug)]
+struct WorstCandidate {
+    id: ObjectId,
+    dist: OrdFloat,
+}
+impl PartialEq for WorstCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist == other.dist
+    }
+}
+impl Eq for WorstCandidate {}
+impl PartialOrd for WorstCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for WorstCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist.cmp(&other.dist)
+    }
+}
+
+/// Per-thread reusable scratch for beam search, so the hot query path allocates
+/// nothing after warmup (allocator contention otherwise caps concurrent QPS).
+/// Safe because a search runs to completion synchronously on one thread.
+#[derive(Default)]
+struct BeamScratch {
+    visited: IdSet,
+    candidates: BinaryHeap<Candidate>,
+    results: BinaryHeap<WorstCandidate>,
+}
+
+thread_local! {
+    static BEAM_SCRATCH: std::cell::RefCell<BeamScratch> =
+        std::cell::RefCell::new(BeamScratch::default());
+}
+
 /// A node in the HNSW graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HnswNode {
@@ -515,11 +577,9 @@ impl HnswIndex {
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
             if curr_ep_exists {
-                let (nearest, _) = self.search_layer_greedy(&scorer, &[curr_ep], lc, 1, &nodes);
-                if let Some(nearest_id) = nearest.into_iter().next() {
-                    curr_ep = nearest_id;
-                    curr_ep_exists = nodes.contains_key(&nearest_id);
-                }
+                let nearest_id = self.search_layer_greedy(&scorer, curr_ep, lc, &nodes);
+                curr_ep = nearest_id;
+                curr_ep_exists = nodes.contains_key(&nearest_id);
             }
         }
 
@@ -609,10 +669,11 @@ impl HnswIndex {
 
         // Rotate (and sign-code) the query once for binary mode; the graph then
         // navigates via the Hamming popcount fast path and the final candidates
-        // are refined with the accurate asymmetric estimator.
-        let (rotated, query_code) = {
-            let rot = self.rotation.read();
-            match rot.as_ref() {
+        // are refined with the accurate asymmetric estimator. The rotation lock
+        // is only touched when binary quantization is on, so the common path
+        // avoids it entirely.
+        let (rotated, query_code) = if self.params.binary_quantize {
+            match self.rotation.read().as_ref() {
                 Some(r) => {
                     let rv = r.apply(query);
                     let code = pack_sign_code(&rv, r.dim_padded);
@@ -620,6 +681,8 @@ impl HnswIndex {
                 }
                 None => (None, None),
             }
+        } else {
+            (None, None)
         };
         // Matryoshka coarse pass — navigate with a dimension prefix, then refine
         // the final candidates at full dimension. Disabled under binary mode,
@@ -643,10 +706,7 @@ impl HnswIndex {
         let global_max = *max_layer;
 
         for lc in (1..=global_max).rev() {
-            let (nearest, _) = self.search_layer_greedy(&scorer, &[curr_ep], lc, 1, &nodes);
-            if let Some(nearest_id) = nearest.into_iter().next() {
-                curr_ep = nearest_id;
-            }
+            curr_ep = self.search_layer_greedy(&scorer, curr_ep, lc, &nodes);
         }
 
         // Beam search at layer 0. When refining, over-fetch candidates so the
@@ -759,16 +819,16 @@ impl HnswIndex {
         ((-r.ln() * ml).floor() as usize).min(10) // Cap at layer 10
     }
 
-    /// Greedy 1-nearest-neighbor search on a single layer.
+    /// Greedy 1-nearest-neighbor search on a single layer. Returns the single
+    /// nearest node id (allocation-free — called once per layer during descent).
     fn search_layer_greedy(
         &self,
         scorer: &Scorer,
-        entry_points: &[ObjectId],
+        entry: ObjectId,
         layer: usize,
-        _ef: usize,
         nodes: &NodeMap,
-    ) -> (Vec<ObjectId>, Vec<f32>) {
-        let mut best_id = entry_points[0];
+    ) -> ObjectId {
+        let mut best_id = entry;
         let mut best_dist = scorer.score(&nodes[&best_id].vector);
 
         loop {
@@ -792,10 +852,11 @@ impl HnswIndex {
             }
         }
 
-        (vec![best_id], vec![best_dist])
+        best_id
     }
 
-    /// Beam search on a single layer.
+    /// Beam search on a single layer. Uses per-thread reusable scratch
+    /// ([`BEAM_SCRATCH`]) so the hot path allocates only the returned vectors.
     fn search_layer_beam(
         &self,
         scorer: &Scorer,
@@ -804,131 +865,85 @@ impl HnswIndex {
         ef: usize,
         nodes: &NodeMap,
     ) -> (Vec<ObjectId>, Vec<f32>) {
-        #[derive(Debug)]
-        struct Candidate {
-            id: ObjectId,
-            /// Distance (smaller = better)
-            dist: OrdFloat,
-        }
-        impl PartialEq for Candidate {
-            fn eq(&self, other: &Self) -> bool {
-                self.dist == other.dist
-            }
-        }
-        impl Eq for Candidate {}
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Candidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Max-heap: larger OrdFloat = larger distance = worse
-                // But we want min-heap (smallest distance first), so reverse
-                other.dist.cmp(&self.dist)
-            }
-        }
+        BEAM_SCRATCH.with(|scratch| {
+            let s = &mut *scratch.borrow_mut();
+            // `clear` keeps the backing capacity from prior queries → no realloc.
+            s.visited.clear();
+            s.candidates.clear();
+            s.results.clear();
 
-        let mut visited: IdSet = IdSet::default();
-        // candidates: min-heap (closest first)
-        let mut candidates = BinaryHeap::new();
-        // results: max-heap (worst first, for eviction). Since Candidate is
-        // reversed, worst (largest distance) pops first from the BinaryHeap.
-        // We need a "worst-heap" — store with distance directly (not reversed).
-        #[derive(Debug)]
-        struct WorstCandidate {
-            id: ObjectId,
-            dist: OrdFloat,
-        }
-        impl PartialEq for WorstCandidate {
-            fn eq(&self, other: &Self) -> bool {
-                self.dist == other.dist
+            for &ep in entry_points {
+                let dist = scorer.score(&nodes[&ep].vector);
+                s.candidates.push(Candidate {
+                    id: ep,
+                    dist: OrdFloat(dist),
+                });
+                s.results.push(WorstCandidate {
+                    id: ep,
+                    dist: OrdFloat(dist),
+                });
+                s.visited.insert(ep);
             }
-        }
-        impl Eq for WorstCandidate {}
-        impl PartialOrd for WorstCandidate {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for WorstCandidate {
-            fn cmp(&self, other: &Self) -> Ordering {
-                self.dist.cmp(&other.dist)
-            }
-        }
-        let mut results: BinaryHeap<WorstCandidate> = BinaryHeap::new();
 
-        for &ep in entry_points {
-            let dist = scorer.score(&nodes[&ep].vector);
-            candidates.push(Candidate {
-                id: ep,
-                dist: OrdFloat(dist),
-            });
-            results.push(WorstCandidate {
-                id: ep,
-                dist: OrdFloat(dist),
-            });
-            visited.insert(ep);
-        }
+            while let Some(current) = s.candidates.pop() {
+                let current_dist = current.dist.0;
 
-        while let Some(current) = candidates.pop() {
-            let current_dist = current.dist.0;
-
-            // Stop if current is farther than the worst result we're keeping
-            if results.len() >= ef {
-                if let Some(worst) = results.peek() {
-                    if current_dist >= worst.dist.0 {
-                        break;
+                // Stop if current is farther than the worst result we're keeping.
+                if s.results.len() >= ef {
+                    if let Some(worst) = s.results.peek() {
+                        if current_dist >= worst.dist.0 {
+                            break;
+                        }
                     }
                 }
-            }
 
-            // Expand neighbors in place; `visited.insert` returns false when the
-            // id was already present, combining the contains+insert check.
-            if let Some(neighbor_set) = nodes.get(&current.id).and_then(|n| n.neighbors.get(&layer))
-            {
-                for &neighbor_id in neighbor_set {
-                    if !visited.insert(neighbor_id) {
-                        continue;
-                    }
-                    if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = scorer.score(&neighbor.vector);
-                        let od = OrdFloat(dist);
+                // Expand neighbors in place; `visited.insert` returns false when
+                // the id was already present (combines the contains+insert check).
+                if let Some(neighbor_set) =
+                    nodes.get(&current.id).and_then(|n| n.neighbors.get(&layer))
+                {
+                    for &neighbor_id in neighbor_set {
+                        if !s.visited.insert(neighbor_id) {
+                            continue;
+                        }
+                        if let Some(neighbor) = nodes.get(&neighbor_id) {
+                            let dist = scorer.score(&neighbor.vector);
+                            let od = OrdFloat(dist);
 
-                        let should_add = results.len() < ef
-                            || dist < results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
+                            let should_add = s.results.len() < ef
+                                || dist < s.results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
 
-                        if should_add {
-                            candidates.push(Candidate {
-                                id: neighbor_id,
-                                dist: od,
-                            });
-                            results.push(WorstCandidate {
-                                id: neighbor_id,
-                                dist: od,
-                            });
-                            if results.len() > ef {
-                                results.pop();
+                            if should_add {
+                                s.candidates.push(Candidate {
+                                    id: neighbor_id,
+                                    dist: od,
+                                });
+                                s.results.push(WorstCandidate {
+                                    id: neighbor_id,
+                                    dist: od,
+                                });
+                                if s.results.len() > ef {
+                                    s.results.pop();
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Collect results (worst-first in heap, so reverse for closest-first)
-        let mut ids = Vec::with_capacity(results.len());
-        let mut dists = Vec::with_capacity(results.len());
-        let mut temp = Vec::new();
-        while let Some(c) = results.pop() {
-            temp.push((c.id, c.dist.0));
-        }
-        for (id, dist) in temp.into_iter().rev() {
-            ids.push(id);
-            dists.push(dist);
-        }
-
-        (ids, dists)
+            // Pop the worst-first heap (so it empties for reuse), then reverse
+            // to closest-first — preserving the original ordering contract.
+            let n = s.results.len();
+            let mut ids = Vec::with_capacity(n);
+            let mut dists = Vec::with_capacity(n);
+            while let Some(c) = s.results.pop() {
+                ids.push(c.id);
+                dists.push(c.dist.0);
+            }
+            ids.reverse();
+            dists.reverse();
+            (ids, dists)
+        })
     }
 
     /// Heuristic neighbor selection (prunes candidates for better graph quality).

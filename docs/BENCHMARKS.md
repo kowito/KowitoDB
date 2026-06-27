@@ -130,9 +130,36 @@ The hot path (graph traversal + distance) was tuned without changing recall:
   default SipHasher across the node map and visited/neighbor sets.
 - **Alloc-free traversal** — neighbor expansion iterates the set in place instead
   of collecting a `Vec` per visited node.
+- **Per-thread beam scratch** — the visited set and the two heaps are reused from
+  a `thread_local` across queries, so a warm query path allocates only its
+  returned vectors (allocator contention otherwise caps concurrent QPS).
+- **Scalar greedy descent** — `search_layer_greedy` returns the single nearest id
+  instead of a `Vec` per layer; the rotation lock is skipped entirely unless
+  binary quantization is on.
 
 Net effect at `ef_search=200`: ~22% lower query latency, ~27% higher build
 throughput, recall unchanged (~94%).
+
+## Maximizing QPS
+
+Concurrent throughput is **core-bound** once the hot path is allocation-free —
+on a 4 P-core + 6 E-core box, 10 query threads already reach ~6.3× the
+single-thread rate (near the hardware ceiling). So beyond the recall-neutral
+tuning above, **QPS is bought by doing less work per query**, which trades
+recall — choose the operating point for your workload:
+
+| Lever | QPS effect | recall effect |
+|-------|-----------|---------------|
+| `ef_search` 200 → 100 | **~1.6× QPS** | ~98% → ~95% |
+| `ef_search` 200 → 50 | **~2.6× QPS** | ~98% → ~93% |
+| int8 quantization | ~1× (memory win) | ~91% |
+| binary + int8 rerank | **~3.7× lower latency** | ~79% |
+| binary 1-bit | **~3.6× lower latency** | data-dependent |
+
+These compose: e.g. `ef_search=100` **and** `binary_rerank` stack a ~1.6× and a
+~3–4× factor. For a fixed recall target, pick the lowest `ef_search` that hits it
+(measure with `bench_hnsw`), then add quantization for the memory/bandwidth win.
+The sharded index also scales build and adds per-query shard parallelism.
 
 ## Caveats / what these numbers are not
 
