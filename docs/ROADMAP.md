@@ -36,8 +36,11 @@ Embed and BM25-index a context-augmented text (deterministic preamble from
 metadata + keywords) while storage returns the original content.
 - **Evidence (VERIFIED 3-0):** Contextual Embeddings + Contextual BM25 cut top-20
   retrieval failure rate **49%**; with reranking **67%**. — Anthropic, 2024.
-- **Follow-up (📋):** LLM-generated context (faithful Anthropic version) behind an
-  optional generative-client hook.
+- ✅ **Follow-up shipped (v0.25):** **LLM-generated context** (the faithful
+  Anthropic version) — with an `LlmClient` configured and
+  `KOWITODB_LLM_CONTEXTUAL=1`, each object's indexed text is prefixed by an
+  LLM-written situating sentence (stored content untouched); falls back to the
+  deterministic preamble otherwise. Mock-tested.
 
 ### 2. Reranking — RRF fusion ✅ done · cross-encoder ✅ shipped (v0.19.0)
 - ✅ **Already present:** the reranker does Reciprocal Rank Fusion across
@@ -59,7 +62,7 @@ broaden the search across vector + keyword and re-rank. The *mechanism* (a
 lightweight retrieval-quality evaluator) was the verified part of CRAG.
 `KOWITODB_CORRECTIVE_RETRIEVAL=0` disables.
 
-### 3. Mem0-style memory → searchable knowledge — 🔜 in progress (category-definer)
+### 3. Mem0-style memory → searchable knowledge — ✅ shipped (v0.25.0)
 - ✅ **Shipped (v0.15):** `remember_turn` promotes each conversation turn into a
   searchable knowledge object (stable id → idempotent; `system` turns excluded),
   so past conversation is retrievable via `ai.ask()` and lives in the same store
@@ -67,8 +70,12 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - ✅ **Shipped (v0.16):** **memory↔entity graph edges** — a promoted memory is
   linked (`mentions`) to the existing knowledge it references (top full-text
   matches), so memories and facts are mutually traversable in the graph.
-- 📋 **Remaining:** LLM-driven extract → consolidate → update (ADD/UPDATE/DELETE/
-  NOOP) for salient-fact distillation.
+- ✅ **Shipped (v0.25):** **LLM-driven distillation** — with an `LlmClient`
+  configured, a recorded turn is distilled to the single salient durable fact
+  before promotion (or dropped on `NOOP`), so memory holds clean facts rather
+  than raw chatter; the stable-id idempotency keys off the distilled fact. Mock-
+  tested. (Full ADD/UPDATE/DELETE reconciliation against prior memories is a
+  natural extension of the same `distill_memory` seam.)
 - **Why us:** we already persist agent memory **and** have a graph index — the
   most *differentiating* item; it makes "agent-memory OS" real.
 
@@ -83,8 +90,11 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   `Analytical` intent ("how many / average / count of …") routed to wide
   structured recall rather than tight top-k semantic. Unit-tested (intent shifts
   ranking; `General` matches the base weights).
-- 📋 **Remaining:** NL→SQL routing for analytical queries (execute real
-  DataFusion aggregates) — needs a generative client for the NL→SQL step.
+- ✅ **NL→SQL shipped (v0.25):** with an `LlmClient` configured,
+  `answer_with_sql()` translates an analytical question into a single SQL query
+  over the `knowledge` table and executes it through the existing DataFusion
+  path — real aggregates, not approximations. Mock-tested end-to-end (mock SQL →
+  rows over the store); returns `None` (retrieval fallback) when no client.
 - **Evidence:** 2025 evals show routing/integration beats RAG-or-GraphRAG alone
   (~+6%). — arxiv 2502.11371.
 

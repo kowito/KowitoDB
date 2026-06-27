@@ -2,6 +2,7 @@ mod cluster;
 mod config;
 mod db;
 mod embedding;
+mod llm;
 #[cfg(feature = "local-embeddings")]
 mod local_embedding;
 mod memory;
@@ -14,6 +15,7 @@ pub use cluster::{Cluster, ClusterService};
 pub use config::ServerConfig;
 pub use db::KowitoDBEngine;
 pub use embedding::{EmbeddingClient, EmbeddingResult, ProxyEmbeddingClient};
+pub use llm::{LlmClient, LlmConfig, OpenAiLlmClient};
 #[cfg(feature = "local-embeddings")]
 pub use local_embedding::LocalEmbeddingClient;
 pub use memory::{AgentMemory, AgentSession, ConversationTurn, TurnRole};
