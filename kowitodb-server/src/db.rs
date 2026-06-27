@@ -146,21 +146,7 @@ impl KowitoDBEngine {
         fulltext_index: FullTextIndex,
         agent_memory: AgentMemory,
     ) -> Self {
-        // Use a real OpenAI-compatible embedding provider when configured via
-        // environment, otherwise fall back to the deterministic dev proxy.
-        let embedding_client: Arc<dyn EmbeddingClient> = match OpenAiConfig::from_env() {
-            Some(cfg) => {
-                info!(
-                    "Embeddings: OpenAI-compatible provider (model={})",
-                    cfg.model
-                );
-                Arc::new(OpenAiEmbeddingClient::new(cfg))
-            }
-            None => {
-                info!("Embeddings: deterministic proxy (set KOWITODB_EMBEDDING_PROVIDER for a real model)");
-                Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128))
-            }
-        };
+        let embedding_client = select_embedding_client();
         let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
 
         Self {
@@ -910,6 +896,59 @@ pub struct StatsResponse {
 }
 
 // ---- Ser/de helpers ----
+
+/// The deterministic dev embedding fallback (no network, not semantic).
+fn proxy_embedding_client() -> Arc<dyn EmbeddingClient> {
+    Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128))
+}
+
+/// Select the embedding client from `KOWITODB_EMBEDDING_PROVIDER`:
+/// `local` (Candle on-device), `openai`/`ollama` (HTTP), else the dev proxy.
+fn select_embedding_client() -> Arc<dyn EmbeddingClient> {
+    let provider = std::env::var("KOWITODB_EMBEDDING_PROVIDER")
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if provider == "local" {
+        return local_embedding_client();
+    }
+
+    match OpenAiConfig::from_env() {
+        Some(cfg) => {
+            info!(
+                "Embeddings: OpenAI-compatible provider (model={})",
+                cfg.model
+            );
+            Arc::new(OpenAiEmbeddingClient::new(cfg))
+        }
+        None => {
+            info!("Embeddings: deterministic proxy (set KOWITODB_EMBEDDING_PROVIDER=local for a real on-device model)");
+            proxy_embedding_client()
+        }
+    }
+}
+
+#[cfg(feature = "local-embeddings")]
+fn local_embedding_client() -> Arc<dyn EmbeddingClient> {
+    let model = std::env::var("KOWITODB_EMBEDDING_MODEL")
+        .unwrap_or_else(|_| crate::local_embedding::DEFAULT_LOCAL_MODEL.to_string());
+    match crate::local_embedding::LocalEmbeddingClient::load(&model) {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            tracing::error!("Failed to load local embedding model ({e}); using the proxy instead");
+            proxy_embedding_client()
+        }
+    }
+}
+
+#[cfg(not(feature = "local-embeddings"))]
+fn local_embedding_client() -> Arc<dyn EmbeddingClient> {
+    tracing::warn!(
+        "KOWITODB_EMBEDDING_PROVIDER=local but this binary was built without the \
+         local-embeddings feature; using the proxy"
+    );
+    proxy_embedding_client()
+}
 
 /// Open the persistent agent-session store under `{index_path}/sessions`.
 fn open_session_store(index_path: &std::path::Path) -> KResult<AgentMemory> {

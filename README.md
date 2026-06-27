@@ -70,7 +70,7 @@ and assembles a token-budgeted context — behind a single call.
 | Agent memory | Conversation sessions, working memory, pinned objects; `RecordTurn`/`GetSession` over gRPC; persisted to a sled store under `{index_path}/sessions` | Implemented |
 | Bulk + pagination | `BatchInsert` for bulk ingestion; `List` with `offset`/`limit` + total count | Implemented |
 | Filtered retrieval | Exact-match `metadata_filter` on `Ask`/`Search`, applied via the metadata index | Implemented |
-| Embedding clients | Deterministic proxy (default) + OpenAI-compatible HTTP client, selected via env | Implemented |
+| Embedding clients | On-device Candle model (`local-embeddings` feature), OpenAI-compatible HTTP client, or a deterministic dev proxy — selected via env | Implemented |
 | Index rebuild on restart | `open()` re-reads the object store and repopulates the in-memory vector/metadata/time/graph indexes | Implemented |
 | Storage: sled | Default persistent embedded key/value store | Implemented |
 | Storage: Lance | Optional columnar/Arrow dataset backend behind the `lance` feature | Implemented |
@@ -177,7 +177,7 @@ is unset the server uses a deterministic dev proxy; set it to use a real model:
 
 | Variable | Meaning |
 | --- | --- |
-| `KOWITODB_EMBEDDING_PROVIDER` | `openai` or `ollama` (anything else / unset → proxy). |
+| `KOWITODB_EMBEDDING_PROVIDER` | `local` (on-device Candle model — needs the `local-embeddings` build feature), `openai`, or `ollama` (anything else / unset → deterministic dev proxy). |
 | `OPENAI_API_KEY` / `KOWITODB_OPENAI_API_KEY` | API key for the `openai` provider. |
 | `KOWITODB_OPENAI_BASE_URL` | Override the OpenAI-compatible base URL (default `https://api.openai.com/v1`). |
 | `KOWITODB_EMBEDDING_MODEL` | Model name (default `text-embedding-3-small`, or `nomic-embed-text` for Ollama). |
@@ -363,14 +363,17 @@ These are accurate to the current code and are documented in detail in
   They are **rebuilt from the object store on startup** via `open()`, at a cost
   of O(stored objects); they are not separately persisted. The working set must
   fit in RAM.
-- **Default embeddings are a deterministic hash proxy** unless you set
-  `KOWITODB_EMBEDDING_PROVIDER`. A real OpenAI-compatible / Ollama client is
-  wired in and selected by env. Token counts use a ~4-chars-per-token heuristic.
-- **Agent conversation memory is in-memory and not persisted** — it is exposed
-  over gRPC (`RecordTurn`/`GetSession`) and counted in `Stats`, but is lost on
-  restart.
-- **Keyword and time predicates still scan storage**; `id` and `importance`
-  filters are pushed down. `Search`/`Ask` results cap at 100.
+- **Default embeddings are a deterministic hash proxy** (not semantic) unless
+  you choose a real model: build with `--features local-embeddings` and set
+  `KOWITODB_EMBEDDING_PROVIDER=local` for an on-device Candle model, or use the
+  OpenAI-compatible / Ollama HTTP client. Token counts use a ~4-chars-per-token
+  heuristic.
+- **Keyword and time predicates still scan storage** in the sled backend; `id`
+  and `importance` filters are pushed down (the Lance backend also pushes
+  keyword/time). `Search`/`Ask` results cap at a configurable maximum
+  (`--max-results`, default 100).
+- **Build throughput for the vector index is the current bottleneck** (~900
+  inserts/s single-threaded; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)).
 
 ## Documentation
 
@@ -381,6 +384,8 @@ These are accurate to the current code and are documented in detail in
 - [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — backup/restore, upgrades,
   metrics, plan cache, scaling boundaries.
 - [`docs/SDKS.md`](docs/SDKS.md) — Python / TypeScript / Go usage and codegen.
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — HNSW recall/latency benchmark and
+  how to run it.
 
 ## License
 

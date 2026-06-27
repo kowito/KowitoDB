@@ -71,7 +71,10 @@ impl Default for HnswParams {
         Self {
             m,
             ef_construction: 200,
-            ef_search: 50,
+            // ef_search=200 targets ~94% recall@10 on 384-dim data (see the
+            // `bench_hnsw` example); ef_search=50 only reached ~60%. The modest
+            // extra query latency is worth it for a knowledge DB.
+            ef_search: 200,
             m_max: m,
             m0: 2 * m,
         }

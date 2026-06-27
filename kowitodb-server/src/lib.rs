@@ -1,6 +1,8 @@
 mod config;
 mod db;
 mod embedding;
+#[cfg(feature = "local-embeddings")]
+mod local_embedding;
 mod memory;
 mod metrics;
 mod openai;
@@ -9,6 +11,8 @@ mod service;
 pub use config::ServerConfig;
 pub use db::KowitoDBEngine;
 pub use embedding::{EmbeddingClient, EmbeddingResult, ProxyEmbeddingClient};
+#[cfg(feature = "local-embeddings")]
+pub use local_embedding::LocalEmbeddingClient;
 pub use memory::{AgentMemory, AgentSession, ConversationTurn, TurnRole};
 pub use metrics::{MetricsCollector, ServerMetrics};
 pub use openai::{OpenAiConfig, OpenAiEmbeddingClient};
