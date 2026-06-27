@@ -1,3 +1,4 @@
+mod cluster;
 mod config;
 mod db;
 mod embedding;
@@ -8,6 +9,7 @@ mod metrics;
 mod openai;
 mod service;
 
+pub use cluster::{Cluster, ClusterService};
 pub use config::ServerConfig;
 pub use db::KowitoDBEngine;
 pub use embedding::{EmbeddingClient, EmbeddingResult, ProxyEmbeddingClient};
@@ -137,6 +139,40 @@ pub async fn serve_with_config(
         Err(e) => warn!("Final vector-index checkpoint failed: {}", e),
     }
 
+    Ok(())
+}
+
+/// Start a cluster **gateway**: a coordinator that fronts `peers` data nodes and
+/// speaks the exact same `KowitoDB` gRPC API, so clients/SDKs are unchanged.
+/// Writes are partitioned (and optionally replicated); reads scatter-gather.
+pub async fn serve_gateway(
+    addr: SocketAddr,
+    peers: Vec<String>,
+    replication_factor: usize,
+) -> anyhow::Result<()> {
+    let cluster = Cluster::connect(&peers, replication_factor).await?;
+    info!(
+        "KowitoDB gateway: {} data node(s), replication_factor={}",
+        cluster.node_count(),
+        replication_factor
+    );
+    let service = ClusterService::new(cluster);
+
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<KowitoDbServer<ClusterService>>()
+        .await;
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+
+    info!("KowitoDB gateway listening on {}", addr);
+    Server::builder()
+        .add_service(health_service)
+        .add_service(reflection)
+        .add_service(KowitoDbServer::new(service))
+        .serve(addr)
+        .await?;
     Ok(())
 }
 

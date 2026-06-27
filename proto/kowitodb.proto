@@ -35,6 +35,10 @@ message InsertRequest {
   repeated string keywords = 4;
   repeated RelationshipInput relationships = 5;
   float importance = 6;
+  // Optional caller-assigned id. Used by the cluster gateway to partition
+  // writes before the (otherwise server-generated) id exists. If empty, the
+  // server generates one.
+  optional string id = 7;
 }
 
 message RelationshipInput {
@@ -145,6 +149,8 @@ message RememberRequest {
   map<string, string> metadata = 3;
   repeated string keywords = 4;
   float importance = 5;
+  // Optional caller-assigned id (see InsertRequest.id).
+  optional string id = 6;
 }
 
 message RememberResponse {

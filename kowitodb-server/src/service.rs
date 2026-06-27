@@ -205,6 +205,13 @@ impl KowitoDb for KowitoDBService {
         let req = request.into_inner();
         let mut obj = kowitodb_core::KnowledgeObject::new(req.content);
 
+        if let Some(id) = req
+            .id
+            .as_deref()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        {
+            obj.id = id;
+        }
         for (model, vec_proto) in req.embeddings {
             obj.embeddings.insert(model, vec_proto.values);
         }
@@ -361,6 +368,15 @@ impl KowitoDb for KowitoDBService {
 /// Build a `KnowledgeObject` from an `InsertRequest` (shared by Insert/BatchInsert).
 fn insert_req_to_obj(req: proto::InsertRequest) -> kowitodb_core::KnowledgeObject {
     let mut obj = kowitodb_core::KnowledgeObject::new(req.content);
+
+    // Honor a caller-assigned id (used by the cluster gateway to partition).
+    if let Some(id) = req
+        .id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    {
+        obj.id = id;
+    }
 
     for (model, vec_proto) in req.embeddings {
         obj.embeddings.insert(model, vec_proto.values);

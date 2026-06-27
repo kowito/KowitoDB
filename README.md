@@ -70,6 +70,7 @@ and assembles a token-budgeted context — behind a single call.
 | Agent memory | Conversation sessions, working memory, pinned objects; `RecordTurn`/`GetSession` over gRPC; persisted to a sled store under `{index_path}/sessions` | Implemented |
 | Bulk + pagination | `BatchInsert` for bulk ingestion; `List` with `offset`/`limit` + total count | Implemented |
 | Filtered retrieval | Exact-match `metadata_filter` on `Ask`/`Search`, applied via the metadata index | Implemented |
+| Distributed mode | `gateway` coordinator over N data nodes: partitioned + replicated writes, scatter-gather reads, same gRPC API | Implemented |
 | Embedding clients | On-device Candle model (`local-embeddings` feature), OpenAI-compatible HTTP client, or a deterministic dev proxy — selected via env | Implemented |
 | Index rebuild on restart | `open()` re-reads the object store and repopulates the in-memory vector/metadata/time/graph indexes | Implemented |
 | Storage: sled | Default persistent embedded key/value store | Implemented |
@@ -192,6 +193,28 @@ it defaults to `info`:
 ```bash
 RUST_LOG=kowitodb=debug,info ./target/release/kowitodb serve
 ```
+
+### Distributed mode (gateway)
+
+Run several plain data nodes, then a `gateway` coordinator in front of them. The
+gateway partitions writes by object id (optionally replicating to `R` nodes) and
+scatter-gathers reads, merging results — and it speaks the **same gRPC API**, so
+clients/SDKs point at the gateway unchanged.
+
+```bash
+# data nodes (each holds a partition)
+kowitodb serve --addr 0.0.0.0:50051 --storage-path /data/n1/s --index-path /data/n1/i
+kowitodb serve --addr 0.0.0.0:50052 --storage-path /data/n2/s --index-path /data/n2/i
+
+# coordinator
+kowitodb gateway --addr 0.0.0.0:50050 \
+  --peers host1:50051,host2:50052 \
+  --replication-factor 2
+```
+
+This provides real horizontal distribution. It is **not** consensus-backed HA —
+see [docs/ROADMAP.md](docs/ROADMAP.md) for the honest limits (no quorum,
+rebalancing, or failure recovery yet).
 
 ### Use a client
 

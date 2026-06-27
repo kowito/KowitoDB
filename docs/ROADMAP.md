@@ -88,12 +88,25 @@ DiskANN + RaBitQ enables billion-scale on SSD.
 - **Multimodal embeddings:** image/text in the same store (knowledge objects are
   already content-agnostic).
 
-## Scale / infra (📋)
+## Scale / infra
 
-- **Parallel HNSW build via fine-grained locking** (current build holds a global
-  write lock; sharding sidesteps it but per-shard build is still serial).
-- **Cross-machine sharding + replication** — true horizontal scale / HA. Large
-  distributed-systems effort; sharding (shipped) is the in-process foundation.
+- ✅ **Distributed mode (v0.11)** — a `gateway` coordinator fronts N data nodes:
+  writes are partitioned by id (consistent `id % N`) and optionally replicated;
+  reads scatter-gather across nodes and merge (search/ask de-dup + re-rank;
+  stats/list aggregate). Speaks the same gRPC API, so SDKs are unchanged.
+- 📋 **Production HA on top of distributed mode:** Raft/quorum consensus,
+  automatic rebalancing on membership change, failure detection + repair, and a
+  distributed-SQL planner (cross-shard aggregates). The gateway is the
+  foundation; these are the next, larger steps.
+- 📋 **Parallel HNSW build via fine-grained locking** (per-shard build is still
+  serial; sharding sidesteps the global write lock at the cluster level).
+
+## Honest limits of distributed mode (v0.11)
+
+Real horizontal distribution, but **not** production HA: best-effort replication
+(write fan-out, no quorum/consensus), no automatic rebalancing or failure
+recovery, cross-shard SQL aggregates are per-shard partials, and the gateway is a
+single coordinator. These are the 📋 items above.
 
 ## Deliberately not pursuing (⛔)
 

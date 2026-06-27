@@ -6,7 +6,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use kowitodb_core::KnowledgeObject;
-use kowitodb_server::{serve_with_config, KowitoDBEngine, ServerConfig};
+use kowitodb_server::{serve_gateway, serve_with_config, KowitoDBEngine, ServerConfig};
 
 /// KowitoDB — AI Knowledge Operating System
 ///
@@ -75,6 +75,21 @@ enum Commands {
         /// Expose Prometheus /metrics + /healthz on this address (e.g. 0.0.0.0:9090).
         #[arg(long, env = "KOWITODB_METRICS_ADDR")]
         metrics_addr: Option<SocketAddr>,
+    },
+
+    /// Run a cluster gateway that distributes over data nodes (distributed mode)
+    Gateway {
+        /// Address to bind the gateway
+        #[arg(short, long, default_value = "127.0.0.1:50050")]
+        addr: SocketAddr,
+
+        /// Comma-separated data node addresses (e.g. host1:50051,host2:50051)
+        #[arg(long, value_delimiter = ',', env = "KOWITODB_PEERS")]
+        peers: Vec<String>,
+
+        /// Replication factor — write each object to this many nodes
+        #[arg(long, default_value = "1", env = "KOWITODB_REPLICATION_FACTOR")]
+        replication_factor: usize,
     },
 
     /// Ask a question (embedded mode — no server required)
@@ -209,6 +224,20 @@ async fn main() -> anyhow::Result<()> {
                 max_results: Some(max_results),
             };
             serve_with_config(engine, addr, config).await?;
+        }
+
+        Commands::Gateway {
+            addr,
+            peers,
+            replication_factor,
+        } => {
+            info!("Starting KowitoDB gateway v{}", env!("CARGO_PKG_VERSION"));
+            if peers.is_empty() {
+                anyhow::bail!(
+                    "--peers is required: a comma-separated list of data node host:port addresses"
+                );
+            }
+            serve_gateway(addr, peers, replication_factor).await?;
         }
 
         Commands::Ask {
