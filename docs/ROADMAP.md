@@ -51,12 +51,15 @@ broaden the search across vector + keyword and re-rank. The *mechanism* (a
 lightweight retrieval-quality evaluator) was the verified part of CRAG.
 `KOWITODB_CORRECTIVE_RETRIEVAL=0` disables.
 
-### 3. Mem0-style memory consolidation, fused into the graph — 📋 planned (category-definer)
-Replace flat turn storage with an LLM-driven extract → consolidate → update
-pipeline (ADD/UPDATE/DELETE/NOOP) and link memories as nodes/edges in the graph.
-- **Maturity:** Mem0 (Chhikara et al., Apr 2025), lineage MemGPT (2023).
-- **Why us:** we already persist agent memory **and** have a graph index — this is
-  the most *differentiating* item; it makes "agent-memory OS" real.
+### 3. Mem0-style memory → searchable knowledge — 🔜 in progress (category-definer)
+- ✅ **Shipped (v0.15):** `remember_turn` promotes each conversation turn into a
+  searchable knowledge object (stable id → idempotent; `system` turns excluded),
+  so past conversation is retrievable via `ai.ask()` and lives in the same store
+  as ingested knowledge. The `RecordTurn` RPC routes through it.
+- 📋 **Remaining:** LLM-driven extract → consolidate → update (ADD/UPDATE/DELETE/
+  NOOP) for salient-fact distillation, and explicit memory↔entity graph edges.
+- **Why us:** we already persist agent memory **and** have a graph index — the
+  most *differentiating* item; it makes "agent-memory OS" real.
 
 ### 4. Query routing in the planner — ✅ largely done · 📋 enhance
 - ✅ **Already present:** a rule-engine planner maps detected intent → retrieval

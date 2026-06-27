@@ -320,19 +320,15 @@ impl KowitoDb for KowitoDBService {
         &self,
         request: Request<proto::RecordTurnRequest>,
     ) -> Result<Response<proto::RecordTurnResponse>, Status> {
-        use crate::memory::TurnRole;
         let req = request.into_inner();
-        let role = match req.role.to_lowercase().as_str() {
-            "assistant" => TurnRole::Assistant,
-            "system" => TurnRole::System,
-            "observation" => TurnRole::Observation,
-            _ => TurnRole::User,
-        };
-
-        let mut session = self.engine.agent_memory.get_or_create(&req.session_id);
-        session.add_turn(role, req.content);
-        let turn_count = session.turn_count() as u32;
-        self.engine.agent_memory.save(session);
+        let turn_count = self
+            .engine
+            .remember_turn(&req.session_id, &req.role, req.content)
+            .await
+            .map_err(|e| {
+                self.metrics.record_error();
+                Status::internal(e.to_string())
+            })?;
 
         Ok(Response::new(proto::RecordTurnResponse { turn_count }))
     }

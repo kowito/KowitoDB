@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use tracing::{debug, info};
 
 use crate::embedding::{EmbeddingClient, ProxyEmbeddingClient};
-use crate::memory::AgentMemory;
+use crate::memory::{AgentMemory, TurnRole};
 use crate::openai::{OpenAiConfig, OpenAiEmbeddingClient};
 use crate::proto;
 
@@ -1052,6 +1052,47 @@ impl KowitoDBEngine {
             .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))
     }
 
+    /// Record an agent conversation turn AND promote it into searchable,
+    /// graph-able knowledge (Mem0-style episodic memory). Returns the session's
+    /// turn count.
+    ///
+    /// The memory object has a stable id derived from `(session_id, content)`, so
+    /// re-recording the same turn is idempotent (no duplicate memory). `system`
+    /// turns are not promoted. This makes past conversation retrievable via
+    /// `ai.ask()` and linkable in the graph alongside ingested knowledge.
+    pub async fn remember_turn(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: String,
+    ) -> KResult<u32> {
+        let turn_role = match role.to_lowercase().as_str() {
+            "assistant" => TurnRole::Assistant,
+            "system" => TurnRole::System,
+            "observation" => TurnRole::Observation,
+            _ => TurnRole::User,
+        };
+
+        let mut session = self.agent_memory.get_or_create(session_id);
+        session.add_turn(turn_role.clone(), content.clone());
+        let count = session.turn_count() as u32;
+        self.agent_memory.save(session);
+
+        // Promote to searchable knowledge (idempotent by stable id).
+        if !matches!(turn_role, TurnRole::System) && !content.trim().is_empty() {
+            let mem_id = stable_memory_id(session_id, &content);
+            if self.get(mem_id).await?.is_none() {
+                let mut obj = KnowledgeObject::new(content)
+                    .with_metadata("session_id", session_id)
+                    .with_metadata("role", role)
+                    .with_metadata("kind", "memory");
+                obj.id = mem_id;
+                self.insert(obj).await?;
+            }
+        }
+        Ok(count)
+    }
+
     /// Comprehensive database stats.
     pub async fn stats(&self) -> KResult<StatsResponse> {
         Ok(StatsResponse {
@@ -1171,6 +1212,22 @@ fn local_embedding_client() -> Arc<dyn EmbeddingClient> {
          local-embeddings feature; using the proxy"
     );
     proxy_embedding_client()
+}
+
+/// Deterministic memory id from `(session_id, content)`, so the same turn maps
+/// to the same knowledge object (idempotent promotion).
+fn stable_memory_id(session_id: &str, content: &str) -> ObjectId {
+    use std::hash::{Hash, Hasher};
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hi);
+    content.hash(&mut hi);
+    0xA5u8.hash(&mut hi);
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut lo);
+    session_id.hash(&mut lo);
+    0x5Au8.hash(&mut lo);
+    let bits = ((hi.finish() as u128) << 64) | (lo.finish() as u128);
+    uuid::Uuid::from_u128(bits)
 }
 
 /// Open the persistent agent-session store under `{index_path}/sessions`.
@@ -1506,6 +1563,51 @@ mod tests {
         assert_eq!(
             stored.content,
             "Quarterly results were strong and the team grew."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_promoted_to_searchable_knowledge() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        let n = engine
+            .remember_turn("sess-1", "user", "I love hiking in the mountains".into())
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // Recorded in agent memory.
+        assert_eq!(engine.agent_memory.get("sess-1").unwrap().turn_count(), 1);
+
+        // Retrievable as knowledge via ai.ask().
+        let resp = engine.ask("hiking", 5).await.unwrap();
+        assert!(
+            resp.results.iter().any(|r| r.content.contains("hiking")),
+            "promoted memory should be retrievable"
+        );
+
+        // Idempotent: re-recording the same turn does not duplicate the memory.
+        engine
+            .remember_turn("sess-1", "user", "I love hiking in the mountains".into())
+            .await
+            .unwrap();
+        let (objects, _) = engine.list(0, 100).await.unwrap();
+        let memories = objects
+            .iter()
+            .filter(|o| o.metadata.get("kind").and_then(|v| v.as_str()) == Some("memory"))
+            .count();
+        assert_eq!(memories, 1, "duplicate memory must be deduped by stable id");
+
+        // System turns are recorded but not promoted to knowledge.
+        engine
+            .remember_turn("sess-1", "system", "you are a helpful assistant".into())
+            .await
+            .unwrap();
+        let (objects, _) = engine.list(0, 100).await.unwrap();
+        assert!(
+            !objects
+                .iter()
+                .any(|o| o.content.contains("helpful assistant")),
+            "system turns are not promoted"
         );
     }
 
