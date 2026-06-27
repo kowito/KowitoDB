@@ -139,4 +139,41 @@ fn main() {
         percentile(&latencies_us, 99.0),
     );
     println!("  throughput ~{:.0} queries/s (single-threaded)", qps);
+
+    // Concurrent throughput: queries run in parallel under the index's RwLock
+    // read locks, so single-node QPS scales with cores.
+    let threads = env_usize(
+        "BENCH_THREADS",
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
+    if threads > 1 {
+        let rounds = 5usize;
+        let start = Instant::now();
+        let total: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut count = 0usize;
+                        for _ in 0..rounds {
+                            for q in &query_vecs {
+                                let _ = index.search(q, k);
+                                count += 1;
+                            }
+                        }
+                        count
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        let agg_qps = total as f64 / start.elapsed().as_secs_f64();
+        println!("Concurrent ({threads} threads):");
+        println!(
+            "  aggregate throughput ~{:.0} queries/s ({:.1}x single-threaded)",
+            agg_qps,
+            agg_qps / qps
+        );
+    }
 }

@@ -19,6 +19,7 @@ hex.workspace = true
 sha2.workspace = true
 rand = "0.8"
 bincode = "1.3"
+ahash = "0.8"
 
 # Tantivy for full-text search
 [dependencies.tantivy]

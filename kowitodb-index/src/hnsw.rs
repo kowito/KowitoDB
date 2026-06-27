@@ -19,6 +19,13 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Set of object ids using a fast (ahash) hasher. UUID hashing with the default
+/// SipHasher dominates the hot path, so the index uses ahash everywhere ids are
+/// keyed.
+type IdSet = HashSet<ObjectId, ahash::RandomState>;
+/// Node map keyed by object id, ahash-hashed for the same reason.
+type NodeMap = HashMap<ObjectId, HnswNode, ahash::RandomState>;
+
 /// A float wrapper that provides total ordering for BinaryHeap use.
 #[derive(Debug, Clone, Copy)]
 struct OrdFloat(f32);
@@ -47,7 +54,7 @@ struct HnswNode {
     vector: Embedding,
     max_layer: usize,
     /// Per-layer neighbor sets: layer → set of neighbor IDs.
-    neighbors: HashMap<usize, HashSet<ObjectId>>,
+    neighbors: HashMap<usize, IdSet>,
 }
 
 /// HNSW index parameters.
@@ -86,7 +93,7 @@ impl Default for HnswParams {
 /// Thread-safe via RwLock. Supports concurrent reads and serialized writes.
 pub struct HnswIndex {
     /// All nodes, keyed by object ID.
-    nodes: Arc<RwLock<HashMap<ObjectId, HnswNode>>>,
+    nodes: Arc<RwLock<NodeMap>>,
     /// Entry point (top-layer node).
     entry_point: Arc<RwLock<Option<ObjectId>>>,
     /// Current maximum layer across all nodes.
@@ -99,7 +106,7 @@ pub struct HnswIndex {
 #[derive(Serialize)]
 struct HnswSnapshotRef<'a> {
     params: &'a HnswParams,
-    nodes: &'a HashMap<ObjectId, HnswNode>,
+    nodes: &'a NodeMap,
     entry_point: Option<ObjectId>,
     max_layer: usize,
 }
@@ -108,7 +115,7 @@ struct HnswSnapshotRef<'a> {
 #[derive(Deserialize)]
 struct HnswSnapshot {
     params: HnswParams,
-    nodes: HashMap<ObjectId, HnswNode>,
+    nodes: NodeMap,
     entry_point: Option<ObjectId>,
     max_layer: usize,
 }
@@ -116,7 +123,7 @@ struct HnswSnapshot {
 impl HnswIndex {
     pub fn new(params: HnswParams) -> Self {
         Self {
-            nodes: Arc::new(RwLock::new(HashMap::new())),
+            nodes: Arc::new(RwLock::new(NodeMap::default())),
             entry_point: Arc::new(RwLock::new(None)),
             max_layer: Arc::new(RwLock::new(0)),
             params,
@@ -145,7 +152,7 @@ impl HnswIndex {
         let ep = match *entry_point {
             Some(ep) => ep,
             None => {
-                node.neighbors.insert(0, HashSet::new());
+                node.neighbors.insert(0, IdSet::default());
                 *max_layer = node_layer;
                 nodes.insert(id, node);
                 *entry_point = Some(id);
@@ -154,18 +161,20 @@ impl HnswIndex {
             }
         };
 
-        // Find the current entry point at the top layer
+        // Find the current entry point at the top layer.
         let mut curr_ep = ep;
-        let mut curr_ep_node = nodes.get(&ep).cloned();
+        // Only the existence of the entry-point node matters here, so avoid
+        // cloning the whole node (and its vector) on every descent step.
+        let mut curr_ep_exists = nodes.contains_key(&ep);
         let global_max = *max_layer;
 
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
-            if let Some(ref _ep_node) = curr_ep_node {
+            if curr_ep_exists {
                 let (nearest, _) = self.search_layer_greedy(&vector, &[curr_ep], lc, 1, &nodes);
                 if let Some(nearest_id) = nearest.into_iter().next() {
                     curr_ep = nearest_id;
-                    curr_ep_node = nodes.get(&nearest_id).cloned();
+                    curr_ep_exists = nodes.contains_key(&nearest_id);
                 }
             }
         }
@@ -271,10 +280,11 @@ impl HnswIndex {
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.truncate(k);
 
-        // Convert distance to similarity (1 / (1 + distance))
+        // Convert squared distance to a Euclidean-distance similarity
+        // (1 / (1 + distance)). sqrt is applied only to the k returned results.
         results
             .into_iter()
-            .map(|(id, dist)| (id, 1.0 / (1.0 + dist)))
+            .map(|(id, dist)| (id, 1.0 / (1.0 + dist.sqrt())))
             .collect()
     }
 
@@ -298,8 +308,7 @@ impl HnswIndex {
             entry_point: *self.entry_point.read(),
             max_layer: *self.max_layer.read(),
         };
-        let bytes = bincode::serialize(&snapshot)
-            .map_err(std::io::Error::other)?;
+        let bytes = bincode::serialize(&snapshot).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
@@ -313,8 +322,7 @@ impl HnswIndex {
             return Ok(None);
         }
         let bytes = std::fs::read(path)?;
-        let snapshot: HnswSnapshot = bincode::deserialize(&bytes)
-            .map_err(std::io::Error::other)?;
+        let snapshot: HnswSnapshot = bincode::deserialize(&bytes).map_err(std::io::Error::other)?;
         Ok(Some(Self {
             nodes: Arc::new(RwLock::new(snapshot.nodes)),
             entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
@@ -340,26 +348,23 @@ impl HnswIndex {
         entry_points: &[ObjectId],
         layer: usize,
         _ef: usize,
-        nodes: &HashMap<ObjectId, HnswNode>,
+        nodes: &NodeMap,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         let mut best_id = entry_points[0];
-        let mut best_dist = euclidean_dist(query, &nodes[&best_id].vector);
+        let mut best_dist = squared_dist(query, &nodes[&best_id].vector);
 
         loop {
             let mut improved = false;
-            let current_neighbors: Vec<ObjectId> = nodes[&best_id]
-                .neighbors
-                .get(&layer)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
-
-            for neighbor_id in &current_neighbors {
-                if let Some(neighbor) = nodes.get(neighbor_id) {
-                    let dist = euclidean_dist(query, &neighbor.vector);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_id = *neighbor_id;
-                        improved = true;
+            // Iterate the current node's neighbors in place (no per-step alloc).
+            if let Some(neighbor_set) = nodes.get(&best_id).and_then(|n| n.neighbors.get(&layer)) {
+                for &neighbor_id in neighbor_set {
+                    if let Some(neighbor) = nodes.get(&neighbor_id) {
+                        let dist = squared_dist(query, &neighbor.vector);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_id = neighbor_id;
+                            improved = true;
+                        }
                     }
                 }
             }
@@ -379,7 +384,7 @@ impl HnswIndex {
         entry_points: &[ObjectId],
         layer: usize,
         ef: usize,
-        nodes: &HashMap<ObjectId, HnswNode>,
+        nodes: &NodeMap,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         #[derive(Debug)]
         struct Candidate {
@@ -406,7 +411,7 @@ impl HnswIndex {
             }
         }
 
-        let mut visited: HashSet<ObjectId> = HashSet::new();
+        let mut visited: IdSet = IdSet::default();
         // candidates: min-heap (closest first)
         let mut candidates = BinaryHeap::new();
         // results: max-heap (worst first, for eviction). Since Candidate is
@@ -436,7 +441,7 @@ impl HnswIndex {
         let mut results: BinaryHeap<WorstCandidate> = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = euclidean_dist(query, &nodes[&ep].vector);
+            let dist = squared_dist(query, &nodes[&ep].vector);
             candidates.push(Candidate {
                 id: ep,
                 dist: OrdFloat(dist),
@@ -460,37 +465,33 @@ impl HnswIndex {
                 }
             }
 
-            // Expand neighbors
-            let neighbor_ids: Vec<ObjectId> = nodes[&current.id]
-                .neighbors
-                .get(&layer)
-                .map(|s| s.iter().copied().collect())
-                .unwrap_or_default();
+            // Expand neighbors in place; `visited.insert` returns false when the
+            // id was already present, combining the contains+insert check.
+            if let Some(neighbor_set) = nodes.get(&current.id).and_then(|n| n.neighbors.get(&layer))
+            {
+                for &neighbor_id in neighbor_set {
+                    if !visited.insert(neighbor_id) {
+                        continue;
+                    }
+                    if let Some(neighbor) = nodes.get(&neighbor_id) {
+                        let dist = squared_dist(query, &neighbor.vector);
+                        let od = OrdFloat(dist);
 
-            for neighbor_id in &neighbor_ids {
-                if visited.contains(neighbor_id) {
-                    continue;
-                }
-                visited.insert(*neighbor_id);
+                        let should_add = results.len() < ef
+                            || dist < results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
 
-                if let Some(neighbor) = nodes.get(neighbor_id) {
-                    let dist = euclidean_dist(query, &neighbor.vector);
-                    let od = OrdFloat(dist);
-
-                    let should_add = results.len() < ef
-                        || dist < results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
-
-                    if should_add {
-                        candidates.push(Candidate {
-                            id: *neighbor_id,
-                            dist: od,
-                        });
-                        results.push(WorstCandidate {
-                            id: *neighbor_id,
-                            dist: od,
-                        });
-                        if results.len() > ef {
-                            results.pop();
+                        if should_add {
+                            candidates.push(Candidate {
+                                id: neighbor_id,
+                                dist: od,
+                            });
+                            results.push(WorstCandidate {
+                                id: neighbor_id,
+                                dist: od,
+                            });
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -519,7 +520,7 @@ impl HnswIndex {
         candidates: &[ObjectId],
         m: usize,
         _layer: usize,
-        nodes: &HashMap<ObjectId, HnswNode>,
+        nodes: &NodeMap,
     ) -> Vec<ObjectId> {
         if candidates.len() <= m {
             return candidates.to_vec();
@@ -529,7 +530,7 @@ impl HnswIndex {
         let mut scored: Vec<(ObjectId, f32)> = candidates
             .iter()
             .map(|&id| {
-                let dist = euclidean_dist(query, &nodes[&id].vector);
+                let dist = squared_dist(query, &nodes[&id].vector);
                 (id, dist)
             })
             .collect();
@@ -545,13 +546,15 @@ impl HnswIndex {
     }
 }
 
-/// Euclidean distance between two vectors.
-fn euclidean_dist(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum::<f32>()
-        .sqrt()
+/// Squared Euclidean distance between two vectors.
+///
+/// HNSW only ever *compares* distances, and squared distance preserves ordering,
+/// so the `sqrt` is dropped from the inner loop — it is applied only to the
+/// final k results when converting to a similarity score. The simple loop
+/// auto-vectorizes (NEON/SSE) under the release profile.
+#[inline]
+fn squared_dist(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 #[cfg(test)]
@@ -664,9 +667,10 @@ mod tests {
     }
 
     #[test]
-    fn test_euclidean_dist() {
+    fn test_squared_dist() {
         let a = vec![0.0, 3.0, 4.0];
         let b = vec![0.0, 0.0, 0.0];
-        assert!((euclidean_dist(&a, &b) - 5.0).abs() < 1e-6);
+        // 3^2 + 4^2 = 25 (squared distance — no sqrt).
+        assert!((squared_dist(&a, &b) - 25.0).abs() < 1e-6);
     }
 }
