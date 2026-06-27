@@ -142,9 +142,15 @@ The hot path (graph traversal + distance) was tuned without changing recall:
   the CPU pipelines them and the loop auto-vectorizes cleanly. ~**+18%
   single-thread QPS** on its own (f32 query latency ~1.79ms → ~1.54ms),
   recall-neutral.
+- **Integer-indexed node storage** — nodes live in a contiguous `Vec` with an
+  `ObjectId → u32` map; graph traversal works in `u32` indices (plain array
+  access, no `ObjectId` hashing), neighbor lists are contiguous `Vec<u32>`, and
+  the beam's visited set is a **generation-stamped array** indexed by node id
+  (no hashing, O(1) reset). ~**+20% single-thread QPS** on its own, recall-neutral.
 
-Net effect at `ef_search=200`: ~35% lower query latency than the original
-brute-force-replacement, ~27% higher build throughput, recall unchanged (~94%).
+Net effect at `ef_search=200`: single-thread query throughput **~+46%** over the
+original brute-force-replacement (≈351 → ≈512 q/s on 20k×384), ~27% higher build
+throughput, recall unchanged (~94%).
 
 ## Maximizing QPS
 

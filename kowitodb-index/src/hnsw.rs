@@ -9,7 +9,7 @@
 //! - ef_search: beam width during search (default 50)
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,9 +22,19 @@ use tracing::debug;
 /// Set of object ids using a fast (ahash) hasher. UUID hashing with the default
 /// SipHasher dominates the hot path, so the index uses ahash everywhere ids are
 /// keyed.
-type IdSet = HashSet<ObjectId, ahash::RandomState>;
-/// Node map keyed by object id, ahash-hashed for the same reason.
-type NodeMap = HashMap<ObjectId, HnswNode, ahash::RandomState>;
+///
+/// Dense node index into [`Graph::nodes`]. Graph traversal works in these
+/// indices — plain array access, no `ObjectId` hashing on the hot path.
+type NodeIdx = u32;
+
+/// Contiguous node storage plus an `ObjectId → index` map. Traversal reads
+/// `nodes` by index; the map is only consulted at insert/remove/search entry
+/// and when mapping results back to ids.
+#[derive(Default)]
+struct Graph {
+    nodes: Vec<HnswNode>,
+    id_to_idx: HashMap<ObjectId, NodeIdx, ahash::RandomState>,
+}
 
 /// int8 quantization scale. Assumes ~unit-norm vectors (components in [-1, 1]),
 /// as produced by the embedding models KowitoDB uses.
@@ -304,7 +314,7 @@ impl Ord for OrdFloat {
 /// Min-heap entry (closest popped first) for the beam frontier.
 #[derive(Debug)]
 struct Candidate {
-    id: ObjectId,
+    id: NodeIdx,
     dist: OrdFloat,
 }
 impl PartialEq for Candidate {
@@ -328,7 +338,7 @@ impl Ord for Candidate {
 /// Max-heap entry (worst popped first) for the bounded result set.
 #[derive(Debug)]
 struct WorstCandidate {
-    id: ObjectId,
+    id: NodeIdx,
     dist: OrdFloat,
 }
 impl PartialEq for WorstCandidate {
@@ -351,11 +361,50 @@ impl Ord for WorstCandidate {
 /// Per-thread reusable scratch for beam search, so the hot query path allocates
 /// nothing after warmup (allocator contention otherwise caps concurrent QPS).
 /// Safe because a search runs to completion synchronously on one thread.
+///
+/// `visited` is a **generation-stamped** array indexed by node id: a node is
+/// "visited this query" iff `visited[idx] == gen`. Bumping `gen` per query makes
+/// reset O(1) (no clearing, no hashing) — the standard fast-HNSW visited set.
 #[derive(Default)]
 struct BeamScratch {
-    visited: IdSet,
+    visited: Vec<u32>,
+    gen: u32,
     candidates: BinaryHeap<Candidate>,
     results: BinaryHeap<WorstCandidate>,
+}
+
+impl BeamScratch {
+    /// Start a new query over `node_count` nodes, returning the active
+    /// generation. Resizes the visited array and bumps the generation (clearing
+    /// on wrap so stale stamps never alias).
+    fn begin(&mut self, node_count: usize) -> u32 {
+        if self.visited.len() < node_count {
+            self.visited.resize(node_count, 0);
+        }
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            for v in self.visited.iter_mut() {
+                *v = 0;
+            }
+            self.gen = 1;
+        }
+        self.candidates.clear();
+        self.results.clear();
+        self.gen
+    }
+
+    /// Mark `idx` visited for the current generation; returns `true` if it was
+    /// not already visited (combines the contains+insert check).
+    #[inline]
+    fn visit(&mut self, idx: NodeIdx) -> bool {
+        let slot = &mut self.visited[idx as usize];
+        if *slot == self.gen {
+            false
+        } else {
+            *slot = self.gen;
+            true
+        }
+    }
 }
 
 thread_local! {
@@ -369,8 +418,10 @@ struct HnswNode {
     id: ObjectId,
     vector: NodeVector,
     max_layer: usize,
-    /// Per-layer neighbor sets: layer → set of neighbor IDs.
-    neighbors: HashMap<usize, IdSet>,
+    /// Per-layer neighbor lists: `neighbors[layer]` holds neighbor node indices.
+    /// `Vec` (not a set) for cache-friendly iteration; dedup is enforced on
+    /// insert. Indexed by layer (0..=max_layer).
+    neighbors: Vec<Vec<NodeIdx>>,
     /// Optional higher-fidelity vector (int8) retained *only* to re-score the
     /// final top-k under binary quantization — the oversample→rescore pattern
     /// that recovers recall the 1-bit codes lose. `None` unless
@@ -442,10 +493,10 @@ impl Default for HnswParams {
 ///
 /// Thread-safe via RwLock. Supports concurrent reads and serialized writes.
 pub struct HnswIndex {
-    /// All nodes, keyed by object ID.
-    nodes: Arc<RwLock<NodeMap>>,
-    /// Entry point (top-layer node).
-    entry_point: Arc<RwLock<Option<ObjectId>>>,
+    /// All nodes, stored contiguously with an id→index map.
+    graph: Arc<RwLock<Graph>>,
+    /// Entry point (top-layer node), as a node index.
+    entry_point: Arc<RwLock<Option<NodeIdx>>>,
     /// Current maximum layer across all nodes.
     max_layer: Arc<RwLock<usize>>,
     /// Structured random rotation for binary quantization (lazily created on
@@ -460,8 +511,8 @@ pub struct HnswIndex {
 #[derive(Serialize)]
 struct HnswSnapshotRef<'a> {
     params: &'a HnswParams,
-    nodes: &'a NodeMap,
-    entry_point: Option<ObjectId>,
+    nodes: &'a [HnswNode],
+    entry_point: Option<NodeIdx>,
     max_layer: usize,
     #[serde(default)]
     rotation: Option<Rotation>,
@@ -471,8 +522,8 @@ struct HnswSnapshotRef<'a> {
 #[derive(Deserialize)]
 struct HnswSnapshot {
     params: HnswParams,
-    nodes: NodeMap,
-    entry_point: Option<ObjectId>,
+    nodes: Vec<HnswNode>,
+    entry_point: Option<NodeIdx>,
     max_layer: usize,
     #[serde(default)]
     rotation: Option<Rotation>,
@@ -481,7 +532,7 @@ struct HnswSnapshot {
 impl HnswIndex {
     pub fn new(params: HnswParams) -> Self {
         Self {
-            nodes: Arc::new(RwLock::new(NodeMap::default())),
+            graph: Arc::new(RwLock::new(Graph::default())),
             entry_point: Arc::new(RwLock::new(None)),
             max_layer: Arc::new(RwLock::new(0)),
             rotation: Arc::new(RwLock::new(None)),
@@ -493,9 +544,15 @@ impl HnswIndex {
     ///
     /// If the object already exists, it is re-inserted (updated).
     pub fn insert(&self, id: ObjectId, vector: Embedding) {
-        let mut nodes = self.nodes.write();
+        let mut graph = self.graph.write();
         let mut entry_point = self.entry_point.write();
         let mut max_layer = self.max_layer.write();
+
+        // Re-insert (update) = remove the old copy first, so neighbor search
+        // can't find the node itself and indices stay dense.
+        if graph.id_to_idx.contains_key(&id) {
+            Self::remove_locked(&mut graph, &mut entry_point, id);
+        }
 
         // Compute random layer using exponential distribution
         let node_layer = self.random_layer();
@@ -541,41 +598,35 @@ impl HnswIndex {
             None
         };
 
-        let mut node = HnswNode {
-            id,
-            vector: node_vector,
-            max_layer: node_layer,
-            neighbors: HashMap::new(),
-            rerank,
-        };
+        // The new node lands at the end of the dense node vector.
+        let idx = graph.nodes.len() as NodeIdx;
+        let mut neighbors: Vec<Vec<NodeIdx>> = vec![Vec::new(); node_layer + 1];
 
-        // If this is the first node
+        // If this is the first node, just store it as the entry point.
         let ep = match *entry_point {
             Some(ep) => ep,
             None => {
-                node.neighbors.insert(0, IdSet::default());
                 *max_layer = node_layer;
-                nodes.insert(id, node);
-                *entry_point = Some(id);
+                graph.nodes.push(HnswNode {
+                    id,
+                    vector: node_vector,
+                    max_layer: node_layer,
+                    neighbors,
+                    rerank,
+                });
+                graph.id_to_idx.insert(id, idx);
+                *entry_point = Some(idx);
                 debug!("HNSW: inserted first node {} at layer {}", id, node_layer);
                 return;
             }
         };
 
-        // Find the current entry point at the top layer.
         let mut curr_ep = ep;
-        // Only the existence of the entry-point node matters here, so avoid
-        // cloning the whole node (and its vector) on every descent step.
-        let mut curr_ep_exists = nodes.contains_key(&ep);
         let global_max = *max_layer;
 
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
-            if curr_ep_exists {
-                let nearest_id = self.search_layer_greedy(&scorer, curr_ep, lc, &nodes);
-                curr_ep = nearest_id;
-                curr_ep_exists = nodes.contains_key(&nearest_id);
-            }
+            curr_ep = self.search_layer_greedy(&scorer, curr_ep, lc, &graph.nodes);
         }
 
         // Insert at each layer from min(node_layer, global_max) down to 0
@@ -583,40 +634,53 @@ impl HnswIndex {
         let mut ep_set = vec![curr_ep];
 
         for lc in (0..=start_layer).rev() {
-            // Search for neighbors at this layer
-            let (candidates, _) =
-                self.search_layer_beam(&scorer, &ep_set, lc, self.params.ef_construction, &nodes);
+            let (candidates, _) = self.search_layer_beam(
+                &scorer,
+                &ep_set,
+                lc,
+                self.params.ef_construction,
+                &graph.nodes,
+            );
 
-            // Select M (or M0 at layer 0) best neighbors
             let m = if lc == 0 {
                 self.params.m0
             } else {
                 self.params.m
             };
-            let selected: Vec<ObjectId> =
-                self.select_neighbors_heuristic(search_vec, &candidates, m, lc, &nodes);
+            let selected = self.select_neighbors_heuristic(search_vec, &candidates, m, &graph.nodes);
 
-            // Add bidirectional edges
-            node.neighbors.entry(lc).or_default();
-            for &neighbor_id in &selected {
-                node.neighbors.get_mut(&lc).unwrap().insert(neighbor_id);
-                if let Some(neighbor) = nodes.get_mut(&neighbor_id) {
-                    neighbor.neighbors.entry(lc).or_default();
-                    neighbor.neighbors.get_mut(&lc).unwrap().insert(id);
+            // Add bidirectional edges (the immutable search borrow has ended).
+            for &nb in &selected {
+                if nb == idx {
+                    continue; // never link to self
+                }
+                neighbors[lc].push(nb);
+                let neighbor = &mut graph.nodes[nb as usize];
+                if neighbor.neighbors.len() <= lc {
+                    neighbor.neighbors.resize(lc + 1, Vec::new());
+                }
+                if !neighbor.neighbors[lc].contains(&idx) {
+                    neighbor.neighbors[lc].push(idx);
                 }
             }
 
-            // Next layer's entry points
-            ep_set = selected.clone();
+            ep_set = selected;
         }
 
-        // Update entry point if this node is at a higher layer
+        // Update entry point if this node is at a higher layer.
         if node_layer > global_max {
-            *entry_point = Some(id);
+            *entry_point = Some(idx);
             *max_layer = node_layer;
         }
 
-        nodes.insert(id, node);
+        graph.nodes.push(HnswNode {
+            id,
+            vector: node_vector,
+            max_layer: node_layer,
+            neighbors,
+            rerank,
+        });
+        graph.id_to_idx.insert(id, idx);
         debug!(
             "HNSW: inserted node {} at layer {} (global_max={})",
             id, node_layer, *max_layer
@@ -625,31 +689,56 @@ impl HnswIndex {
 
     /// Remove a node from the index.
     pub fn remove(&self, id: ObjectId) {
-        let mut nodes = self.nodes.write();
+        let mut graph = self.graph.write();
         let mut entry_point = self.entry_point.write();
+        Self::remove_locked(&mut graph, &mut entry_point, id);
+    }
 
-        if let Some(node) = nodes.remove(&id) {
-            // Remove this node from all its neighbors
-            for (layer, neighbors) in &node.neighbors {
-                for neighbor_id in neighbors {
-                    if let Some(neighbor) = nodes.get_mut(neighbor_id) {
-                        if let Some(nbr_set) = neighbor.neighbors.get_mut(layer) {
-                            nbr_set.remove(&id);
-                        }
+    /// Remove `id` from an already-locked graph. Uses `swap_remove` to keep the
+    /// node vector dense, then fixes every edge: references to the removed slot
+    /// are dropped and references to the moved (formerly-last) node are remapped.
+    /// O(N) in the node count, but removals are rare relative to queries.
+    fn remove_locked(graph: &mut Graph, entry_point: &mut Option<NodeIdx>, id: ObjectId) {
+        let Some(r) = graph.id_to_idx.remove(&id) else {
+            return;
+        };
+        let last = (graph.nodes.len() - 1) as NodeIdx;
+        graph.nodes.swap_remove(r as usize);
+        // If a node was moved into slot `r`, repoint its id → index mapping.
+        if r != last {
+            let moved_id = graph.nodes[r as usize].id;
+            graph.id_to_idx.insert(moved_id, r);
+        }
+        // Rewrite all adjacency: drop edges to `r` (gone), remap `last` → `r`.
+        for node in graph.nodes.iter_mut() {
+            for layer in node.neighbors.iter_mut() {
+                let mut w = 0;
+                for read in 0..layer.len() {
+                    let v = layer[read];
+                    if v == r {
+                        continue;
                     }
+                    layer[w] = if v == last { r } else { v };
+                    w += 1;
                 }
+                layer.truncate(w);
             }
         }
-
-        // Update entry point if it was this node
-        if entry_point.is_some_and(|ep| ep == id) {
-            *entry_point = nodes.keys().next().copied();
+        // Fix the entry point.
+        if graph.nodes.is_empty() {
+            *entry_point = None;
+        } else {
+            match *entry_point {
+                Some(e) if e == r => *entry_point = Some(0),
+                Some(e) if e == last => *entry_point = Some(r),
+                _ => {}
+            }
         }
     }
 
     /// Search for the k-nearest neighbors.
     pub fn search(&self, query: &Embedding, k: usize) -> Vec<(ObjectId, f32)> {
-        let nodes = self.nodes.read();
+        let graph = self.graph.read();
         let entry_point = self.entry_point.read();
         let max_layer = self.max_layer.read();
 
@@ -701,7 +790,7 @@ impl HnswIndex {
         let global_max = *max_layer;
 
         for lc in (1..=global_max).rev() {
-            curr_ep = self.search_layer_greedy(&scorer, curr_ep, lc, &nodes);
+            curr_ep = self.search_layer_greedy(&scorer, curr_ep, lc, &graph.nodes);
         }
 
         // Beam search at layer 0. When refining, over-fetch candidates so the
@@ -711,27 +800,27 @@ impl HnswIndex {
         } else {
             self.params.ef_search.max(k)
         };
-        let (candidates, distances) = self.search_layer_beam(&scorer, &[curr_ep], 0, ef, &nodes);
+        let (candidates, distances) =
+            self.search_layer_beam(&scorer, &[curr_ep], 0, ef, &graph.nodes);
 
-        // Take top-k. When navigation was approximate, re-score candidates with
-        // the accurate distance (full-dim for coarse, asymmetric RaBitQ
-        // estimator for binary); otherwise use the beam's distances directly.
-        let mut results: Vec<(ObjectId, f32)> = if refine {
+        // Take top-k (still working in node indices). When navigation was
+        // approximate, re-score candidates with the accurate distance (full-dim
+        // for coarse, asymmetric RaBitQ estimator for binary); otherwise use the
+        // beam's distances directly.
+        let mut results: Vec<(NodeIdx, f32)> = if refine {
             candidates
                 .iter()
-                .map(|&id| {
-                    let d = nodes
-                        .get(&id)
-                        .map(|n| match &n.rerank {
-                            // Retained int8 vector — exact-ish rescore in the
-                            // original space (recovers binary's lost recall).
-                            Some(rv) => rv.dist_sq(orig_query),
-                            // Else the asymmetric estimator (binary) or full-dim
-                            // distance (coarse), both against `query`.
-                            None => n.vector.dist_sq(query),
-                        })
-                        .unwrap_or(f32::MAX);
-                    (id, d)
+                .map(|&idx| {
+                    let n = &graph.nodes[idx as usize];
+                    let d = match &n.rerank {
+                        // Retained int8 vector — exact-ish rescore in the
+                        // original space (recovers binary's lost recall).
+                        Some(rv) => rv.dist_sq(orig_query),
+                        // Else the asymmetric estimator (binary) or full-dim
+                        // distance (coarse), both against `query`.
+                        None => n.vector.dist_sq(query),
+                    };
+                    (idx, d)
                 })
                 .collect()
         } else {
@@ -741,30 +830,30 @@ impl HnswIndex {
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.truncate(k);
 
-        // Convert squared distance to a Euclidean-distance similarity
-        // (1 / (1 + distance)). sqrt is applied only to the k returned results.
+        // Map indices back to object ids and convert squared distance to a
+        // similarity (1 / (1 + √distance)); sqrt only on the k returned results.
         results
             .into_iter()
-            .map(|(id, dist)| (id, 1.0 / (1.0 + dist.sqrt())))
+            .map(|(idx, dist)| (graph.nodes[idx as usize].id, 1.0 / (1.0 + dist.sqrt())))
             .collect()
     }
 
     /// Number of nodes in the index.
     pub fn len(&self) -> usize {
-        self.nodes.read().len()
+        self.graph.read().nodes.len()
     }
 
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.graph.read().nodes.is_empty()
     }
 
     /// Serialize the index to a byte buffer.
     pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
-        let nodes = self.nodes.read();
+        let graph = self.graph.read();
         let snapshot = HnswSnapshotRef {
             params: &self.params,
-            nodes: &nodes,
+            nodes: &graph.nodes,
             entry_point: *self.entry_point.read(),
             max_layer: *self.max_layer.read(),
             rotation: self.rotation.read().clone(),
@@ -775,8 +864,17 @@ impl HnswIndex {
     /// Reconstruct an index from a buffer produced by [`Self::to_bytes`].
     pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         let snapshot: HnswSnapshot = bincode::deserialize(bytes).map_err(std::io::Error::other)?;
+        // Rebuild the id → index map from the dense node vector.
+        let mut id_to_idx =
+            HashMap::with_capacity_and_hasher(snapshot.nodes.len(), ahash::RandomState::default());
+        for (i, node) in snapshot.nodes.iter().enumerate() {
+            id_to_idx.insert(node.id, i as NodeIdx);
+        }
         Ok(Self {
-            nodes: Arc::new(RwLock::new(snapshot.nodes)),
+            graph: Arc::new(RwLock::new(Graph {
+                nodes: snapshot.nodes,
+                id_to_idx,
+            })),
             entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
             max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
             rotation: Arc::new(RwLock::new(snapshot.rotation)),
@@ -815,60 +913,54 @@ impl HnswIndex {
     }
 
     /// Greedy 1-nearest-neighbor search on a single layer. Returns the single
-    /// nearest node id (allocation-free — called once per layer during descent).
+    /// nearest node index (allocation-free — called once per layer in descent).
     fn search_layer_greedy(
         &self,
         scorer: &Scorer,
-        entry: ObjectId,
+        entry: NodeIdx,
         layer: usize,
-        nodes: &NodeMap,
-    ) -> ObjectId {
-        let mut best_id = entry;
-        let mut best_dist = scorer.score(&nodes[&best_id].vector);
+        nodes: &[HnswNode],
+    ) -> NodeIdx {
+        let mut best = entry;
+        let mut best_dist = scorer.score(&nodes[best as usize].vector);
 
         loop {
             let mut improved = false;
-            // Iterate the current node's neighbors in place (no per-step alloc).
-            if let Some(neighbor_set) = nodes.get(&best_id).and_then(|n| n.neighbors.get(&layer)) {
-                for &neighbor_id in neighbor_set {
-                    if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = scorer.score(&neighbor.vector);
-                        if dist < best_dist {
-                            best_dist = dist;
-                            best_id = neighbor_id;
-                            improved = true;
-                        }
+            if let Some(neighbors) = nodes[best as usize].neighbors.get(layer) {
+                for &nb in neighbors {
+                    let dist = scorer.score(&nodes[nb as usize].vector);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = nb;
+                        improved = true;
                     }
                 }
             }
-
             if !improved {
                 break;
             }
         }
-
-        best_id
+        best
     }
 
     /// Beam search on a single layer. Uses per-thread reusable scratch
-    /// ([`BEAM_SCRATCH`]) so the hot path allocates only the returned vectors.
+    /// ([`BEAM_SCRATCH`]) — the visited set is a generation-stamped array indexed
+    /// by node id, so the hot path does no hashing and allocates only the
+    /// returned vectors.
     fn search_layer_beam(
         &self,
         scorer: &Scorer,
-        entry_points: &[ObjectId],
+        entry_points: &[NodeIdx],
         layer: usize,
         ef: usize,
-        nodes: &NodeMap,
-    ) -> (Vec<ObjectId>, Vec<f32>) {
+        nodes: &[HnswNode],
+    ) -> (Vec<NodeIdx>, Vec<f32>) {
         BEAM_SCRATCH.with(|scratch| {
             let s = &mut *scratch.borrow_mut();
-            // `clear` keeps the backing capacity from prior queries → no realloc.
-            s.visited.clear();
-            s.candidates.clear();
-            s.results.clear();
+            s.begin(nodes.len());
 
             for &ep in entry_points {
-                let dist = scorer.score(&nodes[&ep].vector);
+                let dist = scorer.score(&nodes[ep as usize].vector);
                 s.candidates.push(Candidate {
                     id: ep,
                     dist: OrdFloat(dist),
@@ -877,7 +969,7 @@ impl HnswIndex {
                     id: ep,
                     dist: OrdFloat(dist),
                 });
-                s.visited.insert(ep);
+                s.visit(ep);
             }
 
             while let Some(current) = s.candidates.pop() {
@@ -892,42 +984,29 @@ impl HnswIndex {
                     }
                 }
 
-                // Expand neighbors in place; `visited.insert` returns false when
-                // the id was already present (combines the contains+insert check).
-                if let Some(neighbor_set) =
-                    nodes.get(&current.id).and_then(|n| n.neighbors.get(&layer))
-                {
-                    for &neighbor_id in neighbor_set {
-                        if !s.visited.insert(neighbor_id) {
+                // Expand neighbors; `visit` returns false when already seen.
+                if let Some(neighbors) = nodes[current.id as usize].neighbors.get(layer) {
+                    for &nb in neighbors {
+                        if !s.visit(nb) {
                             continue;
                         }
-                        if let Some(neighbor) = nodes.get(&neighbor_id) {
-                            let dist = scorer.score(&neighbor.vector);
-                            let od = OrdFloat(dist);
-
-                            let should_add = s.results.len() < ef
-                                || dist < s.results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
-
-                            if should_add {
-                                s.candidates.push(Candidate {
-                                    id: neighbor_id,
-                                    dist: od,
-                                });
-                                s.results.push(WorstCandidate {
-                                    id: neighbor_id,
-                                    dist: od,
-                                });
-                                if s.results.len() > ef {
-                                    s.results.pop();
-                                }
+                        let dist = scorer.score(&nodes[nb as usize].vector);
+                        let od = OrdFloat(dist);
+                        let should_add = s.results.len() < ef
+                            || dist < s.results.peek().map(|c| c.dist.0).unwrap_or(f32::MAX);
+                        if should_add {
+                            s.candidates.push(Candidate { id: nb, dist: od });
+                            s.results.push(WorstCandidate { id: nb, dist: od });
+                            if s.results.len() > ef {
+                                s.results.pop();
                             }
                         }
                     }
                 }
             }
 
-            // Pop the worst-first heap (so it empties for reuse), then reverse
-            // to closest-first — preserving the original ordering contract.
+            // Pop the worst-first heap (emptying it for reuse), then reverse to
+            // closest-first — preserving the original ordering contract.
             let n = s.results.len();
             let mut ids = Vec::with_capacity(n);
             let mut dists = Vec::with_capacity(n);
@@ -941,36 +1020,24 @@ impl HnswIndex {
         })
     }
 
-    /// Heuristic neighbor selection (prunes candidates for better graph quality).
+    /// Heuristic neighbor selection (prunes candidates for better graph quality):
+    /// keep the `m` closest by full distance against `query`.
     fn select_neighbors_heuristic(
         &self,
         query: &[f32],
-        candidates: &[ObjectId],
+        candidates: &[NodeIdx],
         m: usize,
-        _layer: usize,
-        nodes: &NodeMap,
-    ) -> Vec<ObjectId> {
+        nodes: &[HnswNode],
+    ) -> Vec<NodeIdx> {
         if candidates.len() <= m {
             return candidates.to_vec();
         }
-
-        // Sort candidates by distance
-        let mut scored: Vec<(ObjectId, f32)> = candidates
+        let mut scored: Vec<(NodeIdx, f32)> = candidates
             .iter()
-            .map(|&id| {
-                let dist = nodes[&id].vector.dist_sq(query);
-                (id, dist)
-            })
+            .map(|&idx| (idx, nodes[idx as usize].vector.dist_sq(query)))
             .collect();
         scored.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-        // Simple pruning: keep closest m candidates
-        let mut selected = Vec::with_capacity(m);
-        for (id, _) in scored.into_iter().take(m) {
-            selected.push(id);
-        }
-
-        selected
+        scored.into_iter().take(m).map(|(idx, _)| idx).collect()
     }
 }
 
@@ -1028,6 +1095,7 @@ fn int8_dist_sq(query: &[f32], q: &[i8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_quantized_index_search() {
