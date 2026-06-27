@@ -12,11 +12,17 @@ use crate::proto::kowito_db_server::KowitoDb;
 pub struct KowitoDBService {
     engine: KowitoDBEngine,
     metrics: Arc<MetricsCollector>,
+    /// Upper bound on results returned by Ask/Search.
+    max_results: i32,
 }
 
 impl KowitoDBService {
-    pub fn new(engine: KowitoDBEngine, metrics: Arc<MetricsCollector>) -> Self {
-        Self { engine, metrics }
+    pub fn new(engine: KowitoDBEngine, metrics: Arc<MetricsCollector>, max_results: usize) -> Self {
+        Self {
+            engine,
+            metrics,
+            max_results: max_results.clamp(1, i32::MAX as usize) as i32,
+        }
     }
 }
 
@@ -130,7 +136,7 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::SearchRequest>,
     ) -> Result<Response<proto::SearchResponse>, Status> {
         let req = request.into_inner();
-        let max_results = req.top_k.clamp(1, 100) as usize;
+        let max_results = req.top_k.clamp(1, self.max_results) as usize;
 
         let start = Instant::now();
         let response = self
@@ -166,7 +172,7 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::AskRequest>,
     ) -> Result<Response<proto::AskResponse>, Status> {
         let req = request.into_inner();
-        let max_results = req.max_results.clamp(1, 100) as usize;
+        let max_results = req.max_results.clamp(1, self.max_results) as usize;
         let budget = (req.max_context_tokens > 0).then_some(req.max_context_tokens as usize);
 
         info!("ai.ask(): \"{}\"", req.question);

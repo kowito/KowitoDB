@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -15,11 +15,20 @@ use kowitodb_server::{serve_with_config, KowitoDBEngine, ServerConfig};
 /// interface.
 #[derive(Parser)]
 #[command(name = "kowitodb")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "AI Knowledge Operating System", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Storage backend for the server.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum StorageKind {
+    /// Default embedded sled key-value store.
+    Sled,
+    /// Lance columnar dataset (requires building with `--features lance`).
+    Lance,
 }
 
 #[derive(Subcommand)]
@@ -37,6 +46,19 @@ enum Commands {
         /// Index path
         #[arg(short, long, default_value = "./data/index")]
         index_path: PathBuf,
+
+        /// Storage backend (lance requires a build with --features lance).
+        #[arg(long, value_enum, default_value = "sled", env = "KOWITODB_STORAGE")]
+        storage: StorageKind,
+
+        /// Lance dataset URI/path (used when --storage lance; defaults to
+        /// {storage-path}/lance).
+        #[arg(long, env = "KOWITODB_LANCE_URI")]
+        lance_uri: Option<String>,
+
+        /// Cap on results returned by Ask/Search.
+        #[arg(long, default_value = "100", env = "KOWITODB_MAX_RESULTS")]
+        max_results: usize,
 
         /// Require this API key on every request (Bearer or x-api-key header).
         #[arg(long, env = "KOWITODB_API_KEY")]
@@ -144,6 +166,9 @@ async fn main() -> anyhow::Result<()> {
             addr,
             storage_path,
             index_path,
+            storage,
+            lance_uri,
+            max_results,
             api_key,
             tls_cert,
             tls_key,
@@ -154,15 +179,34 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&storage_path)?;
             std::fs::create_dir_all(&index_path)?;
 
-            let engine = KowitoDBEngine::open(&storage_path, &index_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to initialize engine: {}", e))?;
+            let engine = match storage {
+                StorageKind::Sled => KowitoDBEngine::open(&storage_path, &index_path).await,
+                StorageKind::Lance => {
+                    #[cfg(feature = "lance")]
+                    {
+                        let uri = lance_uri.unwrap_or_else(|| {
+                            storage_path.join("lance").to_string_lossy().into_owned()
+                        });
+                        KowitoDBEngine::new_with_lance(uri, &index_path).await
+                    }
+                    #[cfg(not(feature = "lance"))]
+                    {
+                        let _ = &lance_uri;
+                        anyhow::bail!(
+                            "The Lance backend requires building with --features lance \
+                             (e.g. `cargo build -p kowitodb --features lance`)."
+                        );
+                    }
+                }
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to initialize engine: {}", e))?;
 
             let config = ServerConfig {
                 api_key,
                 tls_cert,
                 tls_key,
                 metrics_addr,
+                max_results: Some(max_results),
             };
             serve_with_config(engine, addr, config).await?;
         }

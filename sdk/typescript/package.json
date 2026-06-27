@@ -1,6 +1,6 @@
 {
   "name": "@kowitodb/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AI Knowledge Operating System — TypeScript SDK",
   "license": "MIT",
   "author": "KowitoDB Contributors",

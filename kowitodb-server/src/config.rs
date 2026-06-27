@@ -20,7 +20,13 @@ pub struct ServerConfig {
     pub tls_key: Option<PathBuf>,
     /// When set, an HTTP server exposes `/metrics` (Prometheus) and `/healthz`.
     pub metrics_addr: Option<SocketAddr>,
+    /// Upper bound on results returned by Ask/Search. `None` uses
+    /// [`DEFAULT_MAX_RESULTS`].
+    pub max_results: Option<usize>,
 }
+
+/// Default cap on the number of results returned by Ask/Search.
+pub const DEFAULT_MAX_RESULTS: usize = 100;
 
 impl ServerConfig {
     /// Whether TLS is fully configured (both cert and key present).

@@ -201,15 +201,27 @@ impl StorageBackend for LanceStorage {
             return Ok(Vec::new());
         };
 
-        // Push the predicates Lance can evaluate natively (id, importance) down
-        // into the scan; the remaining predicates (keyword JSON, time) are
-        // applied in Rust via the shared filter to keep semantics identical.
+        // Push predicates Lance can evaluate natively down into the scan. The
+        // shared `filter_matches` is still applied in Rust afterwards as the
+        // exact backstop, so a coarse pushdown (e.g. substring LIKE) is safe.
         let mut pushdown: Vec<String> = Vec::new();
         if let Some(id) = filter.id {
             pushdown.push(format!("id = '{id}'"));
         }
         if let Some(min_imp) = filter.min_importance {
             pushdown.push(format!("importance >= {min_imp}"));
+        }
+        if let Some(ref after) = filter.created_after {
+            pushdown.push(format!("created_at >= '{}'", after.to_rfc3339()));
+        }
+        if let Some(ref before) = filter.created_before {
+            pushdown.push(format!("created_at <= '{}'", before.to_rfc3339()));
+        }
+        if let Some(ref kw) = filter.keyword {
+            // Coarse substring match over the JSON-encoded keyword array; the
+            // Rust filter re-checks per-keyword containment exactly.
+            let escaped = kw.replace('\'', "''");
+            pushdown.push(format!("keywords_json LIKE '%{escaped}%'"));
         }
 
         let mut scanner = ds.scan();
@@ -337,6 +349,26 @@ mod tests {
             .unwrap();
         assert_eq!(high.len(), 1);
         assert_eq!(high[0].content, "b");
+
+        // Keyword pushdown (both objects carry the "alpha" keyword).
+        let alpha = store
+            .search(StorageFilter {
+                keyword: Some("alpha".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 2);
+
+        // A keyword that matches nothing.
+        let none = store
+            .search(StorageFilter {
+                keyword: Some("zzz".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(none.is_empty());
 
         let mut ids = store.list_ids().await.unwrap();
         ids.sort();

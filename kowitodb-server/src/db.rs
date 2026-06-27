@@ -88,8 +88,10 @@ impl KowitoDBEngine {
         index_path: impl AsRef<std::path::Path>,
     ) -> KResult<Self> {
         let storage: Arc<dyn StorageBackend> = Arc::new(StorageEngine::open(storage_path)?);
-        let fulltext_index = FullTextIndex::open(index_path)?;
-        let engine = Self::assemble(storage, fulltext_index);
+        let index_ref = index_path.as_ref();
+        let agent_memory = open_session_store(index_ref)?;
+        let fulltext_index = FullTextIndex::open(index_ref)?;
+        let engine = Self::assemble(storage, fulltext_index, agent_memory);
         info!("KowitoDB engine initialized with all subsystems (sled storage)");
         Ok(engine)
     }
@@ -117,8 +119,10 @@ impl KowitoDBEngine {
     ) -> KResult<Self> {
         let storage: Arc<dyn StorageBackend> =
             Arc::new(kowitodb_storage::LanceStorage::open(lance_uri).await?);
-        let fulltext_index = FullTextIndex::open(index_path)?;
-        let engine = Self::assemble(storage, fulltext_index);
+        let index_ref = index_path.as_ref();
+        let agent_memory = open_session_store(index_ref)?;
+        let fulltext_index = FullTextIndex::open(index_ref)?;
+        let engine = Self::assemble(storage, fulltext_index, agent_memory);
         engine.reindex_from_storage().await?;
         info!("KowitoDB engine initialized with all subsystems (Lance storage)");
         Ok(engine)
@@ -131,12 +135,17 @@ impl KowitoDBEngine {
         let tmp = std::env::temp_dir().join(format!("kowitodb-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).map_err(kowitodb_core::KowitoError::Io)?;
         let fulltext_index = FullTextIndex::open(&tmp)?;
-        Ok(Self::assemble(storage, fulltext_index))
+        Ok(Self::assemble(storage, fulltext_index, AgentMemory::new()))
     }
 
     /// Assemble the full engine (all indexes, planner, optimizers) over a given
-    /// storage backend and full-text index. Shared by every constructor.
-    fn assemble(storage: Arc<dyn StorageBackend>, fulltext_index: FullTextIndex) -> Self {
+    /// storage backend, full-text index, and agent-memory store. Shared by every
+    /// constructor.
+    fn assemble(
+        storage: Arc<dyn StorageBackend>,
+        fulltext_index: FullTextIndex,
+        agent_memory: AgentMemory,
+    ) -> Self {
         // Use a real OpenAI-compatible embedding provider when configured via
         // environment, otherwise fall back to the deterministic dev proxy.
         let embedding_client: Arc<dyn EmbeddingClient> = match OpenAiConfig::from_env() {
@@ -166,7 +175,7 @@ impl KowitoDBEngine {
             reranker: Arc::new(Reranker::new()),
             context_optimizer: Arc::new(ContextOptimizer::new(4096)),
             cost_tracker: Arc::new(CostTracker::new()),
-            agent_memory: Arc::new(AgentMemory::new()),
+            agent_memory: Arc::new(agent_memory),
             embedding_client,
             plan_cache: Arc::new(plan_cache),
             content_cache: Arc::new(ContentCache::new(CONTENT_CACHE_CAP)),
@@ -826,6 +835,13 @@ pub struct StatsResponse {
 }
 
 // ---- Ser/de helpers ----
+
+/// Open the persistent agent-session store under `{index_path}/sessions`.
+fn open_session_store(index_path: &std::path::Path) -> KResult<AgentMemory> {
+    let sessions_path = index_path.join("sessions");
+    AgentMemory::open(&sessions_path)
+        .map_err(|e| kowitodb_core::KowitoError::Storage(format!("agent session store: {e}")))
+}
 
 fn obj_to_stored(obj: &KnowledgeObject) -> KResult<StoredObject> {
     Ok(StoredObject {

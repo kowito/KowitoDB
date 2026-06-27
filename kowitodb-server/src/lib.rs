@@ -49,7 +49,8 @@ pub async fn serve_with_config(
     config: ServerConfig,
 ) -> anyhow::Result<()> {
     let metrics = Arc::new(MetricsCollector::new());
-    let service = KowitoDBService::new(engine, metrics.clone());
+    let max_results = config.max_results.unwrap_or(config::DEFAULT_MAX_RESULTS);
+    let service = KowitoDBService::new(engine, metrics.clone(), max_results);
 
     // Optional Prometheus/health HTTP endpoint on a separate port.
     if let Some(metrics_addr) = config.metrics_addr {

@@ -115,14 +115,57 @@ impl AgentSession {
 }
 
 /// Manages multiple agent sessions — `ai.remember()` at the session level.
+///
+/// Sessions are held in memory for fast access. When opened with a backing
+/// store ([`AgentMemory::open`]), every change is written through to a sled
+/// database so conversations survive a restart; existing sessions are loaded on
+/// open. Persistence is best-effort: a write failure is logged but does not
+/// fail the request.
 pub struct AgentMemory {
     sessions: Arc<RwLock<HashMap<String, AgentSession>>>,
+    db: Option<sled::Db>,
 }
 
 impl AgentMemory {
+    /// In-memory only (no persistence) — used for tests and ephemeral engines.
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            db: None,
+        }
+    }
+
+    /// Open a persistent session store at `path`, loading any existing sessions.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, sled::Error> {
+        let db = sled::open(path)?;
+        let mut sessions = HashMap::new();
+        for item in db.iter() {
+            let (key, value) = item?;
+            match serde_json::from_slice::<AgentSession>(&value) {
+                Ok(session) => {
+                    sessions.insert(String::from_utf8_lossy(&key).into_owned(), session);
+                }
+                Err(e) => tracing::warn!("Skipping corrupt agent session: {}", e),
+            }
+        }
+        tracing::info!("Loaded {} agent session(s) from store", sessions.len());
+        Ok(Self {
+            sessions: Arc::new(RwLock::new(sessions)),
+            db: Some(db),
+        })
+    }
+
+    /// Write a session through to the backing store (best-effort).
+    fn persist(&self, session: &AgentSession) {
+        if let Some(db) = &self.db {
+            match serde_json::to_vec(session) {
+                Ok(bytes) => {
+                    if let Err(e) = db.insert(session.id.as_bytes(), bytes) {
+                        tracing::warn!("Failed to persist agent session {}: {}", session.id, e);
+                    }
+                }
+                Err(e) => tracing::warn!("Failed to serialize agent session: {}", e),
+            }
         }
     }
 
@@ -136,8 +179,9 @@ impl AgentMemory {
             .clone()
     }
 
-    /// Save/update a session.
+    /// Save/update a session (and persist it when a store is configured).
     pub fn save(&self, session: AgentSession) {
+        self.persist(&session);
         let mut sessions = self.sessions.write();
         sessions.insert(session.id.clone(), session);
     }
@@ -149,6 +193,9 @@ impl AgentMemory {
 
     /// Delete a session.
     pub fn delete(&self, session_id: &str) -> bool {
+        if let Some(db) = &self.db {
+            let _ = db.remove(session_id.as_bytes());
+        }
         self.sessions.write().remove(session_id).is_some()
     }
 
@@ -189,6 +236,26 @@ mod tests {
         let recent = session.recent_turns(1);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].role, TurnRole::Assistant);
+    }
+
+    #[test]
+    fn test_persistent_sessions_survive_reopen() {
+        let dir = std::env::temp_dir().join(format!("kowitodb-sessions-{}", uuid::Uuid::new_v4()));
+
+        {
+            let mem = AgentMemory::open(&dir).unwrap();
+            let mut session = mem.get_or_create("agent-1");
+            session.add_turn(TurnRole::User, "hello");
+            mem.save(session);
+        }
+
+        // Reopen: the session should be loaded from disk.
+        let mem = AgentMemory::open(&dir).unwrap();
+        let session = mem.get("agent-1").expect("session should persist");
+        assert_eq!(session.turn_count(), 1);
+        assert_eq!(mem.session_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

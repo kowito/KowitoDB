@@ -21,3 +21,7 @@ clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+# Build the CLI with the Lance storage backend available via `serve --storage lance`.
+lance = ["kowitodb-server/lance"]
