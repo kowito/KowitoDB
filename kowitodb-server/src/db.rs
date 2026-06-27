@@ -11,12 +11,43 @@ use kowitodb_planner::{
     cache::QueryCache, context::ContextOptimizer, cost::CostTracker, reranker::Reranker,
     DetectedIntent, ExecutionPlan, QueryPlanner, RankedResult,
 };
-use kowitodb_storage::{StorageBackend, StorageEngine, StoredObject};
+use kowitodb_storage::{StorageBackend, StorageEngine, StorageFilter, StoredObject};
+use lru::LruCache;
+use parking_lot::Mutex;
+use std::num::NonZeroUsize;
 use tracing::{debug, info};
 
 use crate::embedding::{EmbeddingClient, ProxyEmbeddingClient};
 use crate::memory::AgentMemory;
+use crate::openai::{OpenAiConfig, OpenAiEmbeddingClient};
 use crate::proto;
+
+/// Maximum number of object contents held in the in-memory LRU cache. On a
+/// miss, content is reloaded from storage, so this only bounds memory use.
+const CONTENT_CACHE_CAP: usize = 10_000;
+
+/// Bounded LRU cache of object content keyed by id, used to avoid storage
+/// round-trips for hot objects without growing without limit.
+struct ContentCache(Mutex<LruCache<ObjectId, String>>);
+
+impl ContentCache {
+    fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN);
+        Self(Mutex::new(LruCache::new(cap)))
+    }
+
+    fn get(&self, id: &ObjectId) -> Option<String> {
+        self.0.lock().get(id).cloned()
+    }
+
+    fn insert(&self, id: ObjectId, content: String) {
+        self.0.lock().put(id, content);
+    }
+
+    fn remove(&self, id: &ObjectId) {
+        self.0.lock().pop(id);
+    }
+}
 
 /// A fully loaded result with content from storage.
 #[derive(Debug, Clone)]
@@ -46,7 +77,7 @@ pub struct KowitoDBEngine {
     pub agent_memory: Arc<AgentMemory>,
     pub embedding_client: Arc<dyn EmbeddingClient>,
     pub plan_cache: Arc<QueryCache<(DetectedIntent, ExecutionPlan)>>,
-    content_cache: Arc<dashmap::DashMap<ObjectId, String>>,
+    content_cache: Arc<ContentCache>,
     #[allow(dead_code)]
     default_model: String,
 }
@@ -63,6 +94,20 @@ impl KowitoDBEngine {
         Ok(engine)
     }
 
+    /// Open a sled-backed engine and rebuild the in-memory indexes from the
+    /// persisted object store. Prefer this over [`Self::new`] when serving an
+    /// existing database: the sled/Lance store and the full-text index persist
+    /// across restarts, but the vector/metadata/time/graph indexes start empty
+    /// and must be repopulated for search to work immediately.
+    pub async fn open(
+        storage_path: impl AsRef<std::path::Path>,
+        index_path: impl AsRef<std::path::Path>,
+    ) -> KResult<Self> {
+        let engine = Self::new(storage_path, index_path)?;
+        engine.reindex_from_storage().await?;
+        Ok(engine)
+    }
+
     /// Create an engine backed by a [Lance](https://lancedb.github.io/lance/)
     /// dataset instead of the default sled store. Requires the `lance` feature.
     #[cfg(feature = "lance")]
@@ -74,6 +119,7 @@ impl KowitoDBEngine {
             Arc::new(kowitodb_storage::LanceStorage::open(lance_uri).await?);
         let fulltext_index = FullTextIndex::open(index_path)?;
         let engine = Self::assemble(storage, fulltext_index);
+        engine.reindex_from_storage().await?;
         info!("KowitoDB engine initialized with all subsystems (Lance storage)");
         Ok(engine)
     }
@@ -91,8 +137,18 @@ impl KowitoDBEngine {
     /// Assemble the full engine (all indexes, planner, optimizers) over a given
     /// storage backend and full-text index. Shared by every constructor.
     fn assemble(storage: Arc<dyn StorageBackend>, fulltext_index: FullTextIndex) -> Self {
-        let embedding_client: Arc<dyn EmbeddingClient> =
-            Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128));
+        // Use a real OpenAI-compatible embedding provider when configured via
+        // environment, otherwise fall back to the deterministic dev proxy.
+        let embedding_client: Arc<dyn EmbeddingClient> = match OpenAiConfig::from_env() {
+            Some(cfg) => {
+                info!("Embeddings: OpenAI-compatible provider (model={})", cfg.model);
+                Arc::new(OpenAiEmbeddingClient::new(cfg))
+            }
+            None => {
+                info!("Embeddings: deterministic proxy (set KOWITODB_EMBEDDING_PROVIDER for a real model)");
+                Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128))
+            }
+        };
         let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
 
         Self {
@@ -110,25 +166,67 @@ impl KowitoDBEngine {
             agent_memory: Arc::new(AgentMemory::new()),
             embedding_client,
             plan_cache: Arc::new(plan_cache),
-            content_cache: Arc::new(dashmap::DashMap::new()),
+            content_cache: Arc::new(ContentCache::new(CONTENT_CACHE_CAP)),
             default_model: "default".to_string(),
         }
     }
 
+    /// Rebuild the in-memory indexes (vector/metadata/time/graph) and content
+    /// cache from the persisted object store. Returns the number of objects
+    /// reindexed.
+    ///
+    /// The full-text index is intentionally skipped: it persists to disk and is
+    /// already loaded on open, so re-inserting would duplicate documents.
+    /// Embeddings are taken from storage — no embedding API calls are made.
+    pub async fn reindex_from_storage(&self) -> KResult<usize> {
+        let objects = self.storage.search(StorageFilter::default()).await?;
+        let count = objects.len();
+
+        for stored in &objects {
+            let obj = stored_to_obj(stored)?;
+            self.content_cache.insert(obj.id, obj.content.clone());
+
+            for embedding in obj.embeddings.values() {
+                self.hnsw_index.insert(obj.id, embedding.clone());
+            }
+            for (key, value) in &obj.metadata {
+                let val_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.metadata_index.insert(obj.id, key, &val_str);
+            }
+            self.time_index
+                .insert(obj.id, obj.created_at.timestamp_millis());
+            if !obj.relationships.is_empty() {
+                self.graph_index
+                    .insert_relationships(obj.id, &obj.relationships);
+            }
+        }
+
+        if count > 0 {
+            info!("Reindexed {} objects from storage into in-memory indexes", count);
+        }
+        Ok(count)
+    }
+
     /// Insert a knowledge object into storage and all 6 indexes.
-    pub async fn insert(&self, obj: KnowledgeObject) -> KResult<ObjectId> {
+    pub async fn insert(&self, mut obj: KnowledgeObject) -> KResult<ObjectId> {
         let id = obj.id;
 
         // Cache the content for fast retrieval
         self.content_cache.insert(id, obj.content.clone());
 
-        // Index vectors (auto-embed if needed)
+        // Index vectors (auto-embed if needed). The generated embedding is
+        // written back onto the object so it is persisted to storage and can be
+        // restored by reindex_from_storage() after a restart.
         for embedding in obj.embeddings.values() {
             self.hnsw_index.insert(id, embedding.clone());
         }
         if obj.embeddings.is_empty() && !obj.content.is_empty() {
             if let Ok(result) = self.embedding_client.embed(&obj.content).await {
-                self.hnsw_index.insert(id, result.vector);
+                self.hnsw_index.insert(id, result.vector.clone());
+                obj.embeddings.insert(result.model, result.vector);
                 self.cost_tracker.record_embedding_calls(1);
             }
         }
@@ -213,6 +311,17 @@ impl KowitoDBEngine {
 
     /// The core `ai.ask()` method — full pipeline with real content.
     pub async fn ask(&self, question: &str, max_results: usize) -> KResult<AskResponse> {
+        self.ask_with_budget(question, max_results, None).await
+    }
+
+    /// `ai.ask()` with an optional context-token budget that honors a request's
+    /// `max_context_tokens`. A `None` (or zero) budget uses the engine default.
+    pub async fn ask_with_budget(
+        &self,
+        question: &str,
+        max_results: usize,
+        max_context_tokens: Option<usize>,
+    ) -> KResult<AskResponse> {
         // Check plan cache
         let (intent, plan) = if let Some(cached) = self.plan_cache.get(question) {
             cached
@@ -239,7 +348,7 @@ impl KowitoDBEngine {
         let loaded = self.load_results(&limited).await;
 
         // Assemble optimized context from loaded content
-        let assembled = self.assemble_context_from_loaded(&loaded);
+        let assembled = self.assemble_context_from_loaded(&loaded, max_context_tokens);
         self.cost_tracker
             .record_llm_input_tokens(assembled.total_tokens);
 
@@ -258,7 +367,7 @@ impl KowitoDBEngine {
         for r in ranked {
             // Try content cache first
             let content = if let Some(cached) = self.content_cache.get(&r.id) {
-                cached.clone()
+                cached
             } else {
                 // Fall back to storage
                 match self.storage.get(r.id).await {
@@ -297,6 +406,7 @@ impl KowitoDBEngine {
     fn assemble_context_from_loaded(
         &self,
         loaded: &[LoadedResult],
+        max_tokens: Option<usize>,
     ) -> kowitodb_planner::AssembledContext {
         // Convert LoadedResult -> RankedResult for the optimizer
         let ranked: Vec<RankedResult> = loaded
@@ -327,7 +437,8 @@ impl KowitoDBEngine {
                 .map(|l| l.content.clone())
         };
 
-        self.context_optimizer.assemble(&ranked, &content_lookup)
+        self.context_optimizer
+            .assemble_with_budget(&ranked, &content_lookup, max_tokens)
     }
 
     /// Execute the planned retrieval steps.
@@ -558,7 +669,7 @@ impl KowitoDBEngine {
         let mut loaded = Vec::with_capacity(final_ids.len());
         for id in &final_ids {
             let content = if let Some(cached) = self.content_cache.get(id) {
-                cached.clone()
+                cached
             } else if let Ok(Some(stored)) = self.storage.get(*id).await {
                 let val = stored.content.clone();
                 self.content_cache.insert(*id, val.clone());
@@ -830,6 +941,85 @@ mod tests {
         );
         // Should find Microsoft via graph traversal
         assert!(!response.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reindex_rebuilds_in_memory_indexes_after_restart() {
+        let base = std::env::temp_dir().join(format!("kowitodb-restart-{}", uuid::Uuid::new_v4()));
+        let storage_path = base.join("storage");
+        let index_path = base.join("index");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        std::fs::create_dir_all(&index_path).unwrap();
+
+        // First session: insert objects, then drop the engine (simulated shutdown).
+        {
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
+                .unwrap();
+            engine
+                .insert(
+                    KnowledgeObject::new("Acme renewed their enterprise contract")
+                        .with_keywords(vec!["acme".into(), "enterprise".into()])
+                        .with_metadata("company", "Acme"),
+                )
+                .await
+                .unwrap();
+            engine
+                .insert(
+                    KnowledgeObject::new("Globex churned last quarter")
+                        .with_metadata("company", "Globex"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(engine.stats().await.unwrap().vector_count, 2);
+        }
+
+        // Second session over the same paths. Without reindex the in-memory
+        // indexes would be empty; open() must repopulate them from storage.
+        let engine = KowitoDBEngine::open(&storage_path, &index_path)
+            .await
+            .unwrap();
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_objects, 2);
+        assert_eq!(
+            stats.vector_count, 2,
+            "vector index must be rebuilt from persisted embeddings on restart"
+        );
+
+        // Metadata index rebuilt.
+        assert_eq!(engine.metadata_index.query_exact("company", "Acme").len(), 1);
+
+        // End-to-end ask works after restart.
+        let resp = engine.ask("enterprise contract", 5).await.unwrap();
+        assert!(!resp.results.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_ask_honors_context_token_budget() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        for i in 0..5 {
+            engine
+                .insert(KnowledgeObject::new(format!(
+                    "Document number {i} about enterprise renewals and funding rounds \
+                     with enough words to consume a non-trivial number of tokens each."
+                )))
+                .await
+                .unwrap();
+        }
+
+        // A tiny budget should yield a smaller assembled context than a large one.
+        let small = engine
+            .ask_with_budget("enterprise renewals", 5, Some(20))
+            .await
+            .unwrap();
+        let large = engine
+            .ask_with_budget("enterprise renewals", 5, Some(4096))
+            .await
+            .unwrap();
+        assert!(small.total_tokens <= large.total_tokens);
+        assert!(small.total_tokens <= 100, "small budget was not honored");
     }
 
     #[tokio::test]

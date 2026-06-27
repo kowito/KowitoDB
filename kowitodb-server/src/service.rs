@@ -167,13 +167,14 @@ impl KowitoDb for KowitoDBService {
     ) -> Result<Response<proto::AskResponse>, Status> {
         let req = request.into_inner();
         let max_results = req.max_results.clamp(1, 100) as usize;
+        let budget = (req.max_context_tokens > 0).then_some(req.max_context_tokens as usize);
 
         info!("ai.ask(): \"{}\"", req.question);
 
         let start = Instant::now();
         let response = self
             .engine
-            .ask(&req.question, max_results)
+            .ask_with_budget(&req.question, max_results, budget)
             .await
             .map_err(|e| {
                 self.metrics.record_error();

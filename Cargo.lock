@@ -2818,6 +2818,7 @@ dependencies = [
  "kowitodb-planner",
  "kowitodb-sql",
  "kowitodb-storage",
+ "lru",
  "parking_lot 0.12.5",
  "prost 0.13.5",
  "prost-types 0.13.5",

@@ -95,6 +95,22 @@ impl ContextOptimizer {
         ranked: &[RankedResult],
         content_lookup: &dyn Fn(ObjectId) -> Option<String>,
     ) -> AssembledContext {
+        self.assemble_with_budget(ranked, content_lookup, None)
+    }
+
+    /// Like [`Self::assemble`] but with an optional per-call token budget that
+    /// overrides the optimizer's configured `max_tokens` (e.g. honoring a
+    /// request's `max_context_tokens`). A zero or `None` override uses the
+    /// configured default.
+    pub fn assemble_with_budget(
+        &self,
+        ranked: &[RankedResult],
+        content_lookup: &dyn Fn(ObjectId) -> Option<String>,
+        max_tokens_override: Option<usize>,
+    ) -> AssembledContext {
+        let budget = max_tokens_override
+            .filter(|b| *b > 0)
+            .unwrap_or(self.max_tokens);
         let raw_count = ranked.len();
         let mut chunks: Vec<ContextChunk> = Vec::new();
 
@@ -135,7 +151,7 @@ impl ContextOptimizer {
 
         for chunk in sorted {
             let chunk_tokens = chunk.estimated_tokens;
-            if token_count + chunk_tokens <= self.max_tokens {
+            if token_count + chunk_tokens <= budget {
                 token_count += chunk_tokens;
                 final_chunks.push(chunk);
             } else if final_chunks.is_empty() {

@@ -51,6 +51,45 @@ impl OpenAiConfig {
             max_retries: 2,
         }
     }
+
+    /// Build a config from environment variables, or `None` to use the proxy.
+    ///
+    /// Driven by `KOWITODB_EMBEDDING_PROVIDER`:
+    /// - `openai`: requires `OPENAI_API_KEY` (or `KOWITODB_OPENAI_API_KEY`);
+    ///   optional `KOWITODB_OPENAI_BASE_URL`, `KOWITODB_EMBEDDING_MODEL`.
+    /// - `ollama`: optional `KOWITODB_OLLAMA_URL` (default
+    ///   `http://localhost:11434/v1`) and `KOWITODB_EMBEDDING_MODEL`
+    ///   (default `nomic-embed-text`).
+    /// - anything else / unset: `None` (caller falls back to the proxy).
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("KOWITODB_EMBEDDING_PROVIDER")
+            .ok()?
+            .to_lowercase()
+            .as_str()
+        {
+            "openai" => {
+                let key = std::env::var("OPENAI_API_KEY")
+                    .or_else(|_| std::env::var("KOWITODB_OPENAI_API_KEY"))
+                    .ok()?;
+                let mut cfg = Self::openai(key);
+                if let Ok(url) = std::env::var("KOWITODB_OPENAI_BASE_URL") {
+                    cfg.base_url = url;
+                }
+                if let Ok(model) = std::env::var("KOWITODB_EMBEDDING_MODEL") {
+                    cfg.model = model;
+                }
+                Some(cfg)
+            }
+            "ollama" => {
+                let url = std::env::var("KOWITODB_OLLAMA_URL")
+                    .unwrap_or_else(|_| "http://localhost:11434/v1".into());
+                let model = std::env::var("KOWITODB_EMBEDDING_MODEL")
+                    .unwrap_or_else(|_| "nomic-embed-text".into());
+                Some(Self::ollama(url, model))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// OpenAI-compatible embedding client with caching.

@@ -25,6 +25,7 @@ bytes.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
+lru = "0.12"
 reqwest = { version = "0.12", features = ["json"] }
 
 [features]

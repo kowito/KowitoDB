@@ -134,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&storage_path)?;
             std::fs::create_dir_all(&index_path)?;
 
-            let engine = KowitoDBEngine::new(&storage_path, &index_path)
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize engine: {}", e))?;
 
             serve(engine, addr).await?;
@@ -147,7 +148,8 @@ async fn main() -> anyhow::Result<()> {
             index_path,
         } => {
             let question = question.join(" ");
-            let engine = KowitoDBEngine::new(&storage_path, &index_path)
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
 
             println!("🤖 Asking: \"{}\"\n", question);
@@ -279,7 +281,8 @@ async fn main() -> anyhow::Result<()> {
             index_path,
         } => {
             let sql = query.join(" ");
-            let engine = KowitoDBEngine::new(&storage_path, &index_path)
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
 
             println!("📊 SQL: {}\n", sql);
@@ -309,7 +312,8 @@ async fn main() -> anyhow::Result<()> {
             storage_path,
             index_path,
         } => {
-            let engine = KowitoDBEngine::new(&storage_path, &index_path)
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
 
             let stats = engine
