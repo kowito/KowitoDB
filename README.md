@@ -184,6 +184,7 @@ is unset the server uses a deterministic dev proxy; set it to use a real model:
 | `KOWITODB_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`). |
 | `KOWITODB_VECTOR_QUANTIZE` | `1` to int8-quantize stored vectors (~4× less memory, ~few points recall). Off by default. |
 | `KOWITODB_CONTEXTUAL_RETRIEVAL` | `0` to disable Contextual Retrieval (embedding/BM25 over a metadata+keyword-augmented text). On by default. |
+| `KOWITODB_CORRECTIVE_RETRIEVAL` | `0` to disable the CRAG-style corrective gate (broaden + re-rank on low-confidence retrieval). On by default. |
 
 Logging is controlled by `RUST_LOG` (via `tracing-subscriber`'s `EnvFilter`);
 it defaults to `info`:

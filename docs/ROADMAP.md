@@ -12,7 +12,10 @@ research notes; each item below tags maturity and the key paper/system.
 
 ---
 
-## Recently shipped (v0.2 → v0.8)
+## Recently shipped (v0.2 → v0.10)
+
+- ✅ Retrieval quality: Contextual Retrieval (v0.9), CRAG-style corrective gate
+  (v0.10); RRF hybrid fusion + rule-engine query routing were already present
 
 - ✅ Data plane: batch insert, metadata-filtered retrieval, list/pagination
 - ✅ Real embeddings (on-device Candle / OpenAI / Ollama), HNSW recall fix (~94%)
@@ -26,22 +29,27 @@ research notes; each item below tags maturity and the key paper/system.
 
 ## Game-changers (research-grounded, prioritized)
 
-### 1. Contextual Retrieval — 🔜 in progress
-Prepend chunk-specific context to the text that gets embedded **and** BM25-indexed,
-while storage returns the original content.
+### 1. Contextual Retrieval — ✅ shipped (v0.9.0)
+Embed and BM25-index a context-augmented text (deterministic preamble from
+metadata + keywords) while storage returns the original content.
 - **Evidence (VERIFIED 3-0):** Contextual Embeddings + Contextual BM25 cut top-20
   retrieval failure rate **49%**; with reranking **67%**. — Anthropic, 2024.
-- **Why us:** needs vector **and** BM25 **and** rerank — we already have all three.
-- **First cut (this work):** deterministic context from structured fields
-  (metadata + keywords). **Potential:** LLM-generated context (faithful Anthropic
-  version) behind an optional generative-client hook.
+- **Follow-up (📋):** LLM-generated context (faithful Anthropic version) behind an
+  optional generative-client hook.
 
-### 2. Cross-encoder / LLM reranker — 📋 planned
-Replace the planner's score-fusion `rerank_simple` with a real reranker (the step
-that takes the 49% → 67% failure-rate reduction above).
-- **Maturity:** production-proven (cross-encoders, Cohere/BGE rerankers).
-- **Potential:** on-device Candle cross-encoder (e.g. `bge-reranker`) so it stays
-  offline-capable, mirroring the local-embeddings feature.
+### 2. Reranking — RRF fusion ✅ done · cross-encoder 📋 planned
+- ✅ **Already present:** the reranker does Reciprocal Rank Fusion across
+  vector/BM25/graph/metadata/time with per-source weights, multi-source boosting,
+  and normalization (`Reranker::rerank`).
+- 📋 **Remaining:** a learned **cross-encoder reranker** (the step that takes
+  Anthropic's 49% → 67%). Plan: on-device Candle `bge-reranker` behind a feature,
+  mirroring local-embeddings (compile-verifiable; runtime needs the model).
+
+### CRAG-style corrective gate — ✅ shipped (v0.10.0)
+When retrieval confidence is low (few results / little cross-source agreement),
+broaden the search across vector + keyword and re-rank. The *mechanism* (a
+lightweight retrieval-quality evaluator) was the verified part of CRAG.
+`KOWITODB_CORRECTIVE_RETRIEVAL=0` disables.
 
 ### 3. Mem0-style memory consolidation, fused into the graph — 📋 planned (category-definer)
 Replace flat turn storage with an LLM-driven extract → consolidate → update
@@ -50,12 +58,12 @@ pipeline (ADD/UPDATE/DELETE/NOOP) and link memories as nodes/edges in the graph.
 - **Why us:** we already persist agent memory **and** have a graph index — this is
   the most *differentiating* item; it makes "agent-memory OS" real.
 
-### 4. Query routing in the planner — 📋 planned
-Route each query by intent: fact → vector/BM25, reasoning/multi-hop → graph,
-analytical → SQL.
-- **Evidence:** systematic 2025 evals show GraphRAG does **not** uniformly beat RAG;
-  routing/integration beats either alone (~+6% via integration). — arxiv 2502.11371.
-- **Why us:** we already have a planner with intent detection + all three backends.
+### 4. Query routing in the planner — ✅ largely done · 📋 enhance
+- ✅ **Already present:** a rule-engine planner maps detected intent → retrieval
+  actions (vector / keyword / graph / metadata / time), so routing exists.
+- 📋 **Enhance:** add explicit SQL routing for analytical queries and tune
+  intent→strategy weights. **Evidence:** 2025 evals show routing/integration beats
+  RAG-or-GraphRAG alone (~+6%). — arxiv 2502.11371.
 
 ### 5. RaBitQ quantization (+ DiskANN) — 🔬 potential (the real scale lever)
 Upgrade int8 SQ → ~1 bit/dim with a *theoretical* error bound (~32× compression);
@@ -79,9 +87,6 @@ DiskANN + RaBitQ enables billion-scale on SSD.
   beyond RAM.
 - **Multimodal embeddings:** image/text in the same store (knowledge objects are
   already content-agnostic).
-- **Corrective gate (CRAG-style):** a lightweight retrieval-quality evaluator that
-  gates re-retrieval (mechanism verified 2-0; "big quality win" claim did not
-  survive verification — adopt as a cheap confidence gate, not a miracle).
 
 ## Scale / infra (📋)
 

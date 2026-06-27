@@ -50,6 +50,38 @@ fn vector_index_params() -> HnswParams {
     }
 }
 
+/// Retrieval confidence below this triggers a corrective (broadened) pass.
+const CONFIDENCE_THRESHOLD: f32 = 0.35;
+
+/// Whether the CRAG-style corrective gate is enabled (default on; disable with
+/// `KOWITODB_CORRECTIVE_RETRIEVAL=0`).
+fn corrective_retrieval_enabled() -> bool {
+    std::env::var("KOWITODB_CORRECTIVE_RETRIEVAL")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(true)
+}
+
+/// Estimate retrieval confidence in [0, 1] from the ranked results.
+///
+/// The reranker normalizes the top score to 1.0, so confidence keys on *result
+/// coverage* (did we find enough?) and *cross-source agreement* (do multiple
+/// indexes agree?) rather than the absolute top score.
+fn retrieval_confidence(ranked: &[RankedResult], requested: usize) -> f32 {
+    if ranked.is_empty() {
+        return 0.0;
+    }
+    let req = requested.max(1) as f32;
+    let coverage = (ranked.len().min(requested) as f32) / req;
+    let considered = ranked.iter().take(requested).count().max(1) as f32;
+    let multi_source = ranked
+        .iter()
+        .take(requested)
+        .filter(|r| r.sources.len() > 1)
+        .count() as f32
+        / considered;
+    0.7 * coverage + 0.3 * multi_source
+}
+
 /// Whether Contextual Retrieval augmentation is enabled (default on; disable
 /// with `KOWITODB_CONTEXTUAL_RETRIEVAL=0`).
 fn contextual_retrieval_enabled() -> bool {
@@ -479,6 +511,29 @@ impl KowitoDBEngine {
         allowed.unwrap_or_default()
     }
 
+    /// Broadened retrieval used by the corrective gate: a wide vector + keyword
+    /// sweep over the question, returned as raw index results to merge + re-rank.
+    async fn corrective_retrieval(&self, question: &str) -> KResult<Vec<IndexResult>> {
+        const WIDE: usize = 50;
+        let mut out = Vec::new();
+
+        if let Ok(results) = self.fulltext_index.search(question, WIDE) {
+            if !results.is_empty() {
+                let (ids, scores): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+                out.push(IndexResult::new(ids, scores, IndexSource::FullText));
+            }
+        }
+        if let Ok(emb) = self.embedding_client.embed(question).await {
+            self.cost_tracker.record_embedding_calls(1);
+            let results = self.hnsw_index.search(&emb.vector, WIDE);
+            if !results.is_empty() {
+                let (ids, scores): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+                out.push(IndexResult::new(ids, scores, IndexSource::Vector));
+            }
+        }
+        Ok(out)
+    }
+
     /// Retrieve by ID (checks content cache first, then storage).
     pub async fn get(&self, id: ObjectId) -> KResult<Option<KnowledgeObject>> {
         match self.storage.get(id).await? {
@@ -600,10 +655,27 @@ impl KowitoDBEngine {
 
         // Graph traversal
         let graph_results = self.execute_graph_traversal(&raw_results, &intent).await?;
-        let all_results: Vec<IndexResult> = raw_results.into_iter().chain(graph_results).collect();
+        let mut all_results: Vec<IndexResult> =
+            raw_results.into_iter().chain(graph_results).collect();
 
         // Rerank
-        let ranked = self.reranker.rerank_simple(&all_results);
+        let mut ranked = self.reranker.rerank_simple(&all_results);
+
+        // CRAG-style corrective gate: when retrieval confidence is low (few
+        // results / little cross-source agreement), broaden the search across
+        // vector + keyword and re-rank. Exploits the integrated indexes.
+        if corrective_retrieval_enabled()
+            && retrieval_confidence(&ranked, max_results) < CONFIDENCE_THRESHOLD
+        {
+            let corrective = self.corrective_retrieval(question).await?;
+            if !corrective.is_empty() {
+                self.cost_tracker
+                    .record_index_lookups(corrective.iter().map(|r| r.ids.len()).sum());
+                all_results.extend(corrective);
+                ranked = self.reranker.rerank_simple(&all_results);
+                debug!("Corrective retrieval engaged for low-confidence query");
+            }
+        }
 
         // Apply metadata filter (via the metadata index) before limiting, so the
         // result count reflects the constraint.
@@ -1371,6 +1443,29 @@ mod tests {
         assert!(!engine.ask("document", 5).await.unwrap().results.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_retrieval_confidence() {
+        // Empty → zero confidence (triggers corrective).
+        assert_eq!(retrieval_confidence(&[], 5), 0.0);
+
+        let mk = |sources: Vec<IndexSource>| RankedResult {
+            id: uuid::Uuid::new_v4(),
+            score: 1.0,
+            sources,
+            source_scores: HashMap::new(),
+        };
+
+        // One result, single source, 5 requested → low confidence.
+        let sparse = vec![mk(vec![IndexSource::Vector])];
+        assert!(retrieval_confidence(&sparse, 5) < CONFIDENCE_THRESHOLD);
+
+        // Full coverage with cross-source agreement → high confidence.
+        let strong: Vec<_> = (0..5)
+            .map(|_| mk(vec![IndexSource::Vector, IndexSource::FullText]))
+            .collect();
+        assert!(retrieval_confidence(&strong, 5) > CONFIDENCE_THRESHOLD);
     }
 
     #[test]
