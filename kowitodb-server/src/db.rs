@@ -54,11 +54,22 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Matryoshka adaptive-retrieval coarse dimension, via
+/// `KOWITODB_VECTOR_COARSE_DIM=<n>`. When set, the index navigates on the first
+/// `n` dimensions and refines top-k at full precision. Requires MRL embeddings.
+fn vector_coarse_dim() -> Option<usize> {
+    std::env::var("KOWITODB_VECTOR_COARSE_DIM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&d| d > 0)
+}
+
 /// Vector-index parameters built from the environment.
 fn vector_index_params() -> HnswParams {
     HnswParams {
         quantize: vector_quantize_enabled(),
         binary_quantize: vector_binary_quantize_enabled(),
+        coarse_dim: vector_coarse_dim(),
         ..Default::default()
     }
 }

@@ -204,6 +204,36 @@ impl NodeVector {
             }
         }
     }
+
+    /// Distance using only the first `coarse` dimensions (Matryoshka coarse
+    /// pass) when `Some`, else the full distance. Prefix scoring is valid for
+    /// `Full`/`Quantized` (where prefixes of MRL embeddings are themselves
+    /// embeddings); `Binary` rotates the space so prefixes are meaningless and
+    /// it falls back to the full estimator.
+    #[inline]
+    fn dist_sq_coarse(&self, query: &[f32], coarse: Option<usize>) -> f32 {
+        let Some(d) = coarse else {
+            return self.dist_sq(query);
+        };
+        match self {
+            NodeVector::Full(v) => {
+                let n = d.min(v.len()).min(query.len());
+                squared_dist(&query[..n], &v[..n])
+            }
+            NodeVector::Quantized(q) => {
+                let n = d.min(q.len()).min(query.len());
+                query[..n]
+                    .iter()
+                    .zip(&q[..n])
+                    .map(|(x, &qi)| {
+                        let e = x - qi as f32 / QUANT_SCALE;
+                        e * e
+                    })
+                    .sum()
+            }
+            NodeVector::Binary { .. } => self.dist_sq(query),
+        }
+    }
 }
 
 /// A float wrapper that provides total ordering for BinaryHeap use.
@@ -260,6 +290,13 @@ pub struct HnswParams {
     /// memory win is the lever for very large in-RAM collections.
     #[serde(default)]
     pub binary_quantize: bool,
+    /// Matryoshka adaptive retrieval: when `Some(d)`, navigate the graph using
+    /// only the first `d` vector dimensions (a cheap coarse pass) and refine the
+    /// final top-k with full-dimension distances. Requires MRL-trained
+    /// embeddings (valid prefixes). Ignored under binary quantization. `None`
+    /// (default) searches at full precision throughout.
+    #[serde(default)]
+    pub coarse_dim: Option<usize>,
 }
 
 impl Default for HnswParams {
@@ -276,6 +313,7 @@ impl Default for HnswParams {
             m0: 2 * m,
             quantize: false,
             binary_quantize: false,
+            coarse_dim: None,
         }
     }
 }
@@ -391,7 +429,8 @@ impl HnswIndex {
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
             if curr_ep_exists {
-                let (nearest, _) = self.search_layer_greedy(search_vec, &[curr_ep], lc, 1, &nodes);
+                let (nearest, _) =
+                    self.search_layer_greedy(search_vec, &[curr_ep], lc, 1, &nodes, None);
                 if let Some(nearest_id) = nearest.into_iter().next() {
                     curr_ep = nearest_id;
                     curr_ep_exists = nodes.contains_key(&nearest_id);
@@ -411,6 +450,7 @@ impl HnswIndex {
                 lc,
                 self.params.ef_construction,
                 &nodes,
+                None,
             );
 
             // Select M (or M0 at layer 0) best neighbors
@@ -487,6 +527,14 @@ impl HnswIndex {
         // In binary mode the graph lives in the rotated basis, so rotate the
         // query once and navigate with it.
         let rotated = self.rotation.read().as_ref().map(|r| r.apply(query));
+        // Matryoshka coarse pass — navigate with a dimension prefix, then refine
+        // the final candidates at full dimension. Disabled under rotation
+        // (binary), where prefixes are meaningless.
+        let coarse = if rotated.is_some() {
+            None
+        } else {
+            self.params.coarse_dim.filter(|&d| d > 0 && d < query.len())
+        };
         let query: &[f32] = rotated.as_deref().unwrap_or(query);
 
         // Greedy descent from top layer to layer 1
@@ -494,18 +542,38 @@ impl HnswIndex {
         let global_max = *max_layer;
 
         for lc in (1..=global_max).rev() {
-            let (nearest, _) = self.search_layer_greedy(query, &[curr_ep], lc, 1, &nodes);
+            let (nearest, _) = self.search_layer_greedy(query, &[curr_ep], lc, 1, &nodes, coarse);
             if let Some(nearest_id) = nearest.into_iter().next() {
                 curr_ep = nearest_id;
             }
         }
 
-        // Beam search at layer 0
-        let ef = self.params.ef_search.max(k);
-        let (candidates, distances) = self.search_layer_beam(query, &[curr_ep], 0, ef, &nodes);
+        // Beam search at layer 0. With a coarse pass, over-fetch candidates so
+        // the full-dimension refine below has a good pool to re-rank.
+        let ef = if coarse.is_some() {
+            self.params.ef_search.max(k * 4)
+        } else {
+            self.params.ef_search.max(k)
+        };
+        let (candidates, distances) =
+            self.search_layer_beam(query, &[curr_ep], 0, ef, &nodes, coarse);
 
-        // Take top-k
-        let mut results: Vec<(ObjectId, f32)> = candidates.into_iter().zip(distances).collect();
+        // Take top-k. Under a coarse pass, re-score candidates at full dimension
+        // so the returned ranking is exact; otherwise use the beam's distances.
+        let mut results: Vec<(ObjectId, f32)> = if coarse.is_some() {
+            candidates
+                .iter()
+                .map(|&id| {
+                    let d = nodes
+                        .get(&id)
+                        .map(|n| n.vector.dist_sq(query))
+                        .unwrap_or(f32::MAX);
+                    (id, d)
+                })
+                .collect()
+        } else {
+            candidates.into_iter().zip(distances).collect()
+        };
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.truncate(k);
@@ -591,9 +659,10 @@ impl HnswIndex {
         layer: usize,
         _ef: usize,
         nodes: &NodeMap,
+        coarse: Option<usize>,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         let mut best_id = entry_points[0];
-        let mut best_dist = nodes[&best_id].vector.dist_sq(query);
+        let mut best_dist = nodes[&best_id].vector.dist_sq_coarse(query, coarse);
 
         loop {
             let mut improved = false;
@@ -601,7 +670,7 @@ impl HnswIndex {
             if let Some(neighbor_set) = nodes.get(&best_id).and_then(|n| n.neighbors.get(&layer)) {
                 for &neighbor_id in neighbor_set {
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = neighbor.vector.dist_sq(query);
+                        let dist = neighbor.vector.dist_sq_coarse(query, coarse);
                         if dist < best_dist {
                             best_dist = dist;
                             best_id = neighbor_id;
@@ -627,6 +696,7 @@ impl HnswIndex {
         layer: usize,
         ef: usize,
         nodes: &NodeMap,
+        coarse: Option<usize>,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         #[derive(Debug)]
         struct Candidate {
@@ -683,7 +753,7 @@ impl HnswIndex {
         let mut results: BinaryHeap<WorstCandidate> = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = nodes[&ep].vector.dist_sq(query);
+            let dist = nodes[&ep].vector.dist_sq_coarse(query, coarse);
             candidates.push(Candidate {
                 id: ep,
                 dist: OrdFloat(dist),
@@ -716,7 +786,7 @@ impl HnswIndex {
                         continue;
                     }
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = neighbor.vector.dist_sq(query);
+                        let dist = neighbor.vector.dist_sq_coarse(query, coarse);
                         let od = OrdFloat(dist);
 
                         let should_add = results.len() < ef
@@ -879,6 +949,56 @@ mod tests {
         }
         let recall = hit as f32 / total as f32;
         assert!(recall >= 0.5, "binary recall@10 too low: {recall}");
+    }
+
+    #[test]
+    fn test_matryoshka_coarse_search_refines() {
+        // Coarse (prefix-dim) navigation + full-dim refine: exact matches stay
+        // top-1 and recall@10 vs brute force stays high because the final
+        // ranking is computed at full dimension.
+        let idx = HnswIndex::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            ef_search: 100,
+            coarse_dim: Some(16), // navigate on the first 16 of 64 dims
+            ..Default::default()
+        });
+        let mut items = Vec::new();
+        for i in 0..200u32 {
+            let id = uuid::Uuid::from_u128(i as u128 + 1);
+            let v: Vec<f32> = (0..64)
+                .map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin())
+                .collect();
+            idx.insert(id, v.clone());
+            items.push((id, v));
+        }
+
+        let (qid, qv) = &items[42];
+        assert_eq!(
+            idx.search(qv, 5)[0].0,
+            *qid,
+            "exact match should be top-1 after full-dim refine"
+        );
+
+        let probes = [7usize, 99, 150];
+        let (mut hit, mut total) = (0usize, 0usize);
+        for &p in &probes {
+            let q = &items[p].1;
+            let mut bf: Vec<_> = items
+                .iter()
+                .map(|(id, v)| (*id, squared_dist(q, v)))
+                .collect();
+            bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
+            for (id, _) in idx.search(q, 10) {
+                if truth.contains(&id) {
+                    hit += 1;
+                }
+                total += 1;
+            }
+        }
+        let recall = hit as f32 / total as f32;
+        assert!(recall >= 0.7, "matryoshka recall@10 too low: {recall}");
     }
 
     #[test]

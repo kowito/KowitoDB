@@ -113,9 +113,14 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - **Late interaction (ColBERTv2 / PLAID):** multi-vector MaxSim; +6–10× storage
   compression, PLAID ~45× CPU speedup. Highest quality ceiling, highest effort
   (changes the index model). — arxiv 2112.01488, 2205.09707.
-- **Matryoshka embeddings (MRL):** nested dims → adaptive-precision retrieval
-  (cheap coarse pass → full-dim rerank). Pairs with quantization + reranker; low
-  effort if the embedding model supports it (OpenAI `text-embedding-3` does).
+- ✅ **Matryoshka embeddings (MRL) — shipped (v0.22.0):** adaptive-dimension
+  retrieval. With `HnswParams::coarse_dim = Some(d)` (or
+  `KOWITODB_VECTOR_COARSE_DIM=d`) the HNSW graph is navigated using only the
+  first `d` dimensions (a cheap coarse pass), then the final top-k is refined at
+  full dimension so the returned ranking stays exact. Requires MRL-trained
+  embeddings whose prefixes are valid (OpenAI `text-embedding-3`); ignored under
+  binary quantization (the rotation precludes prefixes). Recall@10 ≥ 0.7 vs brute
+  force validated in a unit test. Pairs with the quantization + reranker layers.
 - **LazyGraphRAG-style auto-graph:** cheap entity/relation extraction at ingest to
   enrich the graph index (~0.1% of full GraphRAG indexing cost, *unverified*).
 - **Out-of-core / billion-scale:** DiskANN-style on-disk graph + RaBitQ; the path
