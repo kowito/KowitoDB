@@ -90,6 +90,11 @@ enum Commands {
         /// Replication factor — write each object to this many nodes
         #[arg(long, default_value = "1", env = "KOWITODB_REPLICATION_FACTOR")]
         replication_factor: usize,
+
+        /// Write quorum — replica acks required per write (clamped to RF;
+        /// `>= ceil((RF+1)/2)` gives majority durability)
+        #[arg(long, default_value = "1", env = "KOWITODB_WRITE_QUORUM")]
+        write_quorum: usize,
     },
 
     /// Ask a question (embedded mode — no server required)
@@ -230,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
             addr,
             peers,
             replication_factor,
+            write_quorum,
         } => {
             info!("Starting KowitoDB gateway v{}", env!("CARGO_PKG_VERSION"));
             if peers.is_empty() {
@@ -237,7 +243,7 @@ async fn main() -> anyhow::Result<()> {
                     "--peers is required: a comma-separated list of data node host:port addresses"
                 );
             }
-            serve_gateway(addr, peers, replication_factor).await?;
+            serve_gateway(addr, peers, replication_factor, write_quorum).await?;
         }
 
         Commands::Ask {

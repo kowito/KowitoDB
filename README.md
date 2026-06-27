@@ -209,12 +209,15 @@ kowitodb serve --addr 0.0.0.0:50052 --storage-path /data/n2/s --index-path /data
 # coordinator
 kowitodb gateway --addr 0.0.0.0:50050 \
   --peers host1:50051,host2:50052 \
-  --replication-factor 2
+  --replication-factor 2 \
+  --write-quorum 2          # require 2 replica acks per write (durability)
 ```
 
-This provides real horizontal distribution. It is **not** consensus-backed HA —
-see [docs/ROADMAP.md](docs/ROADMAP.md) for the honest limits (no quorum,
-rebalancing, or failure recovery yet).
+Writes require `--write-quorum` replica acks (default 1); reads tolerate partial
+node failure and only error on a total outage. This is real horizontal
+distribution with tunable durability — but **not** yet consensus-backed HA. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for the honest limits (no Raft/linearizable
+reads, rebalancing, or read-repair yet).
 
 ### Use a client
 

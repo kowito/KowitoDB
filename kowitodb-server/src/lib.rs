@@ -149,12 +149,14 @@ pub async fn serve_gateway(
     addr: SocketAddr,
     peers: Vec<String>,
     replication_factor: usize,
+    write_quorum: usize,
 ) -> anyhow::Result<()> {
-    let cluster = Cluster::connect(&peers, replication_factor).await?;
+    let cluster = Cluster::connect(&peers, replication_factor, write_quorum).await?;
     info!(
-        "KowitoDB gateway: {} data node(s), replication_factor={}",
+        "KowitoDB gateway: {} data node(s), replication_factor={}, write_quorum={}",
         cluster.node_count(),
-        replication_factor
+        replication_factor,
+        write_quorum
     );
     let service = ClusterService::new(cluster);
 

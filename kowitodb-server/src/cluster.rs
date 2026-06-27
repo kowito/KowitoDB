@@ -4,20 +4,20 @@
 //! scatter-gather design:
 //!
 //! - **Writes** are partitioned by object id (consistent `id % N`) and optionally
-//!   replicated to `R` consecutive nodes (best-effort: succeeds if any replica
-//!   accepts). The gateway assigns the id up front so it can route before the id
-//!   would otherwise be server-generated.
+//!   replicated to `R` consecutive nodes. A write succeeds once `write_quorum`
+//!   replicas ack (tunable durability). The gateway assigns the id up front so it
+//!   can route before the id would otherwise be server-generated.
 //! - **Id-keyed ops** (get/update/delete) route to the owning replica set.
 //! - **Reads** (search/ask/sql/list/stats) scatter to every node in parallel and
 //!   merge: search/ask de-duplicate by id (keeping the best score) and re-rank;
-//!   stats/list aggregate.
+//!   stats/list aggregate. Partial node failure is tolerated; a total outage
+//!   surfaces as an error (vs. an empty "no matches" result).
 //! - **Agent sessions** partition by `session_id`.
 //!
-//! This provides real horizontal distribution. It is **not** a consensus-backed,
-//! strongly-consistent cluster: there is no Raft, no quorum, no automatic
-//! rebalancing on membership change, and no failure recovery/repair. Those are
-//! the production-HA follow-ups. Replication here is best-effort write fan-out
-//! with read-side de-duplication.
+//! This provides real horizontal distribution with tunable write durability. It
+//! is **not** a consensus-backed, strongly-consistent cluster: there is no Raft
+//! (so no linearizable reads), no automatic rebalancing on membership change, and
+//! no read-repair. Those are the production-HA follow-ups.
 
 // gRPC handlers return `Result<_, Status>`; tonic's Status is intentionally large.
 #![allow(clippy::result_large_err)]
@@ -178,20 +178,34 @@ impl ClusterNode for RemoteNode {
 pub struct Cluster {
     nodes: Vec<Arc<dyn ClusterNode>>,
     replication_factor: usize,
+    /// Minimum replica acks required for a write to succeed (durability).
+    write_quorum: usize,
 }
 
 impl Cluster {
-    /// Build a cluster from already-constructed nodes.
+    /// Build a cluster from already-constructed nodes (write_quorum = 1).
     pub fn new(nodes: Vec<Arc<dyn ClusterNode>>, replication_factor: usize) -> Self {
         let n = nodes.len().max(1);
         Self {
             nodes,
             replication_factor: replication_factor.clamp(1, n),
+            write_quorum: 1,
         }
     }
 
+    /// Require `w` replica acks per write (clamped to the replication factor).
+    /// `w >= ceil((R+1)/2)` gives majority-quorum durability.
+    pub fn with_write_quorum(mut self, w: usize) -> Self {
+        self.write_quorum = w.clamp(1, self.replication_factor);
+        self
+    }
+
     /// Connect to peer data nodes over gRPC.
-    pub async fn connect(peers: &[String], replication_factor: usize) -> anyhow::Result<Self> {
+    pub async fn connect(
+        peers: &[String],
+        replication_factor: usize,
+        write_quorum: usize,
+    ) -> anyhow::Result<Self> {
         if peers.is_empty() {
             anyhow::bail!("a cluster needs at least one peer node");
         }
@@ -201,7 +215,7 @@ impl Cluster {
             info!("Cluster: connected to data node {}", node.addr());
             nodes.push(Arc::new(node));
         }
-        Ok(Self::new(nodes, replication_factor))
+        Ok(Self::new(nodes, replication_factor).with_write_quorum(write_quorum))
     }
 
     pub fn node_count(&self) -> usize {
@@ -280,27 +294,30 @@ impl Cluster {
         Ok(proto::BatchInsertResponse { ids })
     }
 
-    /// Run `f` on each replica; succeed if at least one accepts.
+    /// Run `f` on each replica; succeed once `write_quorum` replicas ack.
     async fn write_to_replicas<F, Fut>(&self, replicas: &[usize], f: F) -> Result<(), Status>
     where
         F: Fn(Arc<dyn ClusterNode>) -> Fut,
         Fut: std::future::Future<Output = Result<(), Status>>,
     {
-        let mut accepted = false;
+        let quorum = self.write_quorum.clamp(1, replicas.len().max(1));
+        let mut acks = 0usize;
         let mut last_err = None;
         for &i in replicas {
             match f(self.nodes[i].clone()).await {
-                Ok(()) => accepted = true,
+                Ok(()) => acks += 1,
                 Err(e) => {
                     warn!("write to replica {i} failed: {e}");
                     last_err = Some(e);
                 }
             }
         }
-        if accepted {
+        if acks >= quorum {
             Ok(())
         } else {
-            Err(last_err.unwrap_or_else(|| Status::internal("no replicas available")))
+            Err(last_err.unwrap_or_else(|| {
+                Status::unavailable(format!("write quorum not met: {acks}/{quorum} acks"))
+            }))
         }
     }
 
@@ -354,7 +371,7 @@ impl Cluster {
                 let r = req.clone();
                 async move { n.search(r).await }
             })
-            .await;
+            .await?;
 
         let mut by_id: HashMap<String, proto::SearchResult> = HashMap::new();
         for resp in responses {
@@ -392,7 +409,7 @@ impl Cluster {
                 let r = req.clone();
                 async move { n.ask(r).await }
             })
-            .await;
+            .await?;
 
         let mut intent = detected_intent;
         let mut by_id: HashMap<String, proto::AskResult> = HashMap::new();
@@ -435,7 +452,7 @@ impl Cluster {
                 let r = req.clone();
                 async move { n.sql(r).await }
             })
-            .await;
+            .await?;
         let rows = responses.into_iter().flat_map(|r| r.rows).collect();
         Ok(proto::SqlResponse { rows })
     }
@@ -457,7 +474,7 @@ impl Cluster {
                 let r = per_node;
                 async move { n.list(r).await }
             })
-            .await;
+            .await?;
 
         let total: u64 = responses.iter().map(|r| r.total).sum();
         let mut by_id: HashMap<String, proto::KnowledgeObject> = HashMap::new();
@@ -478,7 +495,7 @@ impl Cluster {
                 let r = req;
                 async move { n.stats(r).await }
             })
-            .await;
+            .await?;
 
         let mut out = proto::StatsResponse::default();
         let count = responses.len().max(1) as f64;
@@ -531,18 +548,30 @@ impl Cluster {
         })
     }
 
-    /// Run `f` against every node in parallel; drop errored nodes.
-    async fn scatter<F, Fut, T>(&self, f: F) -> Vec<T>
+    /// Run `f` against every node in parallel. Tolerates partial failure (drops
+    /// errored nodes), but errors if **every** node failed — so callers can tell
+    /// "no matches" (empty Ok) from "cluster unavailable" (Err).
+    async fn scatter<F, Fut, T>(&self, f: F) -> Result<Vec<T>, Status>
     where
         F: Fn(Arc<dyn ClusterNode>) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
         let futures = self.nodes.iter().map(|n| f(n.clone()));
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect()
+        let outcomes = futures::future::join_all(futures).await;
+        let total = outcomes.len();
+
+        let mut oks = Vec::with_capacity(total);
+        let mut last_err = None;
+        for outcome in outcomes {
+            match outcome {
+                Ok(v) => oks.push(v),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if oks.is_empty() && total > 0 {
+            return Err(last_err.unwrap_or_else(|| Status::unavailable("all cluster nodes failed")));
+        }
+        Ok(oks)
     }
 }
 
@@ -697,14 +726,30 @@ mod tests {
     use parking_lot::Mutex;
 
     /// In-memory data node: stores inserts, "search" matches by content substring.
+    /// `fail` makes every call return Unavailable (simulating a downed node).
     #[derive(Default)]
     struct MockNode {
         objects: Mutex<HashMap<String, (String, f32)>>, // id -> (content, score)
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockNode {
+        fn set_fail(&self, f: bool) {
+            self.fail.store(f, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn check(&self) -> Result<(), Status> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(Status::unavailable("node down"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[tonic::async_trait]
     impl ClusterNode for MockNode {
         async fn insert(&self, req: proto::InsertRequest) -> Result<proto::InsertResponse, Status> {
+            self.check()?;
             let id = req.id.clone().unwrap();
             self.objects
                 .lock()
@@ -712,6 +757,7 @@ mod tests {
             Ok(proto::InsertResponse { id })
         }
         async fn search(&self, req: proto::SearchRequest) -> Result<proto::SearchResponse, Status> {
+            self.check()?;
             let results: Vec<_> = self
                 .objects
                 .lock()
@@ -731,6 +777,7 @@ mod tests {
             })
         }
         async fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, Status> {
+            self.check()?;
             let object =
                 self.objects
                     .lock()
@@ -743,10 +790,12 @@ mod tests {
             Ok(proto::GetResponse { object })
         }
         async fn delete(&self, req: proto::DeleteRequest) -> Result<proto::DeleteResponse, Status> {
+            self.check()?;
             let existed = self.objects.lock().remove(&req.id).is_some();
             Ok(proto::DeleteResponse { existed })
         }
         async fn stats(&self, _req: proto::StatsRequest) -> Result<proto::StatsResponse, Status> {
+            self.check()?;
             Ok(proto::StatsResponse {
                 total_objects: self.objects.lock().len() as u64,
                 ..Default::default()
@@ -888,6 +937,69 @@ mod tests {
         assert_eq!(
             mocks.iter().map(|m| m.objects.lock().len()).sum::<usize>(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_quorum() {
+        let mocks: Vec<Arc<MockNode>> = (0..3).map(|_| Arc::new(MockNode::default())).collect();
+        let nodes: Vec<Arc<dyn ClusterNode>> = mocks.iter().map(|m| m.clone() as _).collect();
+        let cluster = Cluster::new(nodes, 3).with_write_quorum(2); // rf=3, W=2
+
+        let mk = |c: &str| proto::InsertRequest {
+            content: c.into(),
+            ..Default::default()
+        };
+
+        // All replicas healthy → write succeeds.
+        assert!(cluster.insert(mk("a")).await.is_ok());
+
+        // Two replicas down → only 1 ack < quorum(2) → write fails.
+        mocks[1].set_fail(true);
+        mocks[2].set_fail(true);
+        assert!(
+            cluster.insert(mk("b")).await.is_err(),
+            "write must fail when the quorum is not met"
+        );
+
+        // One replica back → 2 acks ≥ quorum → write succeeds again.
+        mocks[2].set_fail(false);
+        assert!(cluster.insert(mk("c")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reads_tolerate_partial_failure() {
+        let (cluster, mocks) = cluster(3, 1);
+        for i in 0..9 {
+            cluster
+                .insert(proto::InsertRequest {
+                    content: format!("widget {i}"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let query = || proto::SearchRequest {
+            query: "widget".into(),
+            top_k: 50,
+            ..Default::default()
+        };
+
+        // One node down → search still returns results from the live nodes.
+        mocks[0].set_fail(true);
+        assert!(
+            !cluster.search(query()).await.unwrap().results.is_empty(),
+            "a single node failure must be tolerated"
+        );
+
+        // Every node down → search errors (distinguishes an outage from "no
+        // matches", which is an empty Ok).
+        for m in &mocks {
+            m.set_fail(true);
+        }
+        assert!(
+            cluster.search(query()).await.is_err(),
+            "total outage must surface as an error"
         );
     }
 }
