@@ -69,6 +69,8 @@ fn vector_index_params() -> HnswParams {
     HnswParams {
         quantize: vector_quantize_enabled(),
         binary_quantize: vector_binary_quantize_enabled(),
+        // Retain int8 vectors to re-score binary candidates (higher recall).
+        binary_rerank: env_flag("KOWITODB_VECTOR_BINARY_RERANK"),
         coarse_dim: vector_coarse_dim(),
         ..Default::default()
     }

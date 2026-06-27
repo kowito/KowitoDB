@@ -314,6 +314,12 @@ struct HnswNode {
     max_layer: usize,
     /// Per-layer neighbor sets: layer → set of neighbor IDs.
     neighbors: HashMap<usize, IdSet>,
+    /// Optional higher-fidelity vector (int8) retained *only* to re-score the
+    /// final top-k under binary quantization — the oversample→rescore pattern
+    /// that recovers recall the 1-bit codes lose. `None` unless
+    /// `binary_rerank` is set. Stored in the *original* (unrotated) space.
+    #[serde(default)]
+    rerank: Option<NodeVector>,
 }
 
 /// HNSW index parameters.
@@ -346,6 +352,13 @@ pub struct HnswParams {
     /// (default) searches at full precision throughout.
     #[serde(default)]
     pub coarse_dim: Option<usize>,
+    /// Under binary quantization, retain an int8 copy of each vector and
+    /// re-score the oversampled top-k with it (the production oversample→rescore
+    /// pattern). Recovers most of the recall the 1-bit codes lose while keeping
+    /// fast popcount navigation; memory is ~int8 (¼×) rather than 1/32×. No
+    /// effect unless `binary_quantize` is also set. Off by default.
+    #[serde(default)]
+    pub binary_rerank: bool,
 }
 
 impl Default for HnswParams {
@@ -363,6 +376,7 @@ impl Default for HnswParams {
             quantize: false,
             binary_quantize: false,
             coarse_dim: None,
+            binary_rerank: false,
         }
     }
 }
@@ -462,11 +476,20 @@ impl HnswIndex {
             },
         };
 
+        // Under binary quantization, optionally retain an int8 copy (original
+        // space) to re-score the final top-k for higher recall.
+        let rerank = if self.params.binary_quantize && self.params.binary_rerank {
+            Some(NodeVector::new(vector.clone(), true))
+        } else {
+            None
+        };
+
         let mut node = HnswNode {
             id,
             vector: node_vector,
             max_layer: node_layer,
             neighbors: HashMap::new(),
+            rerank,
         };
 
         // If this is the first node
@@ -580,6 +603,10 @@ impl HnswIndex {
             None => return Vec::new(),
         };
 
+        // The original (unrotated) query, kept for re-scoring against retained
+        // int8 vectors under binary quantization.
+        let orig_query: &[f32] = query;
+
         // Rotate (and sign-code) the query once for binary mode; the graph then
         // navigates via the Hamming popcount fast path and the final candidates
         // are refined with the accurate asymmetric estimator.
@@ -640,7 +667,14 @@ impl HnswIndex {
                 .map(|&id| {
                     let d = nodes
                         .get(&id)
-                        .map(|n| n.vector.dist_sq(query))
+                        .map(|n| match &n.rerank {
+                            // Retained int8 vector — exact-ish rescore in the
+                            // original space (recovers binary's lost recall).
+                            Some(rv) => rv.dist_sq(orig_query),
+                            // Else the asymmetric estimator (binary) or full-dim
+                            // distance (coarse), both against `query`.
+                            None => n.vector.dist_sq(query),
+                        })
                         .unwrap_or(f32::MAX);
                     (id, d)
                 })
@@ -1071,6 +1105,67 @@ mod tests {
         }
         let recall = hit as f32 / total as f32;
         assert!(recall >= 0.7, "matryoshka recall@10 too low: {recall}");
+    }
+
+    #[test]
+    fn test_binary_rerank_improves_recall() {
+        // Oversample→rescore with retained int8 vectors should recover recall
+        // the 1-bit codes lose: rerank recall ≥ plain-binary recall, and high.
+        let build = |rerank: bool| {
+            let idx = HnswIndex::new(HnswParams {
+                m: 16,
+                ef_construction: 100,
+                ef_search: 100,
+                binary_quantize: true,
+                binary_rerank: rerank,
+                ..Default::default()
+            });
+            let mut items = Vec::new();
+            for i in 0..200u32 {
+                let id = uuid::Uuid::from_u128(i as u128 + 1);
+                let v: Vec<f32> = (0..64)
+                    .map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin())
+                    .collect();
+                idx.insert(id, v.clone());
+                items.push((id, v));
+            }
+            (idx, items)
+        };
+
+        let recall_of = |idx: &HnswIndex, items: &[(uuid::Uuid, Vec<f32>)]| -> f32 {
+            let probes = [7usize, 42, 99, 150, 175];
+            let (mut hit, mut total) = (0usize, 0usize);
+            for &p in &probes {
+                let q = &items[p].1;
+                let mut bf: Vec<_> = items
+                    .iter()
+                    .map(|(id, v)| (*id, squared_dist(q, v)))
+                    .collect();
+                bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
+                for (id, _) in idx.search(q, 10) {
+                    if truth.contains(&id) {
+                        hit += 1;
+                    }
+                    total += 1;
+                }
+            }
+            hit as f32 / total as f32
+        };
+
+        let (plain, items) = build(false);
+        let (reranked, items2) = build(true);
+        let plain_recall = recall_of(&plain, &items);
+        let rerank_recall = recall_of(&reranked, &items2);
+
+        assert!(
+            rerank_recall >= plain_recall,
+            "rerank ({rerank_recall}) should not hurt recall vs plain binary ({plain_recall})"
+        );
+        assert!(
+            rerank_recall >= 0.85,
+            "binary+int8-rerank recall too low: {rerank_recall}"
+        );
     }
 
     #[test]

@@ -226,6 +226,24 @@ fn main() {
         bmean / cmean
     );
 
+    let binr = HnswIndex::new(HnswParams {
+        ef_search,
+        binary_quantize: true,
+        binary_rerank: true,
+        ..Default::default()
+    });
+    for (id, v) in &cdata {
+        binr.insert(*id, v.clone());
+    }
+    let (brrec, brmean) = eval(&binr);
+    println!("Binary + int8 rerank (~4x less memory, popcount nav + int8 rescore):");
+    println!(
+        "  recall@{k}: {:.1}%   latency mean={:.0}us  ({:.2}x full)",
+        brrec * 100.0,
+        brmean,
+        brmean / cmean
+    );
+
     let cdim = (dim / 4).max(1);
     let mat = HnswIndex::new(HnswParams {
         ef_search,

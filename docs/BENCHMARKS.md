@@ -104,18 +104,20 @@ little to separate):
 |------|-----------|-----------------|--------|
 | Full f32 | ~99% | 1.0× | 1× |
 | int8 (random set) | ~91% | ~1.0× | ¼× |
-| **Binary 1-bit** | **~43%** | **~0.3× (≈3.4× faster)** | **1/32×** |
-| **Matryoshka (96/384)** | **~42%** | **~0.44× (≈2.3× faster)** | 1× |
+| **Binary 1-bit** | **~43%** | **~0.28× (≈3.6× faster)** | **1/32×** |
+| **Binary + int8 rerank** | **~79%** | **~0.27× (≈3.7× faster)** | **¼×** |
+| **Matryoshka (96/384)** | **~42%** | **~0.48× (≈2.1× faster)** | 1× |
 
-The speedups are real and consistent; the **recall figures are the honest cost
-of aggressive approximation without a full-vector rerank stage**. Production
-binary-quantization systems reach high recall by *oversampling* the binary
-candidates and re-scoring them with retained full vectors; KowitoDB does not yet
-retain full vectors in binary mode (a retained-vector rerank is the documented
-next step — see ROADMAP #5). For MRL embeddings specifically, real prefixes
-preserve neighborhoods far better than this generic synthetic, so Matryoshka
-recall in practice is higher. Both modes are off by default; binary takes
-precedence over int8 when both are set. Reproduce with
+The speedups are real and consistent. Plain 1-bit binary's low recall is the
+honest cost of aggressive approximation; the **oversample→rescore** pattern
+(`binary_rerank` / `KOWITODB_VECTOR_BINARY_RERANK=1`) recovers most of it —
+retaining an int8 copy and re-scoring the oversampled top-k **roughly doubles
+recall (~43% → ~79%) at the same latency**, trading the 32× memory win down to
+int8's ~4×. It stays faster than plain int8 because navigation still uses the
+popcount Hamming fast path; only the final top-k touches int8. For MRL
+embeddings, real prefixes preserve neighborhoods far better than this generic
+synthetic, so Matryoshka recall in practice is higher. All modes are off by
+default; binary takes precedence over int8 when both are set. Reproduce with
 `cargo run --release -p kowitodb-index --example bench_hnsw`.
 
 ## Optimizations

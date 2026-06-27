@@ -104,11 +104,16 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   refined to the asymmetric estimator for the final top-k — a measured **~3.4×
   query speedup** on top of the memory win (see BENCHMARKS). Generalized the
   graph traversal to a `Scorer` (full / coarse-prefix / Hamming).
-- **Honest scope:** binary is now both a memory **and** speed win, but recall is
-  the cost of 1-bit codes (~43% recall@10 on a hard clustered synthetic without
-  a rerank stage). 📋 **Remaining for high recall:** retain full (or int8)
-  vectors in binary mode and **oversample → rescore** the top-k with them (the
-  production pattern), and **DiskANN**-style on-disk graph for billion-scale SSD.
+- ✅ **Oversample → rescore (v0.24):** `binary_rerank` /
+  `KOWITODB_VECTOR_BINARY_RERANK=1` retains an int8 copy of each vector and
+  re-scores the oversampled top-k with it — the production pattern that recovers
+  recall the 1-bit codes lose. Measured: **~43% → ~79% recall@10 at the same
+  ~3.7× speedup**, trading the 32× memory win down to int8's ~4× (navigation
+  still uses the popcount fast path; only the final top-k touches int8).
+- **Honest scope:** binary is now a memory **and** speed win, with a recall knob
+  spanning 1/32× memory (low recall) → int8 memory (high recall). 📋 **Remaining:**
+  **DiskANN**-style on-disk graph for billion-scale on SSD (where full vectors
+  live on disk and only codes stay in RAM).
 - **Maturity:** RaBitQ SIGMOD 2024; production in VectorChord/DiskANN.
 
 ---
