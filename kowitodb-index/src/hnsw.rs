@@ -29,6 +29,8 @@ type NodeMap = HashMap<ObjectId, HnswNode, ahash::RandomState>;
 /// int8 quantization scale. Assumes ~unit-norm vectors (components in [-1, 1]),
 /// as produced by the embedding models KowitoDB uses.
 const QUANT_SCALE: f32 = 127.0;
+/// Reciprocal of [`QUANT_SCALE`] — dequantize by multiply (faster than divide).
+const INV_QUANT_SCALE: f32 = 1.0 / QUANT_SCALE;
 
 /// Fixed seed for the structured random rotation used by binary quantization.
 /// Deterministic so a saved index reloads with the same basis.
@@ -186,14 +188,7 @@ impl NodeVector {
     fn dist_sq(&self, query: &[f32]) -> f32 {
         match self {
             NodeVector::Full(v) => squared_dist(query, v),
-            NodeVector::Quantized(q) => query
-                .iter()
-                .zip(q)
-                .map(|(x, &qi)| {
-                    let d = x - qi as f32 / QUANT_SCALE;
-                    d * d
-                })
-                .sum(),
+            NodeVector::Quantized(q) => int8_dist_sq(query, q),
             NodeVector::Binary {
                 code,
                 norm_sq,
@@ -982,12 +977,52 @@ impl HnswIndex {
 /// Squared Euclidean distance between two vectors.
 ///
 /// HNSW only ever *compares* distances, and squared distance preserves ordering,
-/// so the `sqrt` is dropped from the inner loop — it is applied only to the
-/// final k results when converting to a similarity score. The simple loop
-/// auto-vectorizes (NEON/SSE) under the release profile.
+/// so the `sqrt` is dropped — it is applied only to the final k results when
+/// converting to a similarity score.
+///
+/// Summed over **8 independent accumulators** rather than one: a single `.sum()`
+/// is latency-bound (each add waits on the previous on the FP pipeline), whereas
+/// 8 lanes break the dependency chain so the CPU pipelines them and the loop
+/// auto-vectorizes cleanly to NEON/SSE. `chunks_exact(8)` keeps the hot loop
+/// bounds-check-free.
 #[inline]
 fn squared_dist(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+    let mut acc = [0.0f32; 8];
+    let mut ai = a.chunks_exact(8);
+    let mut bi = b.chunks_exact(8);
+    for (ca, cb) in ai.by_ref().zip(bi.by_ref()) {
+        for j in 0..8 {
+            let d = ca[j] - cb[j];
+            acc[j] += d * d;
+        }
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    for (x, y) in ai.remainder().iter().zip(bi.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
+}
+
+/// Squared distance between a full-precision query and an int8-quantized vector,
+/// dequantizing on the fly. Same 8-accumulator structure as [`squared_dist`].
+#[inline]
+fn int8_dist_sq(query: &[f32], q: &[i8]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let mut qi = query.chunks_exact(8);
+    let mut ci = q.chunks_exact(8);
+    for (cq, cc) in qi.by_ref().zip(ci.by_ref()) {
+        for j in 0..8 {
+            let d = cq[j] - cc[j] as f32 * INV_QUANT_SCALE;
+            acc[j] += d * d;
+        }
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    for (x, &c) in qi.remainder().iter().zip(ci.remainder()) {
+        let d = x - c as f32 * INV_QUANT_SCALE;
+        sum += d * d;
+    }
+    sum
 }
 
 #[cfg(test)]

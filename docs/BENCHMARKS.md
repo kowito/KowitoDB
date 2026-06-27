@@ -136,9 +136,15 @@ The hot path (graph traversal + distance) was tuned without changing recall:
 - **Scalar greedy descent** — `search_layer_greedy` returns the single nearest id
   instead of a `Vec` per layer; the rotation lock is skipped entirely unless
   binary quantization is on.
+- **8-accumulator distance** — `squared_dist` (and the int8 kernel) sum over 8
+  independent accumulators instead of one. A single `.sum()` is latency-bound on
+  the FP pipeline (each add waits on the previous); 8 lanes break that chain so
+  the CPU pipelines them and the loop auto-vectorizes cleanly. ~**+18%
+  single-thread QPS** on its own (f32 query latency ~1.79ms → ~1.54ms),
+  recall-neutral.
 
-Net effect at `ef_search=200`: ~22% lower query latency, ~27% higher build
-throughput, recall unchanged (~94%).
+Net effect at `ef_search=200`: ~35% lower query latency than the original
+brute-force-replacement, ~27% higher build throughput, recall unchanged (~94%).
 
 ## Maximizing QPS
 
