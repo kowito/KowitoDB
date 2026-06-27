@@ -141,7 +141,10 @@ impl KowitoDBEngine {
         // environment, otherwise fall back to the deterministic dev proxy.
         let embedding_client: Arc<dyn EmbeddingClient> = match OpenAiConfig::from_env() {
             Some(cfg) => {
-                info!("Embeddings: OpenAI-compatible provider (model={})", cfg.model);
+                info!(
+                    "Embeddings: OpenAI-compatible provider (model={})",
+                    cfg.model
+                );
                 Arc::new(OpenAiEmbeddingClient::new(cfg))
             }
             None => {
@@ -205,7 +208,10 @@ impl KowitoDBEngine {
         }
 
         if count > 0 {
-            info!("Reindexed {} objects from storage into in-memory indexes", count);
+            info!(
+                "Reindexed {} objects from storage into in-memory indexes",
+                count
+            );
         }
         Ok(count)
     }
@@ -1036,7 +1042,10 @@ mod tests {
         );
 
         // Metadata index rebuilt.
-        assert_eq!(engine.metadata_index.query_exact("company", "Acme").len(), 1);
+        assert_eq!(
+            engine.metadata_index.query_exact("company", "Acme").len(),
+            1
+        );
 
         // End-to-end ask works after restart.
         let resp = engine.ask("enterprise contract", 5).await.unwrap();
@@ -1076,15 +1085,32 @@ mod tests {
         // Second update accumulates history — proving versions persist across
         // storage round-trips.
         let v2 = engine
-            .update(id, None, HashMap::new(), vec![], None, Some("edit 2".into()))
+            .update(
+                id,
+                None,
+                HashMap::new(),
+                vec![],
+                None,
+                Some("edit 2".into()),
+            )
             .await
             .unwrap();
         assert_eq!(v2, Some(2));
-        assert_eq!(engine.get(id).await.unwrap().unwrap().version_history.len(), 2);
+        assert_eq!(
+            engine.get(id).await.unwrap().unwrap().version_history.len(),
+            2
+        );
 
         // Updating a missing object returns None.
         let missing = engine
-            .update(uuid::Uuid::new_v4(), Some("x".into()), HashMap::new(), vec![], None, None)
+            .update(
+                uuid::Uuid::new_v4(),
+                Some("x".into()),
+                HashMap::new(),
+                vec![],
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(missing, None);

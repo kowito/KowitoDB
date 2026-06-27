@@ -290,6 +290,7 @@ impl KowitoDb for KowitoDBService {
             self.metrics.record_error();
             Status::invalid_argument(e.to_string())
         })?;
+        self.metrics.record_sql();
 
         Ok(Response::new(proto::SqlResponse {
             rows: rows
@@ -325,23 +326,25 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::GetSessionRequest>,
     ) -> Result<Response<proto::GetSessionResponse>, Status> {
         let req = request.into_inner();
-        Ok(Response::new(match self.engine.agent_memory.get(&req.session_id) {
-            Some(session) => proto::GetSessionResponse {
-                found: true,
-                turns: session
-                    .turns
-                    .into_iter()
-                    .map(|t| proto::ConversationTurnProto {
-                        role: format!("{:?}", t.role).to_lowercase(),
-                        content: t.content,
-                        timestamp: t.timestamp.to_rfc3339(),
-                    })
-                    .collect(),
+        Ok(Response::new(
+            match self.engine.agent_memory.get(&req.session_id) {
+                Some(session) => proto::GetSessionResponse {
+                    found: true,
+                    turns: session
+                        .turns
+                        .into_iter()
+                        .map(|t| proto::ConversationTurnProto {
+                            role: format!("{:?}", t.role).to_lowercase(),
+                            content: t.content,
+                            timestamp: t.timestamp.to_rfc3339(),
+                        })
+                        .collect(),
+                },
+                None => proto::GetSessionResponse {
+                    found: false,
+                    turns: Vec::new(),
+                },
             },
-            None => proto::GetSessionResponse {
-                found: false,
-                turns: Vec::new(),
-            },
-        }))
+        ))
     }
 }

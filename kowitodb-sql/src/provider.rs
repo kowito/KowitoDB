@@ -162,7 +162,10 @@ impl SqlContext {
             TABLE_KNOWLEDGE,
             Arc::new(KnowledgeTableProvider::new(storage.clone())),
         )?;
-        ctx.register_table(TABLE_OBJECTS, Arc::new(KnowledgeTableProvider::new(storage)))?;
+        ctx.register_table(
+            TABLE_OBJECTS,
+            Arc::new(KnowledgeTableProvider::new(storage)),
+        )?;
         Ok(Self { ctx })
     }
 
@@ -234,11 +237,21 @@ mod tests {
     async fn ctx_with_objects() -> SqlContext {
         let storage = Arc::new(StorageEngine::new_in_memory().unwrap());
         storage
-            .put(obj(1, "Acme raised Series A", 0.9, r#"{"stage":"series_a"}"#))
+            .put(obj(
+                1,
+                "Acme raised Series A",
+                0.9,
+                r#"{"stage":"series_a"}"#,
+            ))
             .await
             .unwrap();
         storage
-            .put(obj(2, "Globex raised Series B", 0.4, r#"{"stage":"series_b"}"#))
+            .put(obj(
+                2,
+                "Globex raised Series B",
+                0.4,
+                r#"{"stage":"series_b"}"#,
+            ))
             .await
             .unwrap();
         storage
@@ -252,7 +265,9 @@ mod tests {
     async fn test_projection_and_filter() {
         let ctx = ctx_with_objects().await;
         let rows = ctx
-            .query_rows("SELECT content FROM knowledge WHERE importance >= 0.5 ORDER BY importance DESC")
+            .query_rows(
+                "SELECT content FROM knowledge WHERE importance >= 0.5 ORDER BY importance DESC",
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);

@@ -257,16 +257,24 @@ fn parse_importance_clause(s: &str) -> Result<WhereClause, SqlError> {
     };
     // Order matters: check the two-char operators before the one-char ones.
     if let Some(rest) = s.strip_prefix(">=") {
-        return Ok(WhereClause::ImportanceGe { value: parse(rest)? });
+        return Ok(WhereClause::ImportanceGe {
+            value: parse(rest)?,
+        });
     }
     if let Some(rest) = s.strip_prefix("<=") {
-        return Ok(WhereClause::ImportanceLe { value: parse(rest)? });
+        return Ok(WhereClause::ImportanceLe {
+            value: parse(rest)?,
+        });
     }
     if let Some(rest) = s.strip_prefix('>') {
-        return Ok(WhereClause::ImportanceGe { value: parse(rest)? });
+        return Ok(WhereClause::ImportanceGe {
+            value: parse(rest)?,
+        });
     }
     if let Some(rest) = s.strip_prefix('<') {
-        return Ok(WhereClause::ImportanceLe { value: parse(rest)? });
+        return Ok(WhereClause::ImportanceLe {
+            value: parse(rest)?,
+        });
     }
     Err(SqlError::Parse(format!("Invalid importance clause: {}", s)))
 }

@@ -46,7 +46,10 @@ impl VectorIndex {
 
         let mut vectors = self.vectors.write();
         vectors.insert((id, model.to_string()), vec);
-        debug!("Inserted vector for object {} (model={}, dim={})", id, model, dim);
+        debug!(
+            "Inserted vector for object {} (model={}, dim={})",
+            id, model, dim
+        );
         Ok(())
     }
 
@@ -59,14 +62,16 @@ impl VectorIndex {
     /// Search for the top-k nearest neighbors to `query`.
     ///
     /// Returns (object_id, similarity_score) pairs sorted by descending similarity.
-    pub fn search(&self, query: &Embedding, model: &str, top_k: usize) -> Result<Vec<(ObjectId, f32)>> {
+    pub fn search(
+        &self,
+        query: &Embedding,
+        model: &str,
+        top_k: usize,
+    ) -> Result<Vec<(ObjectId, f32)>> {
         let vectors = self.vectors.read();
 
         // Filter to the requested model
-        let candidates: Vec<_> = vectors
-            .iter()
-            .filter(|((_, m), _)| m == model)
-            .collect();
+        let candidates: Vec<_> = vectors.iter().filter(|((_, m), _)| m == model).collect();
 
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -137,8 +142,10 @@ mod tests {
         let idx = VectorIndex::new();
         let id = uuid::Uuid::new_v4();
         idx.insert(id, "test-model", vec![1.0, 0.0, 0.0]).unwrap();
-        idx.insert(uuid::Uuid::new_v4(), "test-model", vec![0.0, 1.0, 0.0]).unwrap();
-        idx.insert(uuid::Uuid::new_v4(), "test-model", vec![0.0, 0.0, 1.0]).unwrap();
+        idx.insert(uuid::Uuid::new_v4(), "test-model", vec![0.0, 1.0, 0.0])
+            .unwrap();
+        idx.insert(uuid::Uuid::new_v4(), "test-model", vec![0.0, 0.0, 1.0])
+            .unwrap();
 
         let results = idx.search(&vec![0.9, 0.1, 0.0], "test-model", 2).unwrap();
         assert_eq!(results.len(), 2);

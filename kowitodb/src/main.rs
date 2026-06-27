@@ -6,7 +6,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use kowitodb_core::KnowledgeObject;
-use kowitodb_server::{serve, KowitoDBEngine};
+use kowitodb_server::{serve_with_config, KowitoDBEngine, ServerConfig};
 
 /// KowitoDB — AI Knowledge Operating System
 ///
@@ -37,6 +37,22 @@ enum Commands {
         /// Index path
         #[arg(short, long, default_value = "./data/index")]
         index_path: PathBuf,
+
+        /// Require this API key on every request (Bearer or x-api-key header).
+        #[arg(long, env = "KOWITODB_API_KEY")]
+        api_key: Option<String>,
+
+        /// PEM TLS certificate chain (enables TLS together with --tls-key).
+        #[arg(long, env = "KOWITODB_TLS_CERT")]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM TLS private key.
+        #[arg(long, env = "KOWITODB_TLS_KEY")]
+        tls_key: Option<PathBuf>,
+
+        /// Expose Prometheus /metrics + /healthz on this address (e.g. 0.0.0.0:9090).
+        #[arg(long, env = "KOWITODB_METRICS_ADDR")]
+        metrics_addr: Option<SocketAddr>,
     },
 
     /// Ask a question (embedded mode — no server required)
@@ -128,6 +144,10 @@ async fn main() -> anyhow::Result<()> {
             addr,
             storage_path,
             index_path,
+            api_key,
+            tls_cert,
+            tls_key,
+            metrics_addr,
         } => {
             info!("Starting KowitoDB v{}", env!("CARGO_PKG_VERSION"));
 
@@ -138,7 +158,13 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize engine: {}", e))?;
 
-            serve(engine, addr).await?;
+            let config = ServerConfig {
+                api_key,
+                tls_cert,
+                tls_key,
+                metrics_addr,
+            };
+            serve_with_config(engine, addr, config).await?;
         }
 
         Commands::Ask {

@@ -295,7 +295,9 @@ impl GraphIndex {
 
             if let Some(edges) = forward.get(&current) {
                 for rel in edges {
-                    if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(rel.target_id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        visited.entry(rel.target_id)
+                    {
                         e.insert(depth + 1);
                         queue.push_back((rel.target_id, depth + 1));
                     }

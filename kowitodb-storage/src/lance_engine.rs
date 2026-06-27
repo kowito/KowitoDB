@@ -38,7 +38,10 @@ impl LanceStorage {
         if existing.is_some() {
             info!("Opened existing Lance dataset at {}", uri);
         } else {
-            debug!("No Lance dataset at {} yet; will create on first write", uri);
+            debug!(
+                "No Lance dataset at {} yet; will create on first write",
+                uri
+            );
         }
         Ok(Self {
             uri,
@@ -125,7 +128,6 @@ impl LanceStorage {
         }
         Ok(out)
     }
-
 }
 
 #[async_trait::async_trait]
@@ -138,7 +140,9 @@ impl StorageBackend for LanceStorage {
         match guard.as_mut() {
             // Dataset exists: upsert via delete-then-append.
             Some(ds) => {
-                ds.delete(&format!("id = '{id}'")).await.map_err(map_lance)?;
+                ds.delete(&format!("id = '{id}'"))
+                    .await
+                    .map_err(map_lance)?;
                 let reader = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
                 ds.append(reader, None).await.map_err(map_lance)?;
             }
@@ -165,9 +169,7 @@ impl StorageBackend for LanceStorage {
             return Ok(None);
         };
         let mut scanner = ds.scan();
-        scanner
-            .filter(&format!("id = '{id}'"))
-            .map_err(map_lance)?;
+        scanner.filter(&format!("id = '{id}'")).map_err(map_lance)?;
         let batch = scanner.try_into_batch().await.map_err(map_lance)?;
         if batch.num_rows() == 0 {
             return Ok(None);
@@ -212,9 +214,7 @@ impl StorageBackend for LanceStorage {
 
         let mut scanner = ds.scan();
         if !pushdown.is_empty() {
-            scanner
-                .filter(&pushdown.join(" AND "))
-                .map_err(map_lance)?;
+            scanner.filter(&pushdown.join(" AND ")).map_err(map_lance)?;
         }
         let batch = scanner.try_into_batch().await.map_err(map_lance)?;
         if batch.num_rows() == 0 {

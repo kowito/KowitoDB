@@ -43,7 +43,7 @@ tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "2"
 dashmap = "6"

@@ -245,8 +245,7 @@ impl HnswIndex {
         let (candidates, distances) = self.search_layer_beam(query, &[curr_ep], 0, ef, &nodes);
 
         // Take top-k
-        let mut results: Vec<(ObjectId, f32)> =
-            candidates.into_iter().zip(distances).collect();
+        let mut results: Vec<(ObjectId, f32)> = candidates.into_iter().zip(distances).collect();
 
         results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         results.truncate(k);

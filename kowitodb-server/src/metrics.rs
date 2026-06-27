@@ -85,10 +85,90 @@ impl MetricsCollector {
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0)
     }
+
+    /// Render current metrics in the Prometheus text exposition format.
+    pub fn to_prometheus(&self) -> String {
+        let m = self.snapshot();
+        let avg_latency_ms = self.avg_ask_latency_ms();
+        let uptime = self.uptime_secs();
+        let mut out = String::new();
+
+        let counter = |out: &mut String, name: &str, help: &str, value: u64| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        };
+        let gauge = |out: &mut String, name: &str, help: &str, value: f64| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+            ));
+        };
+
+        counter(
+            &mut out,
+            "kowitodb_ask_total",
+            "Total ai.ask() calls",
+            m.ask_count,
+        );
+        counter(
+            &mut out,
+            "kowitodb_remember_total",
+            "Total ai.remember() calls",
+            m.remember_count,
+        );
+        counter(
+            &mut out,
+            "kowitodb_sql_total",
+            "Total SQL queries",
+            m.sql_count,
+        );
+        counter(
+            &mut out,
+            "kowitodb_insert_total",
+            "Total insert calls",
+            m.insert_count,
+        );
+        counter(
+            &mut out,
+            "kowitodb_error_total",
+            "Total errored RPCs",
+            m.error_count,
+        );
+        gauge(
+            &mut out,
+            "kowitodb_ask_latency_ms_avg",
+            "Average ai.ask() latency (ms)",
+            avg_latency_ms,
+        );
+        gauge(
+            &mut out,
+            "kowitodb_uptime_seconds",
+            "Server uptime (seconds)",
+            uptime as f64,
+        );
+
+        out
+    }
 }
 
 impl Default for MetricsCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_to_prometheus_format() {
+        let c = MetricsCollector::new();
+        c.record_ask(Duration::from_millis(5));
+        c.record_sql();
+        let out = c.to_prometheus();
+        assert!(out.contains("kowitodb_ask_total 1"));
+        assert!(out.contains("kowitodb_sql_total 1"));
+        assert!(out.contains("# TYPE kowitodb_uptime_seconds gauge"));
     }
 }
