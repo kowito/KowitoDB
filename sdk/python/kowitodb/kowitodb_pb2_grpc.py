@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-import kowitodb_pb2 as kowitodb__pb2
+from . import kowitodb_pb2 as kowitodb__pb2
 
 GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
@@ -46,6 +46,11 @@ class KowitoDBStub:
                 request_serializer=kowitodb__pb2.GetRequest.SerializeToString,
                 response_deserializer=kowitodb__pb2.GetResponse.FromString,
                 _registered_method=True)
+        self.Update = channel.unary_unary(
+                '/kowitodb.KowitoDB/Update',
+                request_serializer=kowitodb__pb2.UpdateRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.UpdateResponse.FromString,
+                _registered_method=True)
         self.Delete = channel.unary_unary(
                 '/kowitodb.KowitoDB/Delete',
                 request_serializer=kowitodb__pb2.DeleteRequest.SerializeToString,
@@ -66,6 +71,21 @@ class KowitoDBStub:
                 request_serializer=kowitodb__pb2.RememberRequest.SerializeToString,
                 response_deserializer=kowitodb__pb2.RememberResponse.FromString,
                 _registered_method=True)
+        self.Sql = channel.unary_unary(
+                '/kowitodb.KowitoDB/Sql',
+                request_serializer=kowitodb__pb2.SqlRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.SqlResponse.FromString,
+                _registered_method=True)
+        self.RecordTurn = channel.unary_unary(
+                '/kowitodb.KowitoDB/RecordTurn',
+                request_serializer=kowitodb__pb2.RecordTurnRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.RecordTurnResponse.FromString,
+                _registered_method=True)
+        self.GetSession = channel.unary_unary(
+                '/kowitodb.KowitoDB/GetSession',
+                request_serializer=kowitodb__pb2.GetSessionRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.GetSessionResponse.FromString,
+                _registered_method=True)
         self.Stats = channel.unary_unary(
                 '/kowitodb.KowitoDB/Stats',
                 request_serializer=kowitodb__pb2.StatsRequest.SerializeToString,
@@ -85,6 +105,12 @@ class KowitoDBServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Get(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Update(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -115,6 +141,26 @@ class KowitoDBServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Sql(self, request, context):
+        """SQL over the DataFusion engine
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RecordTurn(self, request, context):
+        """Agent conversation memory
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSession(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Stats(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -133,6 +179,11 @@ def add_KowitoDBServicer_to_server(servicer, server):
                     servicer.Get,
                     request_deserializer=kowitodb__pb2.GetRequest.FromString,
                     response_serializer=kowitodb__pb2.GetResponse.SerializeToString,
+            ),
+            'Update': grpc.unary_unary_rpc_method_handler(
+                    servicer.Update,
+                    request_deserializer=kowitodb__pb2.UpdateRequest.FromString,
+                    response_serializer=kowitodb__pb2.UpdateResponse.SerializeToString,
             ),
             'Delete': grpc.unary_unary_rpc_method_handler(
                     servicer.Delete,
@@ -153,6 +204,21 @@ def add_KowitoDBServicer_to_server(servicer, server):
                     servicer.Remember,
                     request_deserializer=kowitodb__pb2.RememberRequest.FromString,
                     response_serializer=kowitodb__pb2.RememberResponse.SerializeToString,
+            ),
+            'Sql': grpc.unary_unary_rpc_method_handler(
+                    servicer.Sql,
+                    request_deserializer=kowitodb__pb2.SqlRequest.FromString,
+                    response_serializer=kowitodb__pb2.SqlResponse.SerializeToString,
+            ),
+            'RecordTurn': grpc.unary_unary_rpc_method_handler(
+                    servicer.RecordTurn,
+                    request_deserializer=kowitodb__pb2.RecordTurnRequest.FromString,
+                    response_serializer=kowitodb__pb2.RecordTurnResponse.SerializeToString,
+            ),
+            'GetSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSession,
+                    request_deserializer=kowitodb__pb2.GetSessionRequest.FromString,
+                    response_serializer=kowitodb__pb2.GetSessionResponse.SerializeToString,
             ),
             'Stats': grpc.unary_unary_rpc_method_handler(
                     servicer.Stats,
@@ -216,6 +282,33 @@ class KowitoDB:
             '/kowitodb.KowitoDB/Get',
             kowitodb__pb2.GetRequest.SerializeToString,
             kowitodb__pb2.GetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Update(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/Update',
+            kowitodb__pb2.UpdateRequest.SerializeToString,
+            kowitodb__pb2.UpdateResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -324,6 +417,87 @@ class KowitoDB:
             '/kowitodb.KowitoDB/Remember',
             kowitodb__pb2.RememberRequest.SerializeToString,
             kowitodb__pb2.RememberResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Sql(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/Sql',
+            kowitodb__pb2.SqlRequest.SerializeToString,
+            kowitodb__pb2.SqlResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RecordTurn(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/RecordTurn',
+            kowitodb__pb2.RecordTurnRequest.SerializeToString,
+            kowitodb__pb2.RecordTurnResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/GetSession',
+            kowitodb__pb2.GetSessionRequest.SerializeToString,
+            kowitodb__pb2.GetSessionResponse.FromString,
             options,
             channel_credentials,
             insecure,

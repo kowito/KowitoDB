@@ -19,13 +19,17 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KowitoDB_Insert_FullMethodName   = "/kowitodb.KowitoDB/Insert"
-	KowitoDB_Get_FullMethodName      = "/kowitodb.KowitoDB/Get"
-	KowitoDB_Delete_FullMethodName   = "/kowitodb.KowitoDB/Delete"
-	KowitoDB_Search_FullMethodName   = "/kowitodb.KowitoDB/Search"
-	KowitoDB_Ask_FullMethodName      = "/kowitodb.KowitoDB/Ask"
-	KowitoDB_Remember_FullMethodName = "/kowitodb.KowitoDB/Remember"
-	KowitoDB_Stats_FullMethodName    = "/kowitodb.KowitoDB/Stats"
+	KowitoDB_Insert_FullMethodName     = "/kowitodb.KowitoDB/Insert"
+	KowitoDB_Get_FullMethodName        = "/kowitodb.KowitoDB/Get"
+	KowitoDB_Update_FullMethodName     = "/kowitodb.KowitoDB/Update"
+	KowitoDB_Delete_FullMethodName     = "/kowitodb.KowitoDB/Delete"
+	KowitoDB_Search_FullMethodName     = "/kowitodb.KowitoDB/Search"
+	KowitoDB_Ask_FullMethodName        = "/kowitodb.KowitoDB/Ask"
+	KowitoDB_Remember_FullMethodName   = "/kowitodb.KowitoDB/Remember"
+	KowitoDB_Sql_FullMethodName        = "/kowitodb.KowitoDB/Sql"
+	KowitoDB_RecordTurn_FullMethodName = "/kowitodb.KowitoDB/RecordTurn"
+	KowitoDB_GetSession_FullMethodName = "/kowitodb.KowitoDB/GetSession"
+	KowitoDB_Stats_FullMethodName      = "/kowitodb.KowitoDB/Stats"
 )
 
 // KowitoDBClient is the client API for KowitoDB service.
@@ -34,11 +38,17 @@ const (
 type KowitoDBClient interface {
 	Insert(ctx context.Context, in *InsertRequest, opts ...grpc.CallOption) (*InsertResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	Update(ctx context.Context, in *UpdateRequest, opts ...grpc.CallOption) (*UpdateResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error)
 	// High-level AI API
 	Ask(ctx context.Context, in *AskRequest, opts ...grpc.CallOption) (*AskResponse, error)
 	Remember(ctx context.Context, in *RememberRequest, opts ...grpc.CallOption) (*RememberResponse, error)
+	// SQL over the DataFusion engine
+	Sql(ctx context.Context, in *SqlRequest, opts ...grpc.CallOption) (*SqlResponse, error)
+	// Agent conversation memory
+	RecordTurn(ctx context.Context, in *RecordTurnRequest, opts ...grpc.CallOption) (*RecordTurnResponse, error)
+	GetSession(ctx context.Context, in *GetSessionRequest, opts ...grpc.CallOption) (*GetSessionResponse, error)
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
 }
 
@@ -64,6 +74,16 @@ func (c *kowitoDBClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.C
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetResponse)
 	err := c.cc.Invoke(ctx, KowitoDB_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kowitoDBClient) Update(ctx context.Context, in *UpdateRequest, opts ...grpc.CallOption) (*UpdateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateResponse)
+	err := c.cc.Invoke(ctx, KowitoDB_Update_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +130,36 @@ func (c *kowitoDBClient) Remember(ctx context.Context, in *RememberRequest, opts
 	return out, nil
 }
 
+func (c *kowitoDBClient) Sql(ctx context.Context, in *SqlRequest, opts ...grpc.CallOption) (*SqlResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SqlResponse)
+	err := c.cc.Invoke(ctx, KowitoDB_Sql_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kowitoDBClient) RecordTurn(ctx context.Context, in *RecordTurnRequest, opts ...grpc.CallOption) (*RecordTurnResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RecordTurnResponse)
+	err := c.cc.Invoke(ctx, KowitoDB_RecordTurn_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kowitoDBClient) GetSession(ctx context.Context, in *GetSessionRequest, opts ...grpc.CallOption) (*GetSessionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSessionResponse)
+	err := c.cc.Invoke(ctx, KowitoDB_GetSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *kowitoDBClient) Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(StatsResponse)
@@ -126,11 +176,17 @@ func (c *kowitoDBClient) Stats(ctx context.Context, in *StatsRequest, opts ...gr
 type KowitoDBServer interface {
 	Insert(context.Context, *InsertRequest) (*InsertResponse, error)
 	Get(context.Context, *GetRequest) (*GetResponse, error)
+	Update(context.Context, *UpdateRequest) (*UpdateResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	Search(context.Context, *SearchRequest) (*SearchResponse, error)
 	// High-level AI API
 	Ask(context.Context, *AskRequest) (*AskResponse, error)
 	Remember(context.Context, *RememberRequest) (*RememberResponse, error)
+	// SQL over the DataFusion engine
+	Sql(context.Context, *SqlRequest) (*SqlResponse, error)
+	// Agent conversation memory
+	RecordTurn(context.Context, *RecordTurnRequest) (*RecordTurnResponse, error)
+	GetSession(context.Context, *GetSessionRequest) (*GetSessionResponse, error)
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)
 	mustEmbedUnimplementedKowitoDBServer()
 }
@@ -148,6 +204,9 @@ func (UnimplementedKowitoDBServer) Insert(context.Context, *InsertRequest) (*Ins
 func (UnimplementedKowitoDBServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
 }
+func (UnimplementedKowitoDBServer) Update(context.Context, *UpdateRequest) (*UpdateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Update not implemented")
+}
 func (UnimplementedKowitoDBServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
 }
@@ -159,6 +218,15 @@ func (UnimplementedKowitoDBServer) Ask(context.Context, *AskRequest) (*AskRespon
 }
 func (UnimplementedKowitoDBServer) Remember(context.Context, *RememberRequest) (*RememberResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Remember not implemented")
+}
+func (UnimplementedKowitoDBServer) Sql(context.Context, *SqlRequest) (*SqlResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Sql not implemented")
+}
+func (UnimplementedKowitoDBServer) RecordTurn(context.Context, *RecordTurnRequest) (*RecordTurnResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RecordTurn not implemented")
+}
+func (UnimplementedKowitoDBServer) GetSession(context.Context, *GetSessionRequest) (*GetSessionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetSession not implemented")
 }
 func (UnimplementedKowitoDBServer) Stats(context.Context, *StatsRequest) (*StatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Stats not implemented")
@@ -216,6 +284,24 @@ func _KowitoDB_Get_Handler(srv interface{}, ctx context.Context, dec func(interf
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(KowitoDBServer).Get(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KowitoDB_Update_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KowitoDBServer).Update(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KowitoDB_Update_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KowitoDBServer).Update(ctx, req.(*UpdateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -292,6 +378,60 @@ func _KowitoDB_Remember_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KowitoDB_Sql_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SqlRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KowitoDBServer).Sql(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KowitoDB_Sql_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KowitoDBServer).Sql(ctx, req.(*SqlRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KowitoDB_RecordTurn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordTurnRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KowitoDBServer).RecordTurn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KowitoDB_RecordTurn_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KowitoDBServer).RecordTurn(ctx, req.(*RecordTurnRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KowitoDB_GetSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSessionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KowitoDBServer).GetSession(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KowitoDB_GetSession_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KowitoDBServer).GetSession(ctx, req.(*GetSessionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _KowitoDB_Stats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StatsRequest)
 	if err := dec(in); err != nil {
@@ -326,6 +466,10 @@ var KowitoDB_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _KowitoDB_Get_Handler,
 		},
 		{
+			MethodName: "Update",
+			Handler:    _KowitoDB_Update_Handler,
+		},
+		{
 			MethodName: "Delete",
 			Handler:    _KowitoDB_Delete_Handler,
 		},
@@ -340,6 +484,18 @@ var KowitoDB_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Remember",
 			Handler:    _KowitoDB_Remember_Handler,
+		},
+		{
+			MethodName: "Sql",
+			Handler:    _KowitoDB_Sql_Handler,
+		},
+		{
+			MethodName: "RecordTurn",
+			Handler:    _KowitoDB_RecordTurn_Handler,
+		},
+		{
+			MethodName: "GetSession",
+			Handler:    _KowitoDB_GetSession_Handler,
 		},
 		{
 			MethodName: "Stats",

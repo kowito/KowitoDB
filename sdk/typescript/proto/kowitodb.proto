@@ -123,6 +123,68 @@ message RememberResponse {
   string id = 1;
 }
 
+// ---- Update ----
+
+message UpdateRequest {
+  string id = 1;
+  // If set, replaces content (and triggers re-embedding).
+  optional string content = 2;
+  // Merged into existing metadata (keys overwrite).
+  map<string, string> metadata = 3;
+  // If non-empty, replaces keywords.
+  repeated string keywords = 4;
+  optional float importance = 5;
+  // Recorded in the object's version history.
+  optional string change_description = 6;
+}
+
+message UpdateResponse {
+  bool updated = 1;
+  // New length of the version history after this update.
+  uint32 version = 2;
+}
+
+// ---- SQL ----
+
+message SqlRequest {
+  string query = 1;
+}
+
+message SqlRow {
+  map<string, string> columns = 1;
+}
+
+message SqlResponse {
+  repeated SqlRow rows = 1;
+}
+
+// ---- Agent memory ----
+
+message RecordTurnRequest {
+  string session_id = 1;
+  string role = 2; // user | assistant | system | observation
+  string content = 3;
+}
+
+message RecordTurnResponse {
+  uint32 turn_count = 1;
+}
+
+message GetSessionRequest {
+  string session_id = 1;
+}
+
+message ConversationTurnProto {
+  string role = 1;
+  string content = 2;
+  string timestamp = 3;
+}
+
+message GetSessionResponse {
+  bool found = 1;
+  repeated ConversationTurnProto turns = 2;
+}
+
 // ---- Stats ----
 
 message StatsRequest {}
@@ -131,6 +193,12 @@ message StatsResponse {
   uint64 total_objects = 1;
   uint64 vector_count = 2;
   uint64 index_size_bytes = 3;
+  uint64 graph_nodes = 4;
+  uint64 graph_edges = 5;
+  uint64 active_agent_sessions = 6;
+  double total_cost_usd = 7;
+  uint64 cache_entries = 8;
+  double cache_hit_rate = 9;
 }
 
 // ---- Service ----
@@ -138,12 +206,20 @@ message StatsResponse {
 service KowitoDB {
   rpc Insert(InsertRequest) returns (InsertResponse);
   rpc Get(GetRequest) returns (GetResponse);
+  rpc Update(UpdateRequest) returns (UpdateResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
 
   // High-level AI API
   rpc Ask(AskRequest) returns (AskResponse);
   rpc Remember(RememberRequest) returns (RememberResponse);
+
+  // SQL over the DataFusion engine
+  rpc Sql(SqlRequest) returns (SqlResponse);
+
+  // Agent conversation memory
+  rpc RecordTurn(RecordTurnRequest) returns (RecordTurnResponse);
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
 
   rpc Stats(StatsRequest) returns (StatsResponse);
 }

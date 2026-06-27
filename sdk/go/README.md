@@ -72,9 +72,13 @@ typed response plus an `error`.
 | `Ask(ctx, question, maxResults) (*AskResponse, error)` | Natural-language query with automatic retrieval (`ai.ask()`). `maxResults <= 0` defaults to 10. |
 | `Insert(ctx, content, ...WriteOption) (string, error)` | Explicitly insert a knowledge object; returns the ID. |
 | `Get(ctx, id) (*KnowledgeObject, error)` | Fetch an object by ID; returns `(nil, nil)` if not found. |
+| `Update(ctx, id, ...UpdateOption) (updated bool, version uint32, err error)` | Update an object in place; returns whether it changed and the new version-history length. |
 | `Delete(ctx, id) (bool, error)` | Delete by ID; returns whether it existed. |
 | `Search(ctx, query, topK) ([]SearchResult, error)` | Direct search, bypassing the AI planner. `topK <= 0` defaults to 20. |
-| `Stats(ctx) (*Stats, error)` | Database statistics. |
+| `Sql(ctx, query) ([]map[string]string, error)` | Run a SQL query against the DataFusion engine; each row maps column name to value. |
+| `RecordTurn(ctx, sessionID, role, content) (uint32, error)` | Append a turn to an agent session; returns the new turn count. |
+| `GetSession(ctx, sessionID) ([]ConversationTurn, error)` | Fetch a session's turns; returns `(nil, nil)` if not found. |
+| `Stats(ctx) (*Stats, error)` | Database statistics (objects, vectors, graph, agent sessions, cost, cache). |
 
 ### Write options
 
@@ -84,6 +88,16 @@ typed response plus an `error`.
 - `WithMetadata(map[string]string)`
 - `WithImportance(float32)` — default `0.5`
 - `WithRelationships(...Relationship)` — `Insert` only
+
+### Update options
+
+`Update` accepts functional options; only the fields you set are changed:
+
+- `WithUpdatedContent(string)` — replaces content (re-embeds)
+- `WithUpdatedMetadata(map[string]string)` — merged into existing metadata
+- `WithUpdatedKeywords(...string)` — replaces keywords
+- `WithUpdatedImportance(float32)`
+- `WithChangeDescription(string)` — recorded in version history
 
 ## Regenerating protobuf code
 

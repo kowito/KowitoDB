@@ -9,11 +9,20 @@ Usage:
                 keywords=["openai", "funding"],
                 metadata={"company": "OpenAI"})
     results = db.ask("Which companies raised funding?")
-    for r in results:
+    for r in results.results:
         print(f"[{r.relevance_score:.2f}] {r.content}")
 
-    # SQL queries
+    # SQL queries (returns a list of {column: value} dicts)
     rows = db.sql("SELECT * FROM knowledge WHERE metadata.company = 'OpenAI'")
+    for row in rows:
+        print(row)
+
+    # Update an existing object
+    db.update(obj_id, importance=0.9, change_description="bump importance")
+
+    # Agent conversation memory
+    db.record_turn("session-1", "user", "What is KowitoDB?")
+    turns = db.get_session("session-1")
 """
 
 from dataclasses import dataclass, field
@@ -84,6 +93,12 @@ class Stats:
     total_objects: int = 0
     vector_count: int = 0
     index_size_bytes: int = 0
+    graph_nodes: int = 0
+    graph_edges: int = 0
+    active_agent_sessions: int = 0
+    total_cost_usd: float = 0.0
+    cache_entries: int = 0
+    cache_hit_rate: float = 0.0
 
     @classmethod
     def from_proto(cls, p: pb.StatsResponse) -> "Stats":
@@ -91,7 +106,38 @@ class Stats:
             total_objects=p.total_objects,
             vector_count=p.vector_count,
             index_size_bytes=p.index_size_bytes,
+            graph_nodes=p.graph_nodes,
+            graph_edges=p.graph_edges,
+            active_agent_sessions=p.active_agent_sessions,
+            total_cost_usd=p.total_cost_usd,
+            cache_entries=p.cache_entries,
+            cache_hit_rate=p.cache_hit_rate,
         )
+
+
+@dataclass
+class UpdateResult:
+    """Result of an update() call."""
+
+    updated: bool
+    version: int
+
+    @classmethod
+    def from_proto(cls, p: pb.UpdateResponse) -> "UpdateResult":
+        return cls(updated=p.updated, version=p.version)
+
+
+@dataclass
+class ConversationTurn:
+    """A single turn in an agent conversation session."""
+
+    role: str
+    content: str
+    timestamp: str = ""
+
+    @classmethod
+    def from_proto(cls, p: pb.ConversationTurnProto) -> "ConversationTurn":
+        return cls(role=p.role, content=p.content, timestamp=p.timestamp)
 
 
 class KowitoDBClient:
@@ -176,25 +222,19 @@ class KowitoDBClient:
 
     # ---- SQL API ----
 
-    def sql(self, query: str) -> List[AskResult]:
-        """Execute a SQL query against knowledge objects.
+    def sql(self, query: str) -> List[Dict[str, str]]:
+        """Execute a SQL query against the DataFusion engine.
+
+        Returns a list of rows, where each row is a dict mapping column
+        name to its string value.
 
         SELECT * FROM knowledge WHERE metadata.company = 'Acme'
         SELECT content FROM knowledge WHERE keyword LIKE '%enterprise%' LIMIT 10
         """
-        # Route SQL through the search interface for now
         self._ensure_connected()
-        req = pb.SearchRequest(query=query, top_k=20)
-        resp = self._stub.Search(req)
-        return [
-            AskResult(
-                id=r.id,
-                content=r.content,
-                relevance_score=r.score,
-                metadata=dict(r.metadata),
-            )
-            for r in resp.results
-        ]
+        req = pb.SqlRequest(query=query)
+        resp = self._stub.Sql(req)
+        return [dict(row.columns) for row in resp.rows]
 
     # ---- Low-level API ----
 
@@ -239,12 +279,69 @@ class KowitoDBClient:
             }
         return None
 
+    def update(
+        self,
+        id: str,
+        content: Optional[str] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        keywords: Optional[List[str]] = None,
+        importance: Optional[float] = None,
+        change_description: Optional[str] = None,
+    ) -> UpdateResult:
+        """Update an existing knowledge object.
+
+        Only the provided fields are changed:
+        - ``content`` (if set) replaces the content and triggers re-embedding.
+        - ``metadata`` is merged into the existing metadata (keys overwrite).
+        - ``keywords`` (if non-empty) replaces the keywords.
+        - ``importance`` (if set) replaces the importance score.
+        - ``change_description`` is recorded in the version history.
+
+        Returns an ``UpdateResult`` with ``updated`` and ``version``.
+        """
+        self._ensure_connected()
+        req = pb.UpdateRequest(id=id, metadata=metadata or {}, keywords=keywords or [])
+        if content is not None:
+            req.content = content
+        if importance is not None:
+            req.importance = importance
+        if change_description is not None:
+            req.change_description = change_description
+        resp = self._stub.Update(req)
+        return UpdateResult.from_proto(resp)
+
     def search(self, query: str, top_k: int = 20) -> List[SearchResult]:
         """Direct search (bypasses the AI planner)."""
         self._ensure_connected()
         req = pb.SearchRequest(query=query, top_k=top_k)
         resp = self._stub.Search(req)
         return [SearchResult.from_proto(r) for r in resp.results]
+
+    # ---- Agent conversation memory ----
+
+    def record_turn(self, session_id: str, role: str, content: str) -> int:
+        """Record a conversation turn for an agent session.
+
+        ``role`` is one of: user | assistant | system | observation.
+        Returns the new total number of turns in the session.
+        """
+        self._ensure_connected()
+        req = pb.RecordTurnRequest(session_id=session_id, role=role, content=content)
+        resp = self._stub.RecordTurn(req)
+        return resp.turn_count
+
+    def get_session(self, session_id: str) -> Optional[List[ConversationTurn]]:
+        """Retrieve all turns for an agent session.
+
+        Returns the list of ``ConversationTurn`` objects, or ``None`` if the
+        session does not exist.
+        """
+        self._ensure_connected()
+        req = pb.GetSessionRequest(session_id=session_id)
+        resp = self._stub.GetSession(req)
+        if not resp.found:
+            return None
+        return [ConversationTurn.from_proto(t) for t in resp.turns]
 
     def stats(self) -> Stats:
         """Return database statistics."""

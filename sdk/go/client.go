@@ -128,9 +128,22 @@ type KnowledgeObject struct {
 
 // Stats holds database statistics.
 type Stats struct {
-	TotalObjects   uint64
-	VectorCount    uint64
-	IndexSizeBytes uint64
+	TotalObjects        uint64
+	VectorCount         uint64
+	IndexSizeBytes      uint64
+	GraphNodes          uint64
+	GraphEdges          uint64
+	ActiveAgentSessions uint64
+	TotalCostUSD        float64
+	CacheEntries        uint64
+	CacheHitRate        float64
+}
+
+// ConversationTurn is a single recorded turn in an agent session.
+type ConversationTurn struct {
+	Role      string
+	Content   string
+	Timestamp string
 }
 
 // Relationship describes a directed relationship to another object.
@@ -174,6 +187,54 @@ func WithRelationships(rels ...Relationship) WriteOption {
 
 func newWriteOptions(opts []WriteOption) writeOptions {
 	o := writeOptions{importance: 0.5}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
+// updateOptions collects the optional parameters for Update. Only fields that
+// are explicitly set are sent; unset optional fields leave the stored object
+// unchanged.
+type updateOptions struct {
+	content           *string
+	metadata          map[string]string
+	keywords          []string
+	importance        *float32
+	changeDescription *string
+}
+
+// UpdateOption configures an Update call.
+type UpdateOption func(*updateOptions)
+
+// WithUpdatedContent replaces the object's content (triggers re-embedding).
+func WithUpdatedContent(content string) UpdateOption {
+	return func(o *updateOptions) { o.content = &content }
+}
+
+// WithUpdatedMetadata merges the given keys into the object's metadata.
+func WithUpdatedMetadata(metadata map[string]string) UpdateOption {
+	return func(o *updateOptions) { o.metadata = metadata }
+}
+
+// WithUpdatedKeywords replaces the object's keywords. Passing a non-empty
+// slice replaces the existing keywords.
+func WithUpdatedKeywords(keywords ...string) UpdateOption {
+	return func(o *updateOptions) { o.keywords = keywords }
+}
+
+// WithUpdatedImportance sets a new importance score.
+func WithUpdatedImportance(importance float32) UpdateOption {
+	return func(o *updateOptions) { o.importance = &importance }
+}
+
+// WithChangeDescription records a note in the object's version history.
+func WithChangeDescription(description string) UpdateOption {
+	return func(o *updateOptions) { o.changeDescription = &description }
+}
+
+func newUpdateOptions(opts []UpdateOption) updateOptions {
+	var o updateOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -271,6 +332,26 @@ func (c *Client) Get(ctx context.Context, id string) (*KnowledgeObject, error) {
 	}, nil
 }
 
+// Update modifies an existing knowledge object in place. Only the fields set
+// via UpdateOption are changed; metadata keys are merged, while content,
+// keywords, and importance replace their existing values. It returns whether
+// the object was updated and the new length of its version history.
+func (c *Client) Update(ctx context.Context, id string, opts ...UpdateOption) (updated bool, version uint32, err error) {
+	o := newUpdateOptions(opts)
+	resp, err := c.stub.Update(ctx, &pb.UpdateRequest{
+		Id:                id,
+		Content:           o.content,
+		Metadata:          o.metadata,
+		Keywords:          o.keywords,
+		Importance:        o.importance,
+		ChangeDescription: o.changeDescription,
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	return resp.GetUpdated(), resp.GetVersion(), nil
+}
+
 // Delete removes a knowledge object by ID and reports whether it existed.
 func (c *Client) Delete(ctx context.Context, id string) (bool, error) {
 	resp, err := c.stub.Delete(ctx, &pb.DeleteRequest{Id: id})
@@ -307,8 +388,67 @@ func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 		return nil, err
 	}
 	return &Stats{
-		TotalObjects:   resp.GetTotalObjects(),
-		VectorCount:    resp.GetVectorCount(),
-		IndexSizeBytes: resp.GetIndexSizeBytes(),
+		TotalObjects:        resp.GetTotalObjects(),
+		VectorCount:         resp.GetVectorCount(),
+		IndexSizeBytes:      resp.GetIndexSizeBytes(),
+		GraphNodes:          resp.GetGraphNodes(),
+		GraphEdges:          resp.GetGraphEdges(),
+		ActiveAgentSessions: resp.GetActiveAgentSessions(),
+		TotalCostUSD:        resp.GetTotalCostUsd(),
+		CacheEntries:        resp.GetCacheEntries(),
+		CacheHitRate:        resp.GetCacheHitRate(),
 	}, nil
+}
+
+// Sql executes a SQL query against the DataFusion engine and returns the
+// resulting rows. Each row is a map of column name to its string value.
+func (c *Client) Sql(ctx context.Context, query string) ([]map[string]string, error) {
+	resp, err := c.stub.Sql(ctx, &pb.SqlRequest{Query: query})
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]map[string]string, 0, len(resp.GetRows()))
+	for _, r := range resp.GetRows() {
+		rows = append(rows, r.GetColumns())
+	}
+	return rows, nil
+}
+
+// ---- Agent conversation memory ----
+
+// RecordTurn appends a turn to an agent conversation session, creating the
+// session if it does not yet exist. The role is typically one of "user",
+// "assistant", "system", or "observation". It returns the new turn count for
+// the session.
+func (c *Client) RecordTurn(ctx context.Context, sessionID, role, content string) (uint32, error) {
+	resp, err := c.stub.RecordTurn(ctx, &pb.RecordTurnRequest{
+		SessionId: sessionID,
+		Role:      role,
+		Content:   content,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.GetTurnCount(), nil
+}
+
+// GetSession returns the recorded turns for an agent conversation session.
+// It returns (nil, nil) when no session exists for the given ID.
+func (c *Client) GetSession(ctx context.Context, sessionID string) ([]ConversationTurn, error) {
+	resp, err := c.stub.GetSession(ctx, &pb.GetSessionRequest{SessionId: sessionID})
+	if err != nil {
+		return nil, err
+	}
+	if !resp.GetFound() {
+		return nil, nil
+	}
+	turns := make([]ConversationTurn, 0, len(resp.GetTurns()))
+	for _, t := range resp.GetTurns() {
+		turns = append(turns, ConversationTurn{
+			Role:      t.GetRole(),
+			Content:   t.GetContent(),
+			Timestamp: t.GetTimestamp(),
+		})
+	}
+	return turns, nil
 }

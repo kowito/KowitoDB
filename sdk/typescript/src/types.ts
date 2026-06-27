@@ -132,6 +132,69 @@ export interface RememberResponse {
   id: string;
 }
 
+// ---- Update ----
+
+export interface UpdateRequest {
+  id: string;
+  /** If set, replaces content (and triggers re-embedding). */
+  content?: string;
+  /** Merged into existing metadata (keys overwrite). */
+  metadata?: Record<string, string>;
+  /** If non-empty, replaces keywords. */
+  keywords?: string[];
+  importance?: number;
+  /** Recorded in the object's version history. */
+  change_description?: string;
+}
+
+export interface UpdateResponse {
+  updated: boolean;
+  /** New length of the version history after this update. */
+  version: number;
+}
+
+// ---- SQL ----
+
+export interface SqlRequest {
+  query: string;
+}
+
+export interface SqlRow {
+  columns: Record<string, string>;
+}
+
+export interface SqlResponse {
+  rows: SqlRow[];
+}
+
+// ---- Agent memory ----
+
+export interface RecordTurnRequest {
+  session_id: string;
+  /** user | assistant | system | observation */
+  role: string;
+  content: string;
+}
+
+export interface RecordTurnResponse {
+  turn_count: number;
+}
+
+export interface GetSessionRequest {
+  session_id: string;
+}
+
+export interface ConversationTurnProto {
+  role: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface GetSessionResponse {
+  found: boolean;
+  turns: ConversationTurnProto[];
+}
+
 // ---- Stats ----
 
 export type StatsRequest = Record<string, never>;
@@ -140,6 +203,12 @@ export interface StatsResponse {
   total_objects: number;
   vector_count: number;
   index_size_bytes: number;
+  graph_nodes: number;
+  graph_edges: number;
+  active_agent_sessions: number;
+  total_cost_usd: number;
+  cache_entries: number;
+  cache_hit_rate: number;
 }
 
 // ---- Optional argument bags for high-level client methods ----
@@ -156,4 +225,16 @@ export interface InsertOptions {
   /** Tuples of [relation_type, target_id]. */
   relationships?: Array<[string, string]>;
   importance?: number;
+}
+
+export interface UpdateOptions {
+  /** If set, replaces content (and triggers re-embedding). */
+  content?: string;
+  /** Merged into existing metadata (keys overwrite). */
+  metadata?: Record<string, string>;
+  /** If non-empty, replaces keywords. */
+  keywords?: string[];
+  importance?: number;
+  /** Recorded in the object's version history. */
+  changeDescription?: string;
 }

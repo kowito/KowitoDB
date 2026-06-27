@@ -28,6 +28,10 @@ export type {
   // Get
   GetRequest,
   GetResponse,
+  // Update
+  UpdateRequest,
+  UpdateResponse,
+  UpdateOptions,
   // Delete
   DeleteRequest,
   DeleteResponse,
@@ -43,6 +47,16 @@ export type {
   RememberRequest,
   RememberResponse,
   RememberOptions,
+  // SQL
+  SqlRequest,
+  SqlRow,
+  SqlResponse,
+  // Agent memory
+  RecordTurnRequest,
+  RecordTurnResponse,
+  GetSessionRequest,
+  ConversationTurnProto,
+  GetSessionResponse,
   // Stats
   StatsRequest,
   StatsResponse,

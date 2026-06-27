@@ -25,6 +25,8 @@ import type {
   InsertResponse,
   GetRequest,
   GetResponse,
+  UpdateRequest,
+  UpdateResponse,
   DeleteRequest,
   DeleteResponse,
   SearchRequest,
@@ -33,6 +35,12 @@ import type {
   AskResponse,
   RememberRequest,
   RememberResponse,
+  SqlRequest,
+  SqlResponse,
+  RecordTurnRequest,
+  RecordTurnResponse,
+  GetSessionRequest,
+  GetSessionResponse,
   StatsRequest,
   StatsResponse,
 } from "./types";
@@ -69,10 +77,14 @@ type UnaryMethod<TRequest, TResponse> = {
 export interface KowitoDBGrpcClient extends Client {
   insert: UnaryMethod<InsertRequest, InsertResponse>;
   get: UnaryMethod<GetRequest, GetResponse>;
+  update: UnaryMethod<UpdateRequest, UpdateResponse>;
   delete: UnaryMethod<DeleteRequest, DeleteResponse>;
   search: UnaryMethod<SearchRequest, SearchResponse>;
   ask: UnaryMethod<AskRequest, AskResponse>;
   remember: UnaryMethod<RememberRequest, RememberResponse>;
+  sql: UnaryMethod<SqlRequest, SqlResponse>;
+  recordTurn: UnaryMethod<RecordTurnRequest, RecordTurnResponse>;
+  getSession: UnaryMethod<GetSessionRequest, GetSessionResponse>;
   stats: UnaryMethod<StatsRequest, StatsResponse>;
 }
 

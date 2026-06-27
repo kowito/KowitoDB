@@ -26,15 +26,19 @@ import {
 } from "./service";
 import type {
   AskResponse,
-  AskResult,
+  ConversationTurnProto,
   DeleteRequest,
   DeleteResponse,
   GetRequest,
   GetResponse,
+  GetSessionRequest,
+  GetSessionResponse,
   InsertOptions,
   InsertRequest,
   InsertResponse,
   KnowledgeObject,
+  RecordTurnRequest,
+  RecordTurnResponse,
   RelationshipInput,
   RememberOptions,
   RememberRequest,
@@ -42,7 +46,12 @@ import type {
   SearchRequest,
   SearchResponse,
   SearchResult,
+  SqlRequest,
+  SqlResponse,
   StatsResponse,
+  UpdateOptions,
+  UpdateRequest,
+  UpdateResponse,
 } from "./types";
 
 export interface KowitoDBClientOptions {
@@ -165,24 +174,57 @@ export class KowitoDBClient {
   // ---- SQL API ----
 
   /**
-   * Execute a SQL query against knowledge objects.
+   * Execute a SQL query against the DataFusion engine.
    *
    *   SELECT * FROM knowledge WHERE metadata.company = 'Acme'
    *   SELECT content FROM knowledge WHERE keyword LIKE '%enterprise%' LIMIT 10
    *
-   * Routed through the search interface (mirrors the Python SDK).
+   * Returns one row per result; each row is a column-name -> value map.
    */
-  async sql(query: string): Promise<AskResult[]> {
+  async sql(query: string): Promise<Array<Record<string, string>>> {
     const stub = this.ensureConnected();
-    const req: SearchRequest = { query, top_k: 20 };
-    const resp = await callUnary<SearchResponse>((cb) => stub.search(req, cb));
-    return resp.results.map((r) => ({
-      id: r.id,
-      content: r.content,
-      relevance_score: r.score,
-      metadata: r.metadata,
-      retrieval_source: "",
-    }));
+    const req: SqlRequest = { query };
+    const resp = await callUnary<SqlResponse>((cb) => stub.sql(req, cb));
+    return resp.rows.map((row) => row.columns);
+  }
+
+  // ---- Agent conversation memory ----
+
+  /**
+   * Append a turn to an agent conversation session, creating it if needed.
+   * `role` is one of: user | assistant | system | observation.
+   * Returns the total number of turns recorded in the session.
+   */
+  async recordTurn(
+    sessionId: string,
+    role: string,
+    content: string,
+  ): Promise<number> {
+    const stub = this.ensureConnected();
+    const req: RecordTurnRequest = {
+      session_id: sessionId,
+      role,
+      content,
+    };
+    const resp = await callUnary<RecordTurnResponse>((cb) =>
+      stub.recordTurn(req, cb),
+    );
+    return resp.turn_count;
+  }
+
+  /**
+   * Fetch the recorded turns for a session, or null if the session does not
+   * exist.
+   */
+  async getSession(
+    sessionId: string,
+  ): Promise<ConversationTurnProto[] | null> {
+    const stub = this.ensureConnected();
+    const req: GetSessionRequest = { session_id: sessionId };
+    const resp = await callUnary<GetSessionResponse>((cb) =>
+      stub.getSession(req, cb),
+    );
+    return resp.found ? resp.turns : null;
   }
 
   // ---- Low-level API ----
@@ -213,6 +255,25 @@ export class KowitoDBClient {
     const req: GetRequest = { id: objectId };
     const resp = await callUnary<GetResponse>((cb) => stub.get(req, cb));
     return resp.object ?? null;
+  }
+
+  /**
+   * Update an existing knowledge object. Only the provided fields are changed:
+   * `content` (if set) is replaced and re-embedded, `metadata` is merged,
+   * non-empty `keywords` replace the existing list, and `importance` is set.
+   * Returns the full update response (whether it applied and the new version).
+   */
+  async update(objectId: string, options: UpdateOptions = {}): Promise<UpdateResponse> {
+    const stub = this.ensureConnected();
+    const req: UpdateRequest = {
+      id: objectId,
+      content: options.content,
+      metadata: options.metadata ?? {},
+      keywords: options.keywords ?? [],
+      importance: options.importance,
+      change_description: options.changeDescription,
+    };
+    return callUnary<UpdateResponse>((cb) => stub.update(req, cb));
   }
 
   /** Direct search (bypasses the AI planner). */

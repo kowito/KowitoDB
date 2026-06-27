@@ -3,8 +3,9 @@
 TypeScript gRPC client for **KowitoDB**, the AI Knowledge Operating System.
 
 It mirrors the [Python SDK](../python) one-to-one: the same `KowitoDBClient`
-class with `remember`, `ask`, `forget`, `sql`, `insert`, `get`, `search`, and
-`stats` methods. All methods are async and return Promises.
+class with `remember`, `ask`, `forget`, `sql`, `insert`, `get`, `update`,
+`search`, `recordTurn`, `getSession`, and `stats` methods. All methods are
+async and return Promises.
 
 ## Install
 
@@ -33,11 +34,24 @@ async function main() {
     console.log(`[${r.relevance_score.toFixed(2)}] ${r.content}`);
   }
 
-  // SQL-style query (routed through search)
+  // SQL query (DataFusion engine) — returns an array of column->value maps
   const rows = await db.sql(
-    "SELECT * FROM knowledge WHERE metadata.company = 'OpenAI'",
+    "SELECT id, content FROM knowledge WHERE metadata.company = 'OpenAI'",
   );
-  console.log(rows);
+  for (const row of rows) {
+    console.log(row.id, row.content);
+  }
+
+  // Update an existing object (partial; only provided fields change)
+  await db.update("obj-123", {
+    metadata: { reviewed: "true" },
+    changeDescription: "marked as reviewed",
+  });
+
+  // Agent conversation memory
+  await db.recordTurn("session-1", "user", "What did OpenAI raise?");
+  const turns = await db.getSession("session-1");
+  console.log(turns); // ConversationTurnProto[] | null
 
   db.close();
 }
@@ -69,10 +83,13 @@ db.close();
 | `remember(content, { keywords?, metadata?, importance? })` | Store knowledge. | `Promise<string>` (id) |
 | `ask(question, maxResults?)` | Natural-language query with auto retrieval. | `Promise<AskResponse>` |
 | `forget(id)` | Delete a knowledge object. | `Promise<boolean>` (existed) |
-| `sql(query)` | SQL-style query (routed through search). | `Promise<AskResult[]>` |
+| `sql(query)` | SQL query over the DataFusion engine. | `Promise<Array<Record<string, string>>>` (rows) |
 | `insert(content, { keywords?, metadata?, relationships?, importance? })` | Explicit insert. | `Promise<string>` (id) |
 | `get(id)` | Fetch a knowledge object. | `Promise<KnowledgeObject \| null>` |
+| `update(id, { content?, metadata?, keywords?, importance?, changeDescription? })` | Partial update of an object. | `Promise<UpdateResponse>` |
 | `search(query, topK?)` | Direct search (no AI planner). | `Promise<SearchResult[]>` |
+| `recordTurn(sessionId, role, content)` | Append a turn to an agent session. | `Promise<number>` (turn count) |
+| `getSession(sessionId)` | Fetch a session's turns. | `Promise<ConversationTurnProto[] \| null>` |
 | `stats()` | Database statistics. | `Promise<StatsResponse>` |
 
 All message types (`AskResponse`, `AskResult`, `SearchResult`,
