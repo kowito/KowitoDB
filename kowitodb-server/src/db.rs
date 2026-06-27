@@ -4,8 +4,8 @@ use std::sync::Arc;
 use kowitodb_core::Result as KResult;
 use kowitodb_core::{Embedding, KnowledgeObject, ObjectId};
 use kowitodb_index::{
-    FullTextIndex, GraphIndex, HnswIndex, HnswParams, IndexResult, IndexSource, MetadataIndex,
-    TimeIndex, VectorIndex,
+    FullTextIndex, GraphIndex, HnswParams, IndexResult, IndexSource, MetadataIndex,
+    ShardedHnswIndex, TimeIndex, VectorIndex,
 };
 use kowitodb_planner::{
     cache::QueryCache, context::ContextOptimizer, cost::CostTracker, reranker::Reranker,
@@ -25,6 +25,14 @@ use crate::proto;
 /// Maximum number of object contents held in the in-memory LRU cache. On a
 /// miss, content is reloaded from storage, so this only bounds memory use.
 const CONTENT_CACHE_CAP: usize = 10_000;
+
+/// Number of HNSW shards for the vector index — scales build/query with cores.
+fn vector_shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
 
 /// Bounded LRU cache of object content keyed by id, used to avoid storage
 /// round-trips for hot objects without growing without limit.
@@ -64,7 +72,7 @@ pub struct LoadedResult {
 /// Core engine wiring storage, all 6 indexes, query planner, and all optimizers.
 pub struct KowitoDBEngine {
     pub storage: Arc<dyn StorageBackend>,
-    pub hnsw_index: Arc<HnswIndex>,
+    pub hnsw_index: Arc<ShardedHnswIndex>,
     pub vector_index: Arc<VectorIndex>,
     pub fulltext_index: Arc<FullTextIndex>,
     pub metadata_index: Arc<MetadataIndex>,
@@ -170,7 +178,10 @@ impl KowitoDBEngine {
 
         Self {
             storage,
-            hnsw_index: Arc::new(HnswIndex::new(HnswParams::default())),
+            hnsw_index: Arc::new(ShardedHnswIndex::new(
+                vector_shard_count(),
+                HnswParams::default(),
+            )),
             vector_index: Arc::new(VectorIndex::new()),
             fulltext_index: Arc::new(fulltext_index),
             metadata_index: Arc::new(MetadataIndex::new()),
@@ -200,7 +211,7 @@ impl KowitoDBEngine {
     /// vector index is rebuilt from stored embeddings too.
     async fn load_or_reindex(&mut self) -> KResult<()> {
         let loaded = match self.hnsw_snapshot_path() {
-            Some(path) => match HnswIndex::load(&path) {
+            Some(path) => match ShardedHnswIndex::load(&path) {
                 Ok(Some(index)) => {
                     info!("Loaded persisted vector index ({} vectors)", index.len());
                     self.hnsw_index = Arc::new(index);
@@ -248,13 +259,16 @@ impl KowitoDBEngine {
         let objects = self.storage.search(StorageFilter::default()).await?;
         let count = objects.len();
 
+        // Collect vectors so the sharded index can build them in parallel.
+        let mut vectors: Vec<(ObjectId, Embedding)> = Vec::new();
+
         for stored in &objects {
             let obj = stored_to_obj(stored)?;
             self.content_cache.insert(obj.id, obj.content.clone());
 
             if include_vectors {
                 for embedding in obj.embeddings.values() {
-                    self.hnsw_index.insert(obj.id, embedding.clone());
+                    vectors.push((obj.id, embedding.clone()));
                 }
             }
             for (key, value) in &obj.metadata {
@@ -270,6 +284,10 @@ impl KowitoDBEngine {
                 self.graph_index
                     .insert_relationships(obj.id, &obj.relationships);
             }
+        }
+
+        if !vectors.is_empty() {
+            self.hnsw_index.build_parallel(vectors);
         }
 
         if count > 0 {

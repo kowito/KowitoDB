@@ -20,6 +20,7 @@ Override the workload via environment variables:
 | `BENCH_K` | `10` | neighbors per query |
 | `BENCH_EF` | `HnswParams::default().ef_search` (200) | search beam width |
 | `BENCH_THREADS` | logical cores | concurrent query threads for the throughput test |
+| `BENCH_SHARDS` | `min(cores, 16)` | shards for the parallel-build test |
 
 The benchmark builds the index from synthetic unit-norm random vectors (fixed
 seed), measures build throughput and per-query latency percentiles, and computes
@@ -56,10 +57,21 @@ Queries hold only a read lock, so single-node QPS scales with cores. On a
 
 ### Build throughput
 
-~1,150 inserts/sec for 10k × 384-dim (single-threaded, `ef_construction=200`),
-up from ~900. Build remains the bottleneck: `insert()` holds a single global
-write lock, so it does not yet parallelize — a fine-grained-locking redesign is
-the next step.
+Single-index (one global write lock): ~1,150 inserts/sec for 10k × 384-dim
+(single-threaded, `ef_construction=200`), up from ~900.
+
+**Sharded parallel build** (`ShardedHnswIndex`, one thread per shard) is far
+faster — each shard builds a smaller graph in parallel. On a 10-core machine
+with 10 shards: **~0.4 s for 10k vectors (~25,000 inserts/s, ~21× the serial
+build)**. The speedup is super-linear because HNSW build cost grows
+super-linearly with graph size, so ten 1k-vector graphs build much faster than
+one 10k-vector graph — on top of the parallelism. Set `BENCH_SHARDS` to vary
+the shard count. The engine uses the sharded index by default (shards =
+`min(cores, 16)`), so reindex-on-restart is parallel.
+
+Sharded recall is **equal or better** than the single index (each shard is a
+smaller, more accurate graph; the per-shard top-k are merged): ~100% recall@10
+at 10 shards on this workload vs ~94% single-index.
 
 ## Optimizations
 

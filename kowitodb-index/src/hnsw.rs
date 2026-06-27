@@ -298,9 +298,8 @@ impl HnswIndex {
         self.nodes.read().is_empty()
     }
 
-    /// Persist the index to `path` (atomic write via a temp file + rename).
-    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
+    /// Serialize the index to a byte buffer.
+    pub fn to_bytes(&self) -> std::io::Result<Vec<u8>> {
         let nodes = self.nodes.read();
         let snapshot = HnswSnapshotRef {
             params: &self.params,
@@ -308,7 +307,24 @@ impl HnswIndex {
             entry_point: *self.entry_point.read(),
             max_layer: *self.max_layer.read(),
         };
-        let bytes = bincode::serialize(&snapshot).map_err(std::io::Error::other)?;
+        bincode::serialize(&snapshot).map_err(std::io::Error::other)
+    }
+
+    /// Reconstruct an index from a buffer produced by [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        let snapshot: HnswSnapshot = bincode::deserialize(bytes).map_err(std::io::Error::other)?;
+        Ok(Self {
+            nodes: Arc::new(RwLock::new(snapshot.nodes)),
+            entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
+            max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
+            params: snapshot.params,
+        })
+    }
+
+    /// Persist the index to `path` (atomic write via a temp file + rename).
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let bytes = self.to_bytes()?;
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
@@ -322,13 +338,7 @@ impl HnswIndex {
             return Ok(None);
         }
         let bytes = std::fs::read(path)?;
-        let snapshot: HnswSnapshot = bincode::deserialize(&bytes).map_err(std::io::Error::other)?;
-        Ok(Some(Self {
-            nodes: Arc::new(RwLock::new(snapshot.nodes)),
-            entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
-            max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
-            params: snapshot.params,
-        }))
+        Ok(Some(Self::from_bytes(&bytes)?))
     }
 
     // ---- Internal methods ----

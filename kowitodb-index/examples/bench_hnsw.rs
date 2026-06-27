@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use kowitodb_index::{HnswIndex, HnswParams};
+use kowitodb_index::{HnswIndex, HnswParams, ShardedHnswIndex};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use uuid::Uuid;
@@ -174,6 +174,44 @@ fn main() {
             "  aggregate throughput ~{:.0} queries/s ({:.1}x single-threaded)",
             agg_qps,
             agg_qps / qps
+        );
+    }
+
+    // Parallel build via the sharded index (one thread per shard).
+    let shards = env_usize("BENCH_SHARDS", threads.clamp(1, 16));
+    if shards > 1 {
+        let sharded = ShardedHnswIndex::new(
+            shards,
+            HnswParams {
+                ef_search,
+                ..Default::default()
+            },
+        );
+        let items: Vec<_> = data.iter().map(|(id, v)| (*id, v.clone())).collect();
+        let t = Instant::now();
+        sharded.build_parallel(items);
+        let pbuild = t.elapsed();
+
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in &query_vecs {
+            let approx = sharded.search(q, k);
+            let truth: std::collections::HashSet<Uuid> =
+                brute_force_topk(q, &data, k).into_iter().collect();
+            hits += approx.iter().filter(|(id, _)| truth.contains(id)).count();
+            total += k;
+        }
+
+        println!("Parallel build ({shards} shards):");
+        println!(
+            "  {n} vectors in {:.2}s  ({:.0} inserts/s, {:.1}x serial build)",
+            pbuild.as_secs_f64(),
+            n as f64 / pbuild.as_secs_f64(),
+            build_elapsed.as_secs_f64() / pbuild.as_secs_f64(),
+        );
+        println!(
+            "  sharded recall@{k}: {:.1}%",
+            hits as f64 / total as f64 * 100.0
         );
     }
 }
