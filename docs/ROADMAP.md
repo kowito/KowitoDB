@@ -72,12 +72,21 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - **Why us:** we already persist agent memory **and** have a graph index — the
   most *differentiating* item; it makes "agent-memory OS" real.
 
-### 4. Query routing in the planner — ✅ largely done · 📋 enhance
+### 4. Query routing in the planner — ✅ enhanced (v0.20.0) · 📋 NL→SQL remaining
 - ✅ **Already present:** a rule-engine planner maps detected intent → retrieval
   actions (vector / keyword / graph / metadata / time), so routing exists.
-- 📋 **Enhance:** add explicit SQL routing for analytical queries and tune
-  intent→strategy weights. **Evidence:** 2025 evals show routing/integration beats
-  RAG-or-GraphRAG alone (~+6%). — arxiv 2502.11371.
+- ✅ **Shipped (v0.20):** **intent-conditioned fusion weights** — the reranker's
+  per-source RRF weights are now scaled by the detected intent
+  (`Reranker::rerank_for_intent`), so e.g. temporal queries lean on the time
+  index, entity queries on the graph + exact full-text, code queries on exact
+  full-text, and analytical/listing queries on broad metadata recall. Added an
+  `Analytical` intent ("how many / average / count of …") routed to wide
+  structured recall rather than tight top-k semantic. Unit-tested (intent shifts
+  ranking; `General` matches the base weights).
+- 📋 **Remaining:** NL→SQL routing for analytical queries (execute real
+  DataFusion aggregates) — needs a generative client for the NL→SQL step.
+- **Evidence:** 2025 evals show routing/integration beats RAG-or-GraphRAG alone
+  (~+6%). — arxiv 2502.11371.
 
 ### 5. RaBitQ quantization (+ DiskANN) — 🔬 potential (the real scale lever)
 Upgrade int8 SQ → ~1 bit/dim with a *theoretical* error bound (~32× compression);

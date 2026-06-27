@@ -4,6 +4,8 @@ use kowitodb_core::ObjectId;
 use kowitodb_index::{IndexResult, IndexSource, VectorIndex};
 use tracing::debug;
 
+use super::intent::Intent;
+
 /// Result with a unified score from all retrieval sources.
 #[derive(Debug, Clone)]
 pub struct RankedResult {
@@ -64,15 +66,41 @@ impl Reranker {
         _vector_index: Option<&VectorIndex>,
         _query_embedding: Option<&[f32]>,
     ) -> Vec<RankedResult> {
+        self.rerank_with_weights(raw_results, &self.source_weights)
+    }
+
+    /// Rerank with **intent-conditioned** source weights: the base per-source
+    /// weights are scaled by an intent-specific multiplier so the planner's
+    /// detected intent steers fusion toward the indexes that matter for it
+    /// (e.g. temporal → time, entity → graph, code → exact full-text). Falls
+    /// back to the base weights for intents with no preference.
+    pub fn rerank_for_intent(
+        &self,
+        raw_results: &[IndexResult],
+        intent: &Intent,
+    ) -> Vec<RankedResult> {
+        let multipliers = intent_weight_multipliers(intent);
+        if multipliers.is_empty() {
+            return self.rerank_with_weights(raw_results, &self.source_weights);
+        }
+        let mut weights = self.source_weights.clone();
+        for (source, mult) in multipliers {
+            let w = weights.entry(source).or_insert(1.0);
+            *w *= mult;
+        }
+        self.rerank_with_weights(raw_results, &weights)
+    }
+
+    fn rerank_with_weights(
+        &self,
+        raw_results: &[IndexResult],
+        weights: &HashMap<IndexSource, f32>,
+    ) -> Vec<RankedResult> {
         // Phase 1: RRF scoring
         let mut scored: HashMap<ObjectId, RankedResult> = HashMap::new();
 
         for result in raw_results {
-            let source_weight = self
-                .source_weights
-                .get(&result.source)
-                .copied()
-                .unwrap_or(1.0);
+            let source_weight = weights.get(&result.source).copied().unwrap_or(1.0);
 
             for (rank, (&id, &score)) in result.ids.iter().zip(result.scores.iter()).enumerate() {
                 let rrf_score = 1.0 / (self.rrf_k + rank as f32 + 1.0);
@@ -146,6 +174,36 @@ impl Default for Reranker {
     }
 }
 
+/// Per-intent source-weight multipliers applied on top of the base RRF weights.
+/// Empty ⇒ no preference (use base weights). Tuned to the index each intent
+/// most depends on; values are deliberately modest (≤1.6×) so fusion still
+/// blends every source rather than collapsing to one.
+fn intent_weight_multipliers(intent: &Intent) -> Vec<(IndexSource, f32)> {
+    match intent {
+        // Time-bounded → lean on the time index, keep semantic signal.
+        Intent::Temporal => vec![(IndexSource::Time, 1.8), (IndexSource::Vector, 1.1)],
+        // Entity-driven → graph relationships + exact name matches.
+        Intent::EntitySearch => vec![
+            (IndexSource::Graph, 1.5),
+            (IndexSource::FullText, 1.3),
+            (IndexSource::Metadata, 1.2),
+        ],
+        // Comparison spans entities → graph + semantics.
+        Intent::Comparison => vec![(IndexSource::Graph, 1.4), (IndexSource::Vector, 1.2)],
+        // Code → exact token matches dominate.
+        Intent::CodeSearch => vec![(IndexSource::FullText, 1.5)],
+        // Factoid lookups reward precise term matches.
+        Intent::Factoid => vec![(IndexSource::FullText, 1.3), (IndexSource::Vector, 1.1)],
+        // Explanation is semantic.
+        Intent::Explanation => vec![(IndexSource::Vector, 1.3)],
+        // Enumeration and aggregation want broad structured recall.
+        Intent::Listing => vec![(IndexSource::Metadata, 1.3), (IndexSource::FullText, 1.2)],
+        Intent::Analytical => vec![(IndexSource::Metadata, 1.4), (IndexSource::FullText, 1.2)],
+        // No preference.
+        Intent::Summary | Intent::General => vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +241,41 @@ mod tests {
 
         assert_eq!(ranked[0].id, id);
         assert!(ranked[0].sources.len() >= 2);
+    }
+
+    #[test]
+    fn test_rerank_for_intent_boosts_graph_for_entity_search() {
+        let reranker = Reranker::new();
+        let graph_hit = uuid::Uuid::new_v4();
+        let vector_hit = uuid::Uuid::new_v4();
+
+        // Two distinct results, one from graph and one from vector, each rank 0
+        // in its own source. Under EntitySearch the graph hit should win.
+        let results = vec![
+            make_result(&[vector_hit], &[0.9], IndexSource::Vector),
+            make_result(&[graph_hit], &[0.9], IndexSource::Graph),
+        ];
+
+        let general = reranker.rerank_for_intent(&results, &Intent::General);
+        // Base weights: Vector (1.5) > Graph (1.3) → vector hit ranks first.
+        assert_eq!(general[0].id, vector_hit);
+
+        let entity = reranker.rerank_for_intent(&results, &Intent::EntitySearch);
+        // Graph ×1.5 (=1.95) now outranks Vector (1.5) → graph hit ranks first.
+        assert_eq!(entity[0].id, graph_hit);
+    }
+
+    #[test]
+    fn test_rerank_for_intent_general_matches_base() {
+        let reranker = Reranker::new();
+        let id1 = uuid::Uuid::new_v4();
+        let id2 = uuid::Uuid::new_v4();
+        let results = vec![make_result(&[id1, id2], &[0.9, 0.5], IndexSource::Vector)];
+
+        let base = reranker.rerank_simple(&results);
+        let general = reranker.rerank_for_intent(&results, &Intent::General);
+        assert_eq!(base.len(), general.len());
+        assert_eq!(base[0].id, general[0].id);
     }
 
     #[test]

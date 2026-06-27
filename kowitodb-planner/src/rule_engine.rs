@@ -93,6 +93,17 @@ impl RuleEngine {
                 ],
             },
             Rule {
+                // Aggregational queries want broad structured recall (scan the
+                // metadata/keyword space) rather than a tight top-k semantic hit.
+                name: "analytical",
+                predicate: |di: &DetectedIntent| di.intent == Intent::Analytical,
+                actions: vec![
+                    RetrievalAction::MetadataFilter,
+                    RetrievalAction::KeywordSearch,
+                    RetrievalAction::VectorSearch,
+                ],
+            },
+            Rule {
                 name: "factoid",
                 predicate: |di: &DetectedIntent| di.intent == Intent::Factoid,
                 actions: vec![
@@ -171,6 +182,15 @@ mod tests {
         let intent = analyzer.analyze("Compare OpenAI and Anthropic");
         let actions = engine.evaluate(&intent);
         assert!(actions.contains(&RetrievalAction::GraphTraverse));
+    }
+
+    #[test]
+    fn test_analytical_rule() {
+        let engine = RuleEngine::new();
+        let analyzer = IntentAnalyzer::new();
+        let intent = analyzer.analyze("How many deals closed last quarter?");
+        let actions = engine.evaluate(&intent);
+        assert!(actions.contains(&RetrievalAction::MetadataFilter));
     }
 
     #[test]

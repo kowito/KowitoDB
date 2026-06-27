@@ -689,8 +689,11 @@ impl KowitoDBEngine {
         let mut all_results: Vec<IndexResult> =
             raw_results.into_iter().chain(graph_results).collect();
 
-        // Rerank
-        let mut ranked = self.reranker.rerank_simple(&all_results);
+        // Rerank with intent-conditioned source weights (the planner's detected
+        // intent steers RRF fusion toward the indexes that matter for it).
+        let mut ranked = self
+            .reranker
+            .rerank_for_intent(&all_results, &intent.intent);
 
         // CRAG-style corrective gate: when retrieval confidence is low (few
         // results / little cross-source agreement), broaden the search across
@@ -703,7 +706,9 @@ impl KowitoDBEngine {
                 self.cost_tracker
                     .record_index_lookups(corrective.iter().map(|r| r.ids.len()).sum());
                 all_results.extend(corrective);
-                ranked = self.reranker.rerank_simple(&all_results);
+                ranked = self
+                    .reranker
+                    .rerank_for_intent(&all_results, &intent.intent);
                 debug!("Corrective retrieval engaged for low-confidence query");
             }
         }

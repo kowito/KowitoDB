@@ -19,6 +19,9 @@ pub enum Intent {
     EntitySearch,
     /// "Code for", "Implement" — code-related.
     CodeSearch,
+    /// "How many", "Count", "Average", "Total number of" — aggregational /
+    /// structured analytics (favors broad structured recall over top-k semantic).
+    Analytical,
     /// Default fallback.
     General,
 }
@@ -122,6 +125,25 @@ impl IntentAnalyzer {
             || lower.contains("short")
         {
             return Intent::Summary;
+        }
+        // Aggregational / analytical queries — checked before Explanation so
+        // "how many" doesn't fall through to "how"-style explanatory matching.
+        if lower.contains("how many")
+            || lower.contains("how much")
+            || lower.contains("number of")
+            || lower.contains("count of")
+            || lower.contains("count the")
+            || lower.contains("total number")
+            || lower.contains("average")
+            || lower.contains(" avg ")
+            || lower.contains("sum of")
+            || lower.contains("most common")
+            || lower.contains("least common")
+            || lower.contains("percentage of")
+            || lower.contains("what fraction")
+            || lower.contains("group by")
+        {
+            return Intent::Analytical;
         }
         if lower.contains("why") || lower.contains("how does") || lower.contains("explain") {
             return Intent::Explanation;
@@ -299,6 +321,24 @@ mod tests {
         let result = analyzer.analyze("Which enterprise customers renewed after January 2024?");
         assert_eq!(result.intent, Intent::Temporal);
         assert!(!result.entities.dates.is_empty());
+    }
+
+    #[test]
+    fn test_classify_analytical() {
+        let analyzer = IntentAnalyzer::new();
+        assert_eq!(
+            analyzer.analyze("How many customers churned?").intent,
+            Intent::Analytical
+        );
+        assert_eq!(
+            analyzer.analyze("What is the average deal size?").intent,
+            Intent::Analytical
+        );
+        // "how does" must remain Explanation, not be captured by the analytical rule.
+        assert_eq!(
+            analyzer.analyze("How does replication work?").intent,
+            Intent::Explanation
+        );
     }
 
     #[test]
