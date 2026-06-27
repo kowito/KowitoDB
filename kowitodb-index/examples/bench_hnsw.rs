@@ -140,6 +140,110 @@ fn main() {
     );
     println!("  throughput ~{:.0} queries/s (single-threaded)", qps);
 
+    // Compression variants (binary, Matryoshka) are evaluated on a *clustered*
+    // dataset, which is representative of real embeddings (true neighbors are
+    // meaningfully closer than random pairs). Pure random unit vectors are a
+    // worst case for them — in high dimensions all pairwise distances
+    // concentrate, leaving 1-bit codes and dimension-prefixes little to
+    // separate, so they understate these techniques. Full/int8 distances are
+    // exact, so those use the random set above.
+    let n_clusters = 64usize;
+    let centers: Vec<Vec<f32>> = (0..n_clusters)
+        .map(|_| random_unit_vec(&mut rng, dim))
+        .collect();
+    let make_clustered = |rng: &mut StdRng, center: &[f32]| -> Vec<f32> {
+        let mut v: Vec<f32> = center
+            .iter()
+            .map(|c| c + 0.25 * rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        v
+    };
+    let cdata: Vec<(Uuid, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let center = &centers[i % n_clusters];
+            (
+                Uuid::from_u128(i as u128 + 1),
+                make_clustered(&mut rng, center),
+            )
+        })
+        .collect();
+    let cqueries: Vec<Vec<f32>> = (0..queries)
+        .map(|i| make_clustered(&mut rng, &centers[i % n_clusters]))
+        .collect();
+
+    let eval = |index: &HnswIndex| -> (f64, f64) {
+        let mut lat: Vec<u128> = Vec::with_capacity(queries);
+        let mut hits = 0usize;
+        for q in &cqueries {
+            let t = Instant::now();
+            let approx = index.search(q, k);
+            lat.push(t.elapsed().as_micros());
+            let truth: std::collections::HashSet<Uuid> =
+                brute_force_topk(q, &cdata, k).into_iter().collect();
+            hits += approx.iter().filter(|(id, _)| truth.contains(id)).count();
+        }
+        let mean = lat.iter().sum::<u128>() as f64 / lat.len() as f64;
+        (hits as f64 / (queries * k) as f64, mean)
+    };
+
+    // Full-precision baseline on the clustered set (for a like-for-like recall
+    // comparison with the variants below).
+    let cfull = HnswIndex::new(HnswParams {
+        ef_search,
+        ..Default::default()
+    });
+    for (id, v) in &cdata {
+        cfull.insert(*id, v.clone());
+    }
+    let (crec, cmean) = eval(&cfull);
+    println!("\n— Compression variants (clustered data, n={n}) —");
+    println!(
+        "Full f32 baseline:  recall@{k}: {:.1}%   mean={:.0}us",
+        crec * 100.0,
+        cmean
+    );
+
+    let bin = HnswIndex::new(HnswParams {
+        ef_search,
+        binary_quantize: true,
+        ..Default::default()
+    });
+    for (id, v) in &cdata {
+        bin.insert(*id, v.clone());
+    }
+    let (brec, bmean) = eval(&bin);
+    println!("Binary 1-bit RaBitQ (~32x less memory, popcount Hamming nav + refine):");
+    println!(
+        "  recall@{k}: {:.1}%   latency mean={:.0}us  ({:.2}x full)",
+        brec * 100.0,
+        bmean,
+        bmean / cmean
+    );
+
+    let cdim = (dim / 4).max(1);
+    let mat = HnswIndex::new(HnswParams {
+        ef_search,
+        coarse_dim: Some(cdim),
+        ..Default::default()
+    });
+    for (id, v) in &cdata {
+        mat.insert(*id, v.clone());
+    }
+    let (mrec, mmean) = eval(&mat);
+    println!("Matryoshka adaptive (navigate {cdim}/{dim} dims, full-dim refine):");
+    println!(
+        "  recall@{k}: {:.1}%   latency mean={:.0}us  ({:.2}x full)",
+        mrec * 100.0,
+        mmean,
+        mmean / cmean
+    );
+
     // Concurrent throughput: queries run in parallel under the index's RwLock
     // read locks, so single-node QPS scales with cores.
     let threads = env_usize(

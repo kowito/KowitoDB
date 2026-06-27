@@ -86,12 +86,37 @@ these). Off by default.
 or `KOWITODB_VECTOR_BINARY_QUANTIZE=1`) goes further — **~32× less memory** than
 f32 (one sign bit per dimension plus two scalars). Each vector is rotated by a
 structured random rotation (random ±1 signs + a normalized fast Walsh–Hadamard
-transform, O(d log d)) so the sign codes are a good estimator, and distances use
-the unbiased RaBitQ estimator. The trade is recall (lower than int8 — a unit test
-asserts recall@10 ≥ 0.5 on a 64-dim synthetic set, with exact matches near top-1),
-and at present it is a memory win, not a query-speed win (the estimator is still
-O(d) per node; a popcount fast path is future work). Off by default; takes
-precedence over int8 when both are set.
+transform, O(d log d)) so the sign codes are a good estimator; the graph is then
+navigated by a **popcount Hamming fast path** and the final top-k is re-scored
+with the unbiased asymmetric RaBitQ estimator.
+
+**Matryoshka adaptive retrieval** (`HnswParams { coarse_dim: Some(d) }`, or
+`KOWITODB_VECTOR_COARSE_DIM=d`) keeps full f32 vectors but navigates the graph
+on only the first `d` dimensions, then refines the top-k at full dimension — a
+query-*speed* lever for MRL-trained embeddings (whose prefixes are valid).
+
+Measured on a **clustered** dataset (n=10k, dim=384, ef_search=200 — clustered
+because random unit vectors are a worst case for compression: in high dimensions
+all pairwise distances concentrate, leaving 1-bit codes and dimension-prefixes
+little to separate):
+
+| Mode | recall@10 | latency vs full | memory |
+|------|-----------|-----------------|--------|
+| Full f32 | ~99% | 1.0× | 1× |
+| int8 (random set) | ~91% | ~1.0× | ¼× |
+| **Binary 1-bit** | **~43%** | **~0.3× (≈3.4× faster)** | **1/32×** |
+| **Matryoshka (96/384)** | **~42%** | **~0.44× (≈2.3× faster)** | 1× |
+
+The speedups are real and consistent; the **recall figures are the honest cost
+of aggressive approximation without a full-vector rerank stage**. Production
+binary-quantization systems reach high recall by *oversampling* the binary
+candidates and re-scoring them with retained full vectors; KowitoDB does not yet
+retain full vectors in binary mode (a retained-vector rerank is the documented
+next step — see ROADMAP #5). For MRL embeddings specifically, real prefixes
+preserve neighborhoods far better than this generic synthetic, so Matryoshka
+recall in practice is higher. Both modes are off by default; binary takes
+precedence over int8 when both are set. Reproduce with
+`cargo run --release -p kowitodb-index --example bench_hnsw`.
 
 ## Optimizations
 

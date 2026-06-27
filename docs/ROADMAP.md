@@ -99,11 +99,16 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   `KOWITODB_VECTOR_BINARY_QUANTIZE=1` (or `HnswParams::binary_quantize`); the
   rotation persists in the index snapshot. Recall@10 validated vs brute force in
   a unit test; exact matches stay near top-1.
-- **Honest scope:** the win here is **memory** (the lever for very large in-RAM
-  collections), not yet query *speed* — the estimator is still O(d) per node.
-  📋 **Remaining:** an int-quantized-query **popcount fast path** (bitwise
-  distance) for the speedup, and **DiskANN**-style on-disk graph for true
-  billion-scale on SSD.
+- ✅ **Popcount fast path (v0.23):** binary navigation now scores via a
+  **Hamming/popcount** distance over the packed sign codes (no float ops),
+  refined to the asymmetric estimator for the final top-k — a measured **~3.4×
+  query speedup** on top of the memory win (see BENCHMARKS). Generalized the
+  graph traversal to a `Scorer` (full / coarse-prefix / Hamming).
+- **Honest scope:** binary is now both a memory **and** speed win, but recall is
+  the cost of 1-bit codes (~43% recall@10 on a hard clustered synthetic without
+  a rerank stage). 📋 **Remaining for high recall:** retain full (or int8)
+  vectors in binary mode and **oversample → rescore** the top-k with them (the
+  production pattern), and **DiskANN**-style on-disk graph for billion-scale SSD.
 - **Maturity:** RaBitQ SIGMOD 2024; production in VectorChord/DiskANN.
 
 ---

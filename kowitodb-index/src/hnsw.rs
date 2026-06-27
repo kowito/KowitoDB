@@ -142,16 +142,12 @@ impl NodeVector {
     /// Build a 1-bit binary code from an already-rotated vector `rotated`
     /// (length `dim_padded`).
     fn new_binary(rotated: &[f32], dim_padded: usize) -> Self {
-        let words = dim_padded.div_ceil(64);
-        let mut code = vec![0u64; words];
+        let code = pack_sign_code(rotated, dim_padded);
         let mut abs_sum = 0.0f32;
         let mut norm_sq = 0.0f32;
-        for (i, &x) in rotated.iter().enumerate().take(dim_padded) {
+        for &x in rotated.iter().take(dim_padded) {
             norm_sq += x * x;
             abs_sum += x.abs();
-            if x >= 0.0 {
-                code[i / 64] |= 1u64 << (i % 64);
-            }
         }
         let factor = if abs_sum > 0.0 {
             norm_sq * (dim_padded as f32).sqrt() / abs_sum
@@ -163,6 +159,23 @@ impl NodeVector {
             norm_sq,
             factor,
             dim_padded,
+        }
+    }
+
+    /// Hamming distance (as `f32`) between this node's sign code and a query's
+    /// sign `code` — the popcount fast path for binary navigation. Only valid
+    /// for `Binary` nodes (the only kind present under binary quantization).
+    #[inline]
+    fn hamming(&self, query_code: &[u64]) -> f32 {
+        match self {
+            NodeVector::Binary { code, .. } => {
+                let mut d = 0u32;
+                for (a, b) in code.iter().zip(query_code) {
+                    d += (a ^ b).count_ones();
+                }
+                d as f32
+            }
+            _ => f32::MAX,
         }
     }
 
@@ -232,6 +245,42 @@ impl NodeVector {
                     .sum()
             }
             NodeVector::Binary { .. } => self.dist_sq(query),
+        }
+    }
+}
+
+/// Pack the sign bits of `rotated` (≥0 ⇒ bit set) into 64-bit words.
+fn pack_sign_code(rotated: &[f32], dim_padded: usize) -> Vec<u64> {
+    let mut code = vec![0u64; dim_padded.div_ceil(64)];
+    for (i, &x) in rotated.iter().enumerate().take(dim_padded) {
+        if x >= 0.0 {
+            code[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    code
+}
+
+/// How the graph traversal scores a candidate node against the query. Built
+/// once per search/insert and passed down to the layer searches, so the hot
+/// loop dispatches on a cheap enum rather than re-deciding per node.
+enum Scorer<'a> {
+    /// Full (or `coarse`-prefix) f32 distance against the query — the query is
+    /// in the original space, or the rotated space under binary quantization.
+    Float {
+        query: &'a [f32],
+        coarse: Option<usize>,
+    },
+    /// Popcount Hamming distance against a precomputed query sign code — the
+    /// binary fast path (no float ops during navigation).
+    Hamming { code: &'a [u64] },
+}
+
+impl Scorer<'_> {
+    #[inline]
+    fn score(&self, v: &NodeVector) -> f32 {
+        match self {
+            Scorer::Float { query, coarse } => v.dist_sq_coarse(query, *coarse),
+            Scorer::Hamming { code } => v.hamming(code),
         }
     }
 }
@@ -380,24 +429,38 @@ impl HnswIndex {
         // Compute random layer using exponential distribution
         let node_layer = self.random_layer();
 
-        // Binary quantization navigates the graph in a rotated basis (so 1-bit
-        // sign codes are a good estimator); `search_vec` is the query used for
-        // all neighbor searches below — rotated when binary, raw otherwise.
-        let (node_vector, rotated) = if self.params.binary_quantize {
+        // Binary quantization navigates the graph in a rotated basis via the
+        // Hamming (popcount) fast path; otherwise it scores with full f32
+        // distance. `search_vec` is the rotated/raw query used for the more
+        // accurate neighbor *selection* step.
+        let (node_vector, rotated, query_code) = if self.params.binary_quantize {
             let mut rot = self.rotation.write();
             if rot.is_none() {
                 *rot = Some(Rotation::new(vector.len(), ROTATION_SEED));
             }
             let r = rot.as_ref().unwrap();
             let rotated = r.apply(&vector);
+            let code = pack_sign_code(&rotated, r.dim_padded);
             (
                 NodeVector::new_binary(&rotated, r.dim_padded),
                 Some(rotated),
+                Some(code),
             )
         } else {
-            (NodeVector::new(vector.clone(), self.params.quantize), None)
+            (
+                NodeVector::new(vector.clone(), self.params.quantize),
+                None,
+                None,
+            )
         };
         let search_vec: &[f32] = rotated.as_deref().unwrap_or(&vector);
+        let scorer = match &query_code {
+            Some(code) => Scorer::Hamming { code },
+            None => Scorer::Float {
+                query: search_vec,
+                coarse: None,
+            },
+        };
 
         let mut node = HnswNode {
             id,
@@ -429,8 +492,7 @@ impl HnswIndex {
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
             if curr_ep_exists {
-                let (nearest, _) =
-                    self.search_layer_greedy(search_vec, &[curr_ep], lc, 1, &nodes, None);
+                let (nearest, _) = self.search_layer_greedy(&scorer, &[curr_ep], lc, 1, &nodes);
                 if let Some(nearest_id) = nearest.into_iter().next() {
                     curr_ep = nearest_id;
                     curr_ep_exists = nodes.contains_key(&nearest_id);
@@ -444,14 +506,8 @@ impl HnswIndex {
 
         for lc in (0..=start_layer).rev() {
             // Search for neighbors at this layer
-            let (candidates, _) = self.search_layer_beam(
-                search_vec,
-                &ep_set,
-                lc,
-                self.params.ef_construction,
-                &nodes,
-                None,
-            );
+            let (candidates, _) =
+                self.search_layer_beam(&scorer, &ep_set, lc, self.params.ef_construction, &nodes);
 
             // Select M (or M0 at layer 0) best neighbors
             let m = if lc == 0 {
@@ -524,43 +580,61 @@ impl HnswIndex {
             None => return Vec::new(),
         };
 
-        // In binary mode the graph lives in the rotated basis, so rotate the
-        // query once and navigate with it.
-        let rotated = self.rotation.read().as_ref().map(|r| r.apply(query));
+        // Rotate (and sign-code) the query once for binary mode; the graph then
+        // navigates via the Hamming popcount fast path and the final candidates
+        // are refined with the accurate asymmetric estimator.
+        let (rotated, query_code) = {
+            let rot = self.rotation.read();
+            match rot.as_ref() {
+                Some(r) => {
+                    let rv = r.apply(query);
+                    let code = pack_sign_code(&rv, r.dim_padded);
+                    (Some(rv), Some(code))
+                }
+                None => (None, None),
+            }
+        };
         // Matryoshka coarse pass — navigate with a dimension prefix, then refine
-        // the final candidates at full dimension. Disabled under rotation
-        // (binary), where prefixes are meaningless.
-        let coarse = if rotated.is_some() {
+        // the final candidates at full dimension. Disabled under binary mode,
+        // where prefixes of the rotated vector are meaningless.
+        let coarse = if query_code.is_some() {
             None
         } else {
             self.params.coarse_dim.filter(|&d| d > 0 && d < query.len())
         };
         let query: &[f32] = rotated.as_deref().unwrap_or(query);
+        let scorer = match &query_code {
+            Some(code) => Scorer::Hamming { code },
+            None => Scorer::Float { query, coarse },
+        };
+        // A coarse or binary (Hamming) navigation is approximate, so the top-k
+        // is re-scored at full fidelity before returning.
+        let refine = query_code.is_some() || coarse.is_some();
 
         // Greedy descent from top layer to layer 1
         let mut curr_ep = ep;
         let global_max = *max_layer;
 
         for lc in (1..=global_max).rev() {
-            let (nearest, _) = self.search_layer_greedy(query, &[curr_ep], lc, 1, &nodes, coarse);
+            let (nearest, _) = self.search_layer_greedy(&scorer, &[curr_ep], lc, 1, &nodes);
             if let Some(nearest_id) = nearest.into_iter().next() {
                 curr_ep = nearest_id;
             }
         }
 
-        // Beam search at layer 0. With a coarse pass, over-fetch candidates so
-        // the full-dimension refine below has a good pool to re-rank.
-        let ef = if coarse.is_some() {
+        // Beam search at layer 0. When refining, over-fetch candidates so the
+        // re-score below has a good pool to re-rank.
+        let ef = if refine {
             self.params.ef_search.max(k * 4)
         } else {
             self.params.ef_search.max(k)
         };
-        let (candidates, distances) =
-            self.search_layer_beam(query, &[curr_ep], 0, ef, &nodes, coarse);
+        let (candidates, distances) = self.search_layer_beam(&scorer, &[curr_ep], 0, ef, &nodes);
 
-        // Take top-k. Under a coarse pass, re-score candidates at full dimension
-        // so the returned ranking is exact; otherwise use the beam's distances.
-        let mut results: Vec<(ObjectId, f32)> = if coarse.is_some() {
+        // Take top-k. When navigation was approximate, re-score candidates with
+        // the accurate distance (full-dim for coarse, asymmetric RaBitQ
+        // estimator for binary); otherwise use the beam's distances directly.
+        let mut results: Vec<(ObjectId, f32)> = if refine {
             candidates
                 .iter()
                 .map(|&id| {
@@ -654,15 +728,14 @@ impl HnswIndex {
     /// Greedy 1-nearest-neighbor search on a single layer.
     fn search_layer_greedy(
         &self,
-        query: &[f32],
+        scorer: &Scorer,
         entry_points: &[ObjectId],
         layer: usize,
         _ef: usize,
         nodes: &NodeMap,
-        coarse: Option<usize>,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         let mut best_id = entry_points[0];
-        let mut best_dist = nodes[&best_id].vector.dist_sq_coarse(query, coarse);
+        let mut best_dist = scorer.score(&nodes[&best_id].vector);
 
         loop {
             let mut improved = false;
@@ -670,7 +743,7 @@ impl HnswIndex {
             if let Some(neighbor_set) = nodes.get(&best_id).and_then(|n| n.neighbors.get(&layer)) {
                 for &neighbor_id in neighbor_set {
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = neighbor.vector.dist_sq_coarse(query, coarse);
+                        let dist = scorer.score(&neighbor.vector);
                         if dist < best_dist {
                             best_dist = dist;
                             best_id = neighbor_id;
@@ -691,12 +764,11 @@ impl HnswIndex {
     /// Beam search on a single layer.
     fn search_layer_beam(
         &self,
-        query: &[f32],
+        scorer: &Scorer,
         entry_points: &[ObjectId],
         layer: usize,
         ef: usize,
         nodes: &NodeMap,
-        coarse: Option<usize>,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         #[derive(Debug)]
         struct Candidate {
@@ -753,7 +825,7 @@ impl HnswIndex {
         let mut results: BinaryHeap<WorstCandidate> = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = nodes[&ep].vector.dist_sq_coarse(query, coarse);
+            let dist = scorer.score(&nodes[&ep].vector);
             candidates.push(Candidate {
                 id: ep,
                 dist: OrdFloat(dist),
@@ -786,7 +858,7 @@ impl HnswIndex {
                         continue;
                     }
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = neighbor.vector.dist_sq_coarse(query, coarse);
+                        let dist = scorer.score(&neighbor.vector);
                         let od = OrdFloat(dist);
 
                         let should_add = results.len() < ef
