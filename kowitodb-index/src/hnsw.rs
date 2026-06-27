@@ -26,6 +26,50 @@ type IdSet = HashSet<ObjectId, ahash::RandomState>;
 /// Node map keyed by object id, ahash-hashed for the same reason.
 type NodeMap = HashMap<ObjectId, HnswNode, ahash::RandomState>;
 
+/// int8 quantization scale. Assumes ~unit-norm vectors (components in [-1, 1]),
+/// as produced by the embedding models KowitoDB uses.
+const QUANT_SCALE: f32 = 127.0;
+
+/// Stored vector — either full f32 precision or int8-quantized (4× smaller).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum NodeVector {
+    Full(Vec<f32>),
+    /// Scalar-quantized to int8 at `QUANT_SCALE`; dequantized on the fly.
+    Quantized(Vec<i8>),
+}
+
+impl NodeVector {
+    /// Build from a full-precision vector, quantizing if requested.
+    fn new(vector: Vec<f32>, quantize: bool) -> Self {
+        if quantize {
+            NodeVector::Quantized(
+                vector
+                    .iter()
+                    .map(|x| (x * QUANT_SCALE).round().clamp(-127.0, 127.0) as i8)
+                    .collect(),
+            )
+        } else {
+            NodeVector::Full(vector)
+        }
+    }
+
+    /// Squared Euclidean distance to a full-precision query vector.
+    #[inline]
+    fn dist_sq(&self, query: &[f32]) -> f32 {
+        match self {
+            NodeVector::Full(v) => squared_dist(query, v),
+            NodeVector::Quantized(q) => query
+                .iter()
+                .zip(q)
+                .map(|(x, &qi)| {
+                    let d = x - qi as f32 / QUANT_SCALE;
+                    d * d
+                })
+                .sum(),
+        }
+    }
+}
+
 /// A float wrapper that provides total ordering for BinaryHeap use.
 #[derive(Debug, Clone, Copy)]
 struct OrdFloat(f32);
@@ -51,7 +95,7 @@ impl Ord for OrdFloat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HnswNode {
     id: ObjectId,
-    vector: Embedding,
+    vector: NodeVector,
     max_layer: usize,
     /// Per-layer neighbor sets: layer → set of neighbor IDs.
     neighbors: HashMap<usize, IdSet>,
@@ -70,6 +114,10 @@ pub struct HnswParams {
     pub m_max: usize,
     /// Multiplier for M at layer 0 (typically 2*M).
     pub m0: usize,
+    /// Store vectors int8-quantized (4× less memory, slight recall cost).
+    /// Off by default; best for normalized embeddings.
+    #[serde(default)]
+    pub quantize: bool,
 }
 
 impl Default for HnswParams {
@@ -84,6 +132,7 @@ impl Default for HnswParams {
             ef_search: 200,
             m_max: m,
             m0: 2 * m,
+            quantize: false,
         }
     }
 }
@@ -143,7 +192,7 @@ impl HnswIndex {
 
         let mut node = HnswNode {
             id,
-            vector: vector.clone(),
+            vector: NodeVector::new(vector.clone(), self.params.quantize),
             max_layer: node_layer,
             neighbors: HashMap::new(),
         };
@@ -361,7 +410,7 @@ impl HnswIndex {
         nodes: &NodeMap,
     ) -> (Vec<ObjectId>, Vec<f32>) {
         let mut best_id = entry_points[0];
-        let mut best_dist = squared_dist(query, &nodes[&best_id].vector);
+        let mut best_dist = nodes[&best_id].vector.dist_sq(query);
 
         loop {
             let mut improved = false;
@@ -369,7 +418,7 @@ impl HnswIndex {
             if let Some(neighbor_set) = nodes.get(&best_id).and_then(|n| n.neighbors.get(&layer)) {
                 for &neighbor_id in neighbor_set {
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = squared_dist(query, &neighbor.vector);
+                        let dist = neighbor.vector.dist_sq(query);
                         if dist < best_dist {
                             best_dist = dist;
                             best_id = neighbor_id;
@@ -451,7 +500,7 @@ impl HnswIndex {
         let mut results: BinaryHeap<WorstCandidate> = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = squared_dist(query, &nodes[&ep].vector);
+            let dist = nodes[&ep].vector.dist_sq(query);
             candidates.push(Candidate {
                 id: ep,
                 dist: OrdFloat(dist),
@@ -484,7 +533,7 @@ impl HnswIndex {
                         continue;
                     }
                     if let Some(neighbor) = nodes.get(&neighbor_id) {
-                        let dist = squared_dist(query, &neighbor.vector);
+                        let dist = neighbor.vector.dist_sq(query);
                         let od = OrdFloat(dist);
 
                         let should_add = results.len() < ef
@@ -540,7 +589,7 @@ impl HnswIndex {
         let mut scored: Vec<(ObjectId, f32)> = candidates
             .iter()
             .map(|&id| {
-                let dist = squared_dist(query, &nodes[&id].vector);
+                let dist = nodes[&id].vector.dist_sq(query);
                 (id, dist)
             })
             .collect();
@@ -570,6 +619,34 @@ fn squared_dist(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quantized_index_search() {
+        // int8-quantized index: exact matches stay top-1 despite quantization.
+        let idx = HnswIndex::new(HnswParams {
+            m: 8,
+            ef_construction: 50,
+            ef_search: 50,
+            quantize: true,
+            ..Default::default()
+        });
+        let mut items = Vec::new();
+        for i in 0..100 {
+            let id = uuid::Uuid::new_v4();
+            // Components in [-1, 1], matching the quantization assumption.
+            let v: Vec<f32> = (0..16).map(|j| ((i * 7 + j * 3) as f32).sin()).collect();
+            idx.insert(id, v.clone());
+            items.push((id, v));
+        }
+
+        let (qid, qv) = &items[42];
+        let results = idx.search(qv, 5);
+        assert_eq!(results.len(), 5);
+        assert_eq!(
+            results[0].0, *qid,
+            "exact match should remain top-1 under int8 quantization"
+        );
+    }
 
     #[test]
     fn test_hnsw_insert_and_search() {

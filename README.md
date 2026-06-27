@@ -182,6 +182,7 @@ is unset the server uses a deterministic dev proxy; set it to use a real model:
 | `KOWITODB_OPENAI_BASE_URL` | Override the OpenAI-compatible base URL (default `https://api.openai.com/v1`). |
 | `KOWITODB_EMBEDDING_MODEL` | Model name (default `text-embedding-3-small`, or `nomic-embed-text` for Ollama). |
 | `KOWITODB_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`). |
+| `KOWITODB_VECTOR_QUANTIZE` | `1` to int8-quantize stored vectors (~4× less memory, ~few points recall). Off by default. |
 
 Logging is controlled by `RUST_LOG` (via `tracing-subscriber`'s `EnvFilter`);
 it defaults to `info`:

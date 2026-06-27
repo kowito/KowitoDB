@@ -213,5 +213,27 @@ fn main() {
             "  sharded recall@{k}: {:.1}%",
             hits as f64 / total as f64 * 100.0
         );
+
+        // int8-quantized index: ~4x less vector memory, measured recall.
+        let qindex = ShardedHnswIndex::new(
+            shards,
+            HnswParams {
+                ef_search,
+                quantize: true,
+                ..Default::default()
+            },
+        );
+        qindex.build_parallel(data.iter().map(|(id, v)| (*id, v.clone())).collect());
+        let mut qhits = 0usize;
+        let mut qtotal = 0usize;
+        for q in &query_vecs {
+            let approx = qindex.search(q, k);
+            let truth: std::collections::HashSet<Uuid> =
+                brute_force_topk(q, &data, k).into_iter().collect();
+            qhits += approx.iter().filter(|(id, _)| truth.contains(id)).count();
+            qtotal += k;
+        }
+        println!("Quantized int8 ({shards} shards, ~4x less vector memory):");
+        println!("  recall@{k}: {:.1}%", qhits as f64 / qtotal as f64 * 100.0);
     }
 }

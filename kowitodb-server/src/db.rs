@@ -34,6 +34,22 @@ fn vector_shard_count() -> usize {
         .clamp(1, 16)
 }
 
+/// Whether to int8-quantize stored vectors (4× less memory), via
+/// `KOWITODB_VECTOR_QUANTIZE=1`. Off by default.
+fn vector_quantize_enabled() -> bool {
+    std::env::var("KOWITODB_VECTOR_QUANTIZE")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
+}
+
+/// Vector-index parameters built from the environment.
+fn vector_index_params() -> HnswParams {
+    HnswParams {
+        quantize: vector_quantize_enabled(),
+        ..Default::default()
+    }
+}
+
 /// Bounded LRU cache of object content keyed by id, used to avoid storage
 /// round-trips for hot objects without growing without limit.
 struct ContentCache(Mutex<LruCache<ObjectId, String>>);
@@ -180,7 +196,7 @@ impl KowitoDBEngine {
             storage,
             hnsw_index: Arc::new(ShardedHnswIndex::new(
                 vector_shard_count(),
-                HnswParams::default(),
+                vector_index_params(),
             )),
             vector_index: Arc::new(VectorIndex::new()),
             fulltext_index: Arc::new(fulltext_index),

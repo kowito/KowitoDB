@@ -73,6 +73,15 @@ Sharded recall is **equal or better** than the single index (each shard is a
 smaller, more accurate graph; the per-shard top-k are merged): ~100% recall@10
 at 10 shards on this workload vs ~94% single-index.
 
+### Quantization (memory vs. recall)
+
+int8 scalar quantization (`HnswParams { quantize: true }`, or
+`KOWITODB_VECTOR_QUANTIZE=1` on the server) stores vectors at **~4× less
+memory** — the key lever for fitting more vectors in RAM. On this workload it
+costs a few points of recall: **~91% recall@10** (vs ~100% sharded full
+precision). It assumes ~unit-norm embeddings (the models KowitoDB uses produce
+these). Off by default.
+
 ## Optimizations
 
 The hot path (graph traversal + distance) was tuned without changing recall:
