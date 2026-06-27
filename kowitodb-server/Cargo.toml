@@ -52,6 +52,14 @@ local-embeddings = [
     "dep:tokenizers",
     "dep:hf-hub",
 ]
+# On-device Candle cross-encoder reranker (KOWITODB_RERANKER_PROVIDER=local).
+cross-encoder-rerank = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+]
 
 [build-dependencies]
 tonic-build = "0.12"

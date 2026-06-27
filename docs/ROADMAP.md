@@ -39,13 +39,19 @@ metadata + keywords) while storage returns the original content.
 - **Follow-up (📋):** LLM-generated context (faithful Anthropic version) behind an
   optional generative-client hook.
 
-### 2. Reranking — RRF fusion ✅ done · cross-encoder 📋 planned
+### 2. Reranking — RRF fusion ✅ done · cross-encoder ✅ shipped (v0.19.0)
 - ✅ **Already present:** the reranker does Reciprocal Rank Fusion across
   vector/BM25/graph/metadata/time with per-source weights, multi-source boosting,
   and normalization (`Reranker::rerank`).
-- 📋 **Remaining:** a learned **cross-encoder reranker** (the step that takes
-  Anthropic's 49% → 67%). Plan: on-device Candle `bge-reranker` behind a feature,
-  mirroring local-embeddings (compile-verifiable; runtime needs the model).
+- ✅ **Shipped (v0.19):** a learned **cross-encoder reranker** (the step that takes
+  Anthropic's 49% → 67%). A `CrossEncoder` trait (`rerank.rs`) is always compiled
+  so the engine can hold an optional second-stage reranker; the on-device Candle
+  `bge-reranker-base` impl (`BertForSequenceClassification`: BERT encoder + a
+  single-logit `[CLS]` head) is behind the `cross-encoder-rerank` feature,
+  mirroring local-embeddings. Enabled via `KOWITODB_RERANKER_PROVIDER=local`;
+  `ask()` re-scores and re-sorts the loaded top-k through it after RRF fusion.
+  Trait + wiring are unit-tested with a mock; the Candle path is compile-verified
+  (runtime needs the HF model). `KOWITODB_RERANKER_MODEL` overrides the model.
 
 ### CRAG-style corrective gate — ✅ shipped (v0.10.0)
 When retrieval confidence is low (few results / little cross-source agreement),

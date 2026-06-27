@@ -7,6 +7,7 @@ mod local_embedding;
 mod memory;
 mod metrics;
 mod openai;
+mod rerank;
 mod service;
 
 pub use cluster::{Cluster, ClusterService};

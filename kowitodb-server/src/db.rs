@@ -21,6 +21,7 @@ use crate::embedding::{EmbeddingClient, ProxyEmbeddingClient};
 use crate::memory::{AgentMemory, TurnRole};
 use crate::openai::{OpenAiConfig, OpenAiEmbeddingClient};
 use crate::proto;
+use crate::rerank::CrossEncoder;
 
 /// Maximum number of object contents held in the in-memory LRU cache. On a
 /// miss, content is reloaded from storage, so this only bounds memory use.
@@ -178,6 +179,8 @@ pub struct KowitoDBEngine {
     /// Index directory; when set, the vector index is persisted here as a
     /// snapshot (`None` for in-memory engines).
     index_path: Option<std::path::PathBuf>,
+    /// Optional second-stage cross-encoder reranker (re-scores the top results).
+    reranker_model: Option<Arc<dyn CrossEncoder>>,
     #[allow(dead_code)]
     default_model: String,
 }
@@ -285,6 +288,7 @@ impl KowitoDBEngine {
             plan_cache: Arc::new(plan_cache),
             content_cache: Arc::new(ContentCache::new(CONTENT_CACHE_CAP)),
             index_path,
+            reranker_model: select_reranker(),
             default_model: "default".to_string(),
         }
     }
@@ -727,6 +731,9 @@ impl KowitoDBEngine {
         let limited: Vec<RankedResult> = ranked.into_iter().take(max_results).collect();
         let loaded = self.load_results(&limited).await;
 
+        // Second-stage cross-encoder rerank of the top results (when configured).
+        let loaded = self.apply_cross_encoder(question, loaded).await;
+
         // Assemble optimized context from loaded content
         let assembled = self.assemble_context_from_loaded(&loaded, max_context_tokens);
         self.cost_tracker
@@ -738,6 +745,34 @@ impl KowitoDBEngine {
             format!("{:?}", intent.intent),
             assembled,
         ))
+    }
+
+    /// Re-score loaded results with the cross-encoder (joint query↔document
+    /// relevance) and re-sort. No-op when no reranker is configured.
+    async fn apply_cross_encoder(
+        &self,
+        query: &str,
+        mut loaded: Vec<LoadedResult>,
+    ) -> Vec<LoadedResult> {
+        let Some(reranker) = &self.reranker_model else {
+            return loaded;
+        };
+        if loaded.is_empty() {
+            return loaded;
+        }
+        let docs: Vec<String> = loaded.iter().map(|l| l.content.clone()).collect();
+        let scores = reranker.rerank(query, &docs).await;
+        if scores.len() == loaded.len() {
+            for (l, s) in loaded.iter_mut().zip(scores) {
+                l.relevance_score = s;
+            }
+            loaded.sort_by(|a, b| {
+                b.relevance_score
+                    .partial_cmp(&a.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        loaded
     }
 
     /// Load real content for ranked results from cache + storage.
@@ -1212,6 +1247,41 @@ pub struct StatsResponse {
 /// The deterministic dev embedding fallback (no network, not semantic).
 fn proxy_embedding_client() -> Arc<dyn EmbeddingClient> {
     Arc::new(ProxyEmbeddingClient::new("proxy-text-embedding", 128))
+}
+
+/// Select the optional cross-encoder reranker from `KOWITODB_RERANKER_PROVIDER`
+/// (`local` → on-device Candle, requires the `cross-encoder-rerank` feature).
+/// Returns `None` when unset/unavailable, leaving the RRF ranking in place.
+fn select_reranker() -> Option<Arc<dyn CrossEncoder>> {
+    let provider = std::env::var("KOWITODB_RERANKER_PROVIDER")
+        .unwrap_or_default()
+        .to_lowercase();
+    if provider != "local" {
+        return None;
+    }
+    #[cfg(feature = "cross-encoder-rerank")]
+    {
+        let model = std::env::var("KOWITODB_RERANKER_MODEL")
+            .unwrap_or_else(|_| crate::rerank::DEFAULT_RERANKER_MODEL.to_string());
+        match crate::rerank::CandleCrossEncoder::load(&model) {
+            Ok(reranker) => {
+                info!("Reranker: on-device cross-encoder ({model})");
+                Some(Arc::new(reranker))
+            }
+            Err(e) => {
+                tracing::error!("Failed to load cross-encoder ({e}); using RRF ranking only");
+                None
+            }
+        }
+    }
+    #[cfg(not(feature = "cross-encoder-rerank"))]
+    {
+        tracing::warn!(
+            "KOWITODB_RERANKER_PROVIDER=local but built without the \
+             cross-encoder-rerank feature; using RRF ranking only"
+        );
+        None
+    }
 }
 
 /// Select the embedding client from `KOWITODB_EMBEDDING_PROVIDER`:
@@ -1818,6 +1888,48 @@ mod tests {
         assert!(
             hp.unwrap() < lp.unwrap(),
             "higher-importance object should rank above the lower-importance one"
+        );
+    }
+
+    struct MockReranker;
+    #[async_trait::async_trait]
+    impl CrossEncoder for MockReranker {
+        async fn rerank(&self, _query: &str, documents: &[String]) -> Vec<f32> {
+            // Score documents mentioning "beta" much higher.
+            documents
+                .iter()
+                .map(|d| if d.contains("beta") { 10.0 } else { 1.0 })
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cross_encoder_reranks_results() {
+        let mut engine = KowitoDBEngine::new_in_memory().unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("enterprise widget alpha")
+                    .with_keywords(vec!["enterprise".into()]),
+            )
+            .await
+            .unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("enterprise widget beta")
+                    .with_keywords(vec!["enterprise".into()]),
+            )
+            .await
+            .unwrap();
+
+        // Inject a cross-encoder that prefers "beta"; it should reorder results.
+        engine.reranker_model = Some(std::sync::Arc::new(MockReranker));
+        let resp = engine.ask("enterprise widget", 5).await.unwrap();
+        assert!(
+            resp.results
+                .first()
+                .map(|r| r.content.contains("beta"))
+                .unwrap_or(false),
+            "cross-encoder's preferred document should rank first"
         );
     }
 

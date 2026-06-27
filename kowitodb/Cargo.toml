@@ -27,3 +27,5 @@ serde_json.workspace = true
 lance = ["kowitodb-server/lance"]
 # Build the CLI with the on-device Candle embedding model (KOWITODB_EMBEDDING_PROVIDER=local).
 local-embeddings = ["kowitodb-server/local-embeddings"]
+# Build the CLI with the on-device Candle cross-encoder reranker (KOWITODB_RERANKER_PROVIDER=local).
+cross-encoder-rerank = ["kowitodb-server/cross-encoder-rerank"]
