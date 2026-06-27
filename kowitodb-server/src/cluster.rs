@@ -23,6 +23,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kowitodb_core::ObjectId;
@@ -177,6 +178,9 @@ impl ClusterNode for RemoteNode {
 /// The distributed coordinator over a set of data nodes.
 pub struct Cluster {
     nodes: Vec<Arc<dyn ClusterNode>>,
+    /// Proactively-tracked health per node (aligned with `nodes`). Reads skip
+    /// nodes marked unhealthy; the heartbeat and per-request outcomes update it.
+    health: Vec<AtomicBool>,
     replication_factor: usize,
     /// Minimum replica acks required for a write to succeed (durability).
     write_quorum: usize,
@@ -186,10 +190,45 @@ impl Cluster {
     /// Build a cluster from already-constructed nodes (write_quorum = 1).
     pub fn new(nodes: Vec<Arc<dyn ClusterNode>>, replication_factor: usize) -> Self {
         let n = nodes.len().max(1);
+        let health = (0..nodes.len()).map(|_| AtomicBool::new(true)).collect();
         Self {
             nodes,
+            health,
             replication_factor: replication_factor.clamp(1, n),
             write_quorum: 1,
+        }
+    }
+
+    fn is_healthy(&self, i: usize) -> bool {
+        self.health[i].load(Ordering::Relaxed)
+    }
+
+    /// Update a node's health, logging up/down transitions.
+    fn set_health(&self, i: usize, healthy: bool) {
+        let prev = self.health[i].swap(healthy, Ordering::Relaxed);
+        if prev != healthy {
+            if healthy {
+                info!("Cluster: node {i} recovered (healthy)");
+            } else {
+                warn!("Cluster: node {i} marked unhealthy");
+            }
+        }
+    }
+
+    /// Number of nodes currently considered healthy.
+    pub fn healthy_count(&self) -> usize {
+        (0..self.nodes.len())
+            .filter(|&i| self.is_healthy(i))
+            .count()
+    }
+
+    /// Probe every node once (cheap `stats` call) and update health. Run
+    /// periodically by the gateway so down nodes are detected and recovered
+    /// without waiting for a request to hit them.
+    pub async fn heartbeat_once(&self) {
+        for i in 0..self.nodes.len() {
+            let ok = self.nodes[i].stats(proto::StatsRequest {}).await.is_ok();
+            self.set_health(i, ok);
         }
     }
 
@@ -305,8 +344,12 @@ impl Cluster {
         let mut last_err = None;
         for &i in replicas {
             match f(self.nodes[i].clone()).await {
-                Ok(()) => acks += 1,
+                Ok(()) => {
+                    self.set_health(i, true);
+                    acks += 1;
+                }
                 Err(e) => {
+                    self.set_health(i, false);
                     warn!("write to replica {i} failed: {e}");
                     last_err = Some(e);
                 }
@@ -548,27 +591,44 @@ impl Cluster {
         })
     }
 
-    /// Run `f` against every node in parallel. Tolerates partial failure (drops
-    /// errored nodes), but errors if **every** node failed — so callers can tell
-    /// "no matches" (empty Ok) from "cluster unavailable" (Err).
+    /// Run `f` against every **healthy** node in parallel, updating health from
+    /// the outcomes. Tolerates partial failure (drops errored nodes), but errors
+    /// if no healthy node responds — so callers can tell "no matches" (empty Ok)
+    /// from "cluster unavailable" (Err).
     async fn scatter<F, Fut, T>(&self, f: F) -> Result<Vec<T>, Status>
     where
         F: Fn(Arc<dyn ClusterNode>) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
-        let futures = self.nodes.iter().map(|n| f(n.clone()));
-        let outcomes = futures::future::join_all(futures).await;
-        let total = outcomes.len();
+        let candidates: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.is_healthy(i))
+            .collect();
+        if candidates.is_empty() && !self.nodes.is_empty() {
+            return Err(Status::unavailable("no healthy cluster nodes"));
+        }
 
-        let mut oks = Vec::with_capacity(total);
+        let futures = candidates.iter().map(|&i| {
+            let fut = f(self.nodes[i].clone());
+            async move { (i, fut.await) }
+        });
+        let outcomes = futures::future::join_all(futures).await;
+        let attempted = outcomes.len();
+
+        let mut oks = Vec::with_capacity(attempted);
         let mut last_err = None;
-        for outcome in outcomes {
+        for (i, outcome) in outcomes {
             match outcome {
-                Ok(v) => oks.push(v),
-                Err(e) => last_err = Some(e),
+                Ok(v) => {
+                    self.set_health(i, true);
+                    oks.push(v);
+                }
+                Err(e) => {
+                    self.set_health(i, false);
+                    last_err = Some(e);
+                }
             }
         }
-        if oks.is_empty() && total > 0 {
+        if oks.is_empty() && attempted > 0 {
             return Err(last_err.unwrap_or_else(|| Status::unavailable("all cluster nodes failed")));
         }
         Ok(oks)
@@ -583,10 +643,8 @@ pub struct ClusterService {
 }
 
 impl ClusterService {
-    pub fn new(cluster: Cluster) -> Self {
-        Self {
-            cluster: Arc::new(cluster),
-        }
+    pub fn new(cluster: Arc<Cluster>) -> Self {
+        Self { cluster }
     }
 }
 
@@ -1001,5 +1059,47 @@ mod tests {
             cluster.search(query()).await.is_err(),
             "total outage must surface as an error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_health_gating_and_recovery() {
+        let (cluster, mocks) = cluster(3, 1);
+        // Pin ids 0..6 → nodes 0,1,2,0,1,2 (2 objects per node) for determinism.
+        for k in 0..6u128 {
+            cluster
+                .insert(proto::InsertRequest {
+                    content: format!("widget {k}"),
+                    id: Some(uuid::Uuid::from_u128(k).to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let query = || proto::SearchRequest {
+            query: "widget".into(),
+            top_k: 50,
+            ..Default::default()
+        };
+
+        assert_eq!(cluster.search(query()).await.unwrap().results.len(), 6);
+        assert_eq!(cluster.healthy_count(), 3);
+
+        // Mark node 0 unhealthy → its 2 objects are skipped on reads.
+        cluster.set_health(0, false);
+        assert_eq!(cluster.healthy_count(), 2);
+        assert_eq!(cluster.search(query()).await.unwrap().results.len(), 4);
+
+        // Heartbeat probes the (healthy) mocks → node 0 recovers → all visible.
+        cluster.heartbeat_once().await;
+        assert_eq!(cluster.healthy_count(), 3);
+        assert_eq!(cluster.search(query()).await.unwrap().results.len(), 6);
+
+        // A genuinely-down node is detected by the heartbeat and recovered on fix.
+        mocks[1].set_fail(true);
+        cluster.heartbeat_once().await;
+        assert!(!cluster.is_healthy(1));
+        mocks[1].set_fail(false);
+        cluster.heartbeat_once().await;
+        assert!(cluster.is_healthy(1));
     }
 }

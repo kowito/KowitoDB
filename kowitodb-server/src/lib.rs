@@ -151,13 +151,28 @@ pub async fn serve_gateway(
     replication_factor: usize,
     write_quorum: usize,
 ) -> anyhow::Result<()> {
-    let cluster = Cluster::connect(&peers, replication_factor, write_quorum).await?;
+    let cluster = Arc::new(Cluster::connect(&peers, replication_factor, write_quorum).await?);
     info!(
         "KowitoDB gateway: {} data node(s), replication_factor={}, write_quorum={}",
         cluster.node_count(),
         replication_factor,
         write_quorum
     );
+
+    // Heartbeat: probe data nodes periodically so down nodes are skipped on reads
+    // and recovered automatically, without waiting for a request to discover them.
+    {
+        let cluster = cluster.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                cluster.heartbeat_once().await;
+            }
+        });
+    }
+
     let service = ClusterService::new(cluster);
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
