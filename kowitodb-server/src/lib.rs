@@ -13,7 +13,7 @@ mod service;
 
 pub use cluster::{Cluster, ClusterService};
 pub use config::ServerConfig;
-pub use db::KowitoDBEngine;
+pub use db::{CommunitySummary, KowitoDBEngine};
 pub use embedding::{EmbeddingClient, EmbeddingResult, ProxyEmbeddingClient};
 pub use llm::{LlmClient, LlmConfig, OpenAiLlmClient};
 #[cfg(feature = "local-embeddings")]

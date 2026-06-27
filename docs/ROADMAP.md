@@ -10,12 +10,14 @@ research notes; each item below tags maturity and the key paper/system.
 
 **Legend:** ✅ shipped · 🔜 in progress · 📋 planned · 🔬 potential / exploratory · ⛔ deliberately not pursuing
 
-**Status (v0.27):** every roadmap item is **resolved** — shipped (✅) or a
-deliberate, documented non-goal (⛔). The ⛔ items (Raft consensus, DiskANN
-on-disk graph, ColBERT late-interaction, full distributed-SQL planner, GPU
-indexes) are each a dedicated multi-week subsystem; they are deferred with
+**Status (v0.28):** every roadmap item is **resolved** — shipped (✅) or a
+deliberate, documented non-goal (⛔). The remaining ⛔ items (Raft consensus,
+DiskANN on-disk graph, ColBERT late-interaction, full distributed-SQL planner,
+GPU indexes) are each a dedicated multi-week subsystem; they are deferred with
 rationale rather than faked. Everything buildable to a *tested, honest* state in
-this product's scope is done.
+this product's scope is done — including full GraphRAG community summarization
+(v0.28), which was previously deferred on cost grounds and is now shipped as an
+opt-in mechanism.
 
 ---
 
@@ -157,6 +159,15 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   LazyGraphRAG insight (a light extractor enriches the graph at ~0.1% of full
   GraphRAG cost) without any LLM. Default on (`KOWITODB_AUTO_GRAPH=0` disables),
   fan-out bounded. Unit-tested.
+- ✅ **Microsoft GraphRAG — full community summarization shipped (v0.28):**
+  `GraphIndex::detect_communities()` finds communities via deterministic label
+  propagation over the (auto-built) graph; `build_community_summaries()`
+  LLM-summarizes each; `global_query()` answers holistic "what are the themes?"
+  questions by **map-reduce over community summaries** (partial answer per
+  community → combined answer). Mock-tested end-to-end; degrades to a
+  deterministic digest / retrieval fallback without an LLM. **Opt-in / on
+  demand** by design — full summarization is token-expensive (~79M tokens in one
+  benchmarked config), so it is built explicitly after ingest, not per write.
 - ⛔ **Out-of-core / billion-scale (DiskANN on-disk graph):** the genuine path
   beyond RAM, but a production on-disk ANN graph (memory-mapped adjacency, SSD
   I/O scheduling, beam-search tuned for page faults) is a dedicated multi-week
@@ -220,9 +231,6 @@ strongly-consistent cluster would require.
   aggregates are pushed down and merged (v0.27); general distributed query
   planning (shuffle joins, partial GROUP BY → re-aggregate) is a query-engine
   project of its own, beyond the integrated-retrieval thesis.
-- **Heavy LLM GraphRAG (full community summarization):** task-dependent, not a
-  blanket win, and very costly to index (~79M tokens in one benchmarked config).
-  Prefer routing (#4) + cheap auto-graph enrichment (shipped) instead.
 - **Late interaction (ColBERT/PLAID)** and **DiskANN on-disk graph:** real and
   valuable, but each is a dedicated multi-week index-model rewrite — deferred as
   explicit next-major-efforts rather than faked (see "Potential / exploratory").

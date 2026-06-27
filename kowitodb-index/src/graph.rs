@@ -321,6 +321,80 @@ impl GraphIndex {
     pub fn edge_count(&self) -> usize {
         self.forward.read().values().map(|rels| rels.len()).sum()
     }
+
+    /// Detect communities via deterministic **label propagation** (edges treated
+    /// as undirected). Each node starts labeled with its own id; processed in
+    /// sorted order, every node adopts the most frequent label among its
+    /// neighbors (ties broken toward the smallest label), iterating to a fixed
+    /// point. Returns each community as a sorted group of object ids, the groups
+    /// sorted by smallest member. This is the structural basis for GraphRAG-style
+    /// community summarization.
+    pub fn detect_communities(&self) -> Vec<Vec<ObjectId>> {
+        use std::collections::HashSet;
+
+        // Build an undirected neighbor map from forward + reverse edges.
+        let mut neighbors: HashMap<ObjectId, HashSet<ObjectId>> = HashMap::new();
+        {
+            let forward = self.forward.read();
+            for (src, rels) in forward.iter() {
+                for r in rels {
+                    if r.target_id != *src {
+                        neighbors.entry(*src).or_default().insert(r.target_id);
+                        neighbors.entry(r.target_id).or_default().insert(*src);
+                    }
+                }
+            }
+        }
+        if neighbors.is_empty() {
+            return Vec::new();
+        }
+
+        let mut nodes: Vec<ObjectId> = neighbors.keys().copied().collect();
+        nodes.sort();
+        let mut labels: HashMap<ObjectId, ObjectId> = nodes.iter().map(|&n| (n, n)).collect();
+
+        const MAX_ITER: usize = 20;
+        for _ in 0..MAX_ITER {
+            let mut changed = false;
+            for &node in &nodes {
+                let nbrs = &neighbors[&node];
+                if nbrs.is_empty() {
+                    continue;
+                }
+                let mut counts: HashMap<ObjectId, usize> = HashMap::new();
+                for &nb in nbrs {
+                    *counts.entry(labels[&nb]).or_default() += 1;
+                }
+                // Most frequent label; on a tie, the smallest label id wins.
+                let best = counts
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+                    .map(|(l, _)| *l)
+                    .unwrap();
+                if labels[&node] != best {
+                    labels.insert(node, best);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut groups: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for (&node, &label) in &labels {
+            groups.entry(label).or_default().push(node);
+        }
+        let mut communities: Vec<Vec<ObjectId>> = groups
+            .into_values()
+            .map(|mut g| {
+                g.sort();
+                g
+            })
+            .collect();
+        communities.sort_by(|a, b| a[0].cmp(&b[0]));
+        communities
+    }
 }
 
 impl Default for GraphIndex {
@@ -332,6 +406,40 @@ impl Default for GraphIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_detect_communities() {
+        let graph = GraphIndex::new();
+        let rel = |t: ObjectId| Relationship {
+            relation_type: "co_mentions".into(),
+            target_id: t,
+            weight: None,
+        };
+        // Two dense clusters with no edge between them:
+        //   {a,b,c} triangle   and   {d,e} pair.
+        let ids: Vec<ObjectId> = (1..=5).map(uuid::Uuid::from_u128).collect();
+        let (a, b, c, d, e) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        graph.insert_relationships(a, &[rel(b), rel(c)]);
+        graph.insert_relationships(b, &[rel(a), rel(c)]);
+        graph.insert_relationships(c, &[rel(a), rel(b)]);
+        graph.insert_relationships(d, &[rel(e)]);
+        graph.insert_relationships(e, &[rel(d)]);
+
+        let communities = graph.detect_communities();
+        assert_eq!(
+            communities.len(),
+            2,
+            "two disconnected clusters → two communities"
+        );
+        let sizes: Vec<usize> = communities.iter().map(|c| c.len()).collect();
+        assert!(
+            sizes.contains(&3) && sizes.contains(&2),
+            "got sizes {sizes:?}"
+        );
+        // The triangle members land together.
+        let tri = communities.iter().find(|c| c.len() == 3).unwrap();
+        assert!(tri.contains(&a) && tri.contains(&b) && tri.contains(&c));
+    }
 
     #[test]
     fn test_graph_insert_and_traverse() {
