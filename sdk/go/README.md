@@ -53,6 +53,30 @@ func main() {
 	for _, r := range resp.Results {
 		fmt.Printf("[%.2f] %s\n", r.RelevanceScore, r.Content)
 	}
+
+	// Insert several objects at once
+	ids, err := db.BatchInsert(ctx, []kowitodb.InsertItem{
+		{Content: "Anthropic raised $4B in 2024", Metadata: map[string]string{"company": "Anthropic"}},
+		{Content: "Mistral raised €600M in 2024", Keywords: []string{"mistral", "funding"}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("stored:", ids)
+
+	// Page through stored objects
+	objects, total, err := db.List(ctx, 0, 50)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("showing %d of %d objects\n", len(objects), total)
+
+	// Ask / Search filtered by metadata
+	resp, err = db.Ask(ctx, "funding rounds", 10,
+		kowitodb.WithMetadataFilter(map[string]string{"company": "OpenAI"}))
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
@@ -69,12 +93,14 @@ typed response plus an `error`.
 | Method | Description |
 | --- | --- |
 | `Remember(ctx, content, ...WriteOption) (string, error)` | Store knowledge (high-level `ai.remember()`); returns the object ID. |
-| `Ask(ctx, question, maxResults) (*AskResponse, error)` | Natural-language query with automatic retrieval (`ai.ask()`). `maxResults <= 0` defaults to 10. |
+| `Ask(ctx, question, maxResults, ...QueryOption) (*AskResponse, error)` | Natural-language query with automatic retrieval (`ai.ask()`). `maxResults <= 0` defaults to 10. Accepts `WithMetadataFilter`. |
 | `Insert(ctx, content, ...WriteOption) (string, error)` | Explicitly insert a knowledge object; returns the ID. |
+| `BatchInsert(ctx, []InsertItem) ([]string, error)` | Insert multiple objects in one request; returns their IDs in order. |
 | `Get(ctx, id) (*KnowledgeObject, error)` | Fetch an object by ID; returns `(nil, nil)` if not found. |
+| `List(ctx, offset, limit) ([]KnowledgeObject, uint64, error)` | Page through stored objects; returns the page plus the total object count. `limit == 0` uses the server default. |
 | `Update(ctx, id, ...UpdateOption) (updated bool, version uint32, err error)` | Update an object in place; returns whether it changed and the new version-history length. |
 | `Delete(ctx, id) (bool, error)` | Delete by ID; returns whether it existed. |
-| `Search(ctx, query, topK) ([]SearchResult, error)` | Direct search, bypassing the AI planner. `topK <= 0` defaults to 20. |
+| `Search(ctx, query, topK, ...QueryOption) ([]SearchResult, error)` | Direct search, bypassing the AI planner. `topK <= 0` defaults to 20. Accepts `WithMetadataFilter`. |
 | `Sql(ctx, query) ([]map[string]string, error)` | Run a SQL query against the DataFusion engine; each row maps column name to value. |
 | `RecordTurn(ctx, sessionID, role, content) (uint32, error)` | Append a turn to an agent session; returns the new turn count. |
 | `GetSession(ctx, sessionID) ([]ConversationTurn, error)` | Fetch a session's turns; returns `(nil, nil)` if not found. |
@@ -88,6 +114,26 @@ typed response plus an `error`.
 - `WithMetadata(map[string]string)`
 - `WithImportance(float32)` — default `0.5`
 - `WithRelationships(...Relationship)` — `Insert` only
+
+`BatchInsert` takes a slice of `InsertItem` instead of options:
+
+```go
+type InsertItem struct {
+	Content       string
+	Keywords      []string
+	Metadata      map[string]string
+	Importance    float32        // defaults to 0.5 when zero
+	Relationships []Relationship
+}
+```
+
+### Query options
+
+`Ask` and `Search` accept functional options:
+
+- `WithMetadataFilter(map[string]string)` — restrict results to objects whose
+  metadata matches every given key/value pair (exact match, ANDed). An empty or
+  nil map means no filtering.
 
 ### Update options
 

@@ -12,6 +12,23 @@ Usage:
     for r in results.results:
         print(f"[{r.relevance_score:.2f}] {r.content}")
 
+    # Insert many objects at once -> list of ids
+    ids = db.batch_insert([
+        {"content": "Anthropic raised $4B from Amazon",
+         "keywords": ["anthropic", "funding"],
+         "metadata": {"company": "Anthropic"}, "importance": 0.8},
+        {"content": "Mistral raised €600M",
+         "metadata": {"company": "Mistral"}},
+    ])
+
+    # Scroll through stored objects (paginated)
+    page = db.list(offset=0, limit=50)
+    print(f"{len(page.objects)} of {page.total} objects")
+
+    # Metadata-filtered ask / search (exact-match, ANDed)
+    results = db.ask("funding rounds", metadata_filter={"company": "Anthropic"})
+    hits = db.search("funding", top_k=10, metadata_filter={"company": "Anthropic"})
+
     # SQL queries (returns a list of {column: value} dicts)
     rows = db.sql("SELECT * FROM knowledge WHERE metadata.company = 'OpenAI'")
     for row in rows:
@@ -128,6 +145,46 @@ class UpdateResult:
 
 
 @dataclass
+class KnowledgeObject:
+    """A stored knowledge object (as returned by list())."""
+
+    id: str
+    content: str
+    keywords: List[str] = field(default_factory=list)
+    metadata: Dict[str, str] = field(default_factory=dict)
+    importance: float = 0.0
+    created_at: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_proto(cls, p: pb.KnowledgeObject) -> "KnowledgeObject":
+        return cls(
+            id=p.id,
+            content=p.content,
+            keywords=list(p.keywords),
+            metadata=dict(p.metadata),
+            importance=p.importance,
+            created_at=p.created_at,
+            updated_at=p.updated_at,
+        )
+
+
+@dataclass
+class ListResult:
+    """Result of a list() call — a page of objects plus the total count."""
+
+    objects: List[KnowledgeObject]
+    total: int
+
+    @classmethod
+    def from_proto(cls, p: pb.ListResponse) -> "ListResult":
+        return cls(
+            objects=[KnowledgeObject.from_proto(o) for o in p.objects],
+            total=p.total,
+        )
+
+
+@dataclass
 class ConversationTurn:
     """A single turn in an agent conversation session."""
 
@@ -181,14 +238,26 @@ class KowitoDBClient:
 
     # ---- High-level AI API ----
 
-    def ask(self, question: str, max_results: int = 10) -> AskResponse:
+    def ask(
+        self,
+        question: str,
+        max_results: int = 10,
+        metadata_filter: Optional[Dict[str, str]] = None,
+    ) -> AskResponse:
         """ai.ask() — natural-language query with automatic retrieval.
 
         The engine detects intent, chooses retrieval strategies,
         searches all indexes, reranks, and returns optimized results.
+
+        ``metadata_filter`` applies exact-match metadata constraints (ANDed);
+        empty or ``None`` means no filtering.
         """
         self._ensure_connected()
-        req = pb.AskRequest(question=question, max_results=max_results)
+        req = pb.AskRequest(
+            question=question,
+            max_results=max_results,
+            metadata_filter=metadata_filter or {},
+        )
         resp = self._stub.Ask(req)
         return AskResponse.from_proto(resp)
 
@@ -262,6 +331,43 @@ class KowitoDBClient:
         resp = self._stub.Insert(req)
         return resp.id
 
+    def batch_insert(self, items: List[dict]) -> List[str]:
+        """Insert multiple knowledge objects in a single request.
+
+        Each item is a dict mirroring :meth:`insert`:
+
+            db.batch_insert([
+                {"content": "...", "metadata": {...}, "keywords": [...],
+                 "importance": 0.8},
+                {"content": "..."},
+            ])
+
+        Supported keys per item: ``content`` (required), ``keywords``,
+        ``metadata``, ``relationships`` (list of ``(relation_type, target_id)``
+        tuples), and ``importance``.
+
+        Returns the list of created object IDs, in input order.
+        """
+        self._ensure_connected()
+        proto_items = []
+        for item in items:
+            rels = [
+                pb.RelationshipInput(relation_type=r[0], target_id=r[1])
+                for r in (item.get("relationships") or [])
+            ]
+            proto_items.append(
+                pb.InsertRequest(
+                    content=item["content"],
+                    keywords=item.get("keywords") or [],
+                    metadata=item.get("metadata") or {},
+                    relationships=rels,
+                    importance=item.get("importance", 0.5),
+                )
+            )
+        req = pb.BatchInsertRequest(items=proto_items)
+        resp = self._stub.BatchInsert(req)
+        return list(resp.ids)
+
     def get(self, object_id: str) -> Optional[dict]:
         """Retrieve a knowledge object by ID."""
         self._ensure_connected()
@@ -310,12 +416,37 @@ class KowitoDBClient:
         resp = self._stub.Update(req)
         return UpdateResult.from_proto(resp)
 
-    def search(self, query: str, top_k: int = 20) -> List[SearchResult]:
-        """Direct search (bypasses the AI planner)."""
+    def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        metadata_filter: Optional[Dict[str, str]] = None,
+    ) -> List[SearchResult]:
+        """Direct search (bypasses the AI planner).
+
+        ``metadata_filter`` applies exact-match metadata constraints (ANDed);
+        empty or ``None`` means no filtering.
+        """
         self._ensure_connected()
-        req = pb.SearchRequest(query=query, top_k=top_k)
+        req = pb.SearchRequest(
+            query=query, top_k=top_k, metadata_filter=metadata_filter or {}
+        )
         resp = self._stub.Search(req)
         return [SearchResult.from_proto(r) for r in resp.results]
+
+    def list(self, offset: int = 0, limit: int = 0) -> ListResult:
+        """List stored knowledge objects (paginated scroll).
+
+        ``offset`` is the number of objects to skip; ``limit`` is the page
+        size, where ``0`` means the server default.
+
+        Returns a ``ListResult`` exposing ``objects`` (a list of
+        ``KnowledgeObject``) and ``total`` (the full object count).
+        """
+        self._ensure_connected()
+        req = pb.ListRequest(offset=offset, limit=limit)
+        resp = self._stub.List(req)
+        return ListResult.from_proto(resp)
 
     # ---- Agent conversation memory ----
 

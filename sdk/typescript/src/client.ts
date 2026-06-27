@@ -25,7 +25,11 @@ import {
   UnaryCallback,
 } from "./service";
 import type {
+  AskOptions,
+  AskRequest,
   AskResponse,
+  BatchInsertRequest,
+  BatchInsertResponse,
   ConversationTurnProto,
   DeleteRequest,
   DeleteResponse,
@@ -37,12 +41,15 @@ import type {
   InsertRequest,
   InsertResponse,
   KnowledgeObject,
+  ListRequest,
+  ListResponse,
   RecordTurnRequest,
   RecordTurnResponse,
   RelationshipInput,
   RememberOptions,
   RememberRequest,
   RememberResponse,
+  SearchOptions,
   SearchRequest,
   SearchResponse,
   SearchResult,
@@ -140,11 +147,18 @@ export class KowitoDBClient {
    * The engine detects intent, chooses retrieval strategies, searches all
    * indexes, reranks, and returns optimized results.
    */
-  async ask(question: string, maxResults: number = 10): Promise<AskResponse> {
+  async ask(
+    question: string,
+    maxResults: number = 10,
+    options: AskOptions = {},
+  ): Promise<AskResponse> {
     const stub = this.ensureConnected();
-    return callUnary<AskResponse>((cb) =>
-      stub.ask({ question, max_results: maxResults }, cb),
-    );
+    const req: AskRequest = {
+      question,
+      max_results: options.maxResults ?? maxResults,
+      metadata_filter: options.metadataFilter ?? {},
+    };
+    return callUnary<AskResponse>((cb) => stub.ask(req, cb));
   }
 
   /**
@@ -229,24 +243,63 @@ export class KowitoDBClient {
 
   // ---- Low-level API ----
 
-  /** Insert a knowledge object explicitly. Returns the new object ID. */
-  async insert(content: string, options: InsertOptions = {}): Promise<string> {
-    const stub = this.ensureConnected();
+  /** Build an InsertRequest from content + options (shared by insert/batchInsert). */
+  private buildInsertRequest(content: string, options: InsertOptions): InsertRequest {
     const relationships: RelationshipInput[] = (options.relationships ?? []).map(
       ([relationType, targetId]) => ({
         relation_type: relationType,
         target_id: targetId,
       }),
     );
-    const req: InsertRequest = {
+    return {
       content,
       keywords: options.keywords ?? [],
       metadata: options.metadata ?? {},
       relationships,
       importance: options.importance ?? DEFAULT_IMPORTANCE,
     };
+  }
+
+  /** Insert a knowledge object explicitly. Returns the new object ID. */
+  async insert(content: string, options: InsertOptions = {}): Promise<string> {
+    const stub = this.ensureConnected();
+    const req = this.buildInsertRequest(content, options);
     const resp = await callUnary<InsertResponse>((cb) => stub.insert(req, cb));
     return resp.id;
+  }
+
+  /**
+   * Insert multiple knowledge objects in a single call. Each item accepts the
+   * same option bag as `insert`/`remember`. Returns the new object IDs in
+   * request order.
+   */
+  async batchInsert(
+    items: Array<{ content: string } & InsertOptions>,
+  ): Promise<string[]> {
+    const stub = this.ensureConnected();
+    const req: BatchInsertRequest = {
+      items: items.map(({ content, ...options }) =>
+        this.buildInsertRequest(content, options),
+      ),
+    };
+    const resp = await callUnary<BatchInsertResponse>((cb) =>
+      stub.batchInsert(req, cb),
+    );
+    return resp.ids;
+  }
+
+  /**
+   * List knowledge objects with pagination. Returns the page of objects and
+   * the total number of objects in the store.
+   */
+  async list(
+    offset: number = 0,
+    limit: number = 0,
+  ): Promise<{ objects: KnowledgeObject[]; total: number }> {
+    const stub = this.ensureConnected();
+    const req: ListRequest = { offset, limit };
+    const resp = await callUnary<ListResponse>((cb) => stub.list(req, cb));
+    return { objects: resp.objects, total: resp.total };
   }
 
   /** Retrieve a knowledge object by ID, or null if it does not exist. */
@@ -277,9 +330,17 @@ export class KowitoDBClient {
   }
 
   /** Direct search (bypasses the AI planner). */
-  async search(query: string, topK: number = 20): Promise<SearchResult[]> {
+  async search(
+    query: string,
+    topK: number = 20,
+    options: SearchOptions = {},
+  ): Promise<SearchResult[]> {
     const stub = this.ensureConnected();
-    const req: SearchRequest = { query, top_k: topK };
+    const req: SearchRequest = {
+      query,
+      top_k: options.topK ?? topK,
+      metadata_filter: options.metadataFilter ?? {},
+    };
     const resp = await callUnary<SearchResponse>((cb) => stub.search(req, cb));
     return resp.results;
   }

@@ -115,7 +115,7 @@ func searchResultFromProto(p *pb.SearchResult) SearchResult {
 	}
 }
 
-// KnowledgeObject is a stored knowledge object returned by Get.
+// KnowledgeObject is a stored knowledge object returned by Get and List.
 type KnowledgeObject struct {
 	ID         string
 	Content    string
@@ -124,6 +124,21 @@ type KnowledgeObject struct {
 	Importance float32
 	CreatedAt  string
 	UpdatedAt  string
+}
+
+func knowledgeObjectFromProto(o *pb.KnowledgeObject) *KnowledgeObject {
+	if o == nil {
+		return nil
+	}
+	return &KnowledgeObject{
+		ID:         o.GetId(),
+		Content:    o.GetContent(),
+		Keywords:   o.GetKeywords(),
+		Metadata:   o.GetMetadata(),
+		Importance: o.GetImportance(),
+		CreatedAt:  o.GetCreatedAt(),
+		UpdatedAt:  o.GetUpdatedAt(),
+	}
 }
 
 // Stats holds database statistics.
@@ -150,6 +165,38 @@ type ConversationTurn struct {
 type Relationship struct {
 	RelationType string
 	TargetID     string
+}
+
+// InsertItem describes a single object to store via BatchInsert. Only Content
+// is required; the remaining fields are optional. Importance defaults to 0.5
+// when left as the zero value.
+type InsertItem struct {
+	Content       string
+	Keywords      []string
+	Metadata      map[string]string
+	Importance    float32
+	Relationships []Relationship
+}
+
+func (it InsertItem) toProto() *pb.InsertRequest {
+	importance := it.Importance
+	if importance == 0 {
+		importance = 0.5
+	}
+	rels := make([]*pb.RelationshipInput, 0, len(it.Relationships))
+	for _, r := range it.Relationships {
+		rels = append(rels, &pb.RelationshipInput{
+			RelationType: r.RelationType,
+			TargetId:     r.TargetID,
+		})
+	}
+	return &pb.InsertRequest{
+		Content:       it.Content,
+		Keywords:      it.Keywords,
+		Metadata:      it.Metadata,
+		Relationships: rels,
+		Importance:    importance,
+	}
 }
 
 // ---- Options ----
@@ -241,6 +288,29 @@ func newUpdateOptions(opts []UpdateOption) updateOptions {
 	return o
 }
 
+// queryOptions collects the optional parameters shared by Ask and Search.
+type queryOptions struct {
+	metadataFilter map[string]string
+}
+
+// QueryOption configures Ask and Search calls.
+type QueryOption func(*queryOptions)
+
+// WithMetadataFilter restricts results to objects whose metadata matches every
+// given key/value pair (exact match, ANDed). An empty or nil map means no
+// filtering.
+func WithMetadataFilter(filter map[string]string) QueryOption {
+	return func(o *queryOptions) { o.metadataFilter = filter }
+}
+
+func newQueryOptions(opts []QueryOption) queryOptions {
+	var o queryOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // ---- High-level AI API ----
 
 // Remember stores knowledge for future retrieval (ai.remember()).
@@ -262,14 +332,17 @@ func (c *Client) Remember(ctx context.Context, content string, opts ...WriteOpti
 // Ask runs a natural-language query with automatic retrieval (ai.ask()).
 // The engine detects intent, chooses retrieval strategies, searches all
 // indexes, reranks, and returns optimized results. If maxResults <= 0 a
-// default of 10 is used.
-func (c *Client) Ask(ctx context.Context, question string, maxResults int32) (*AskResponse, error) {
+// default of 10 is used. Pass WithMetadataFilter to restrict results to
+// objects whose metadata matches the given key/value pairs.
+func (c *Client) Ask(ctx context.Context, question string, maxResults int32, opts ...QueryOption) (*AskResponse, error) {
 	if maxResults <= 0 {
 		maxResults = 10
 	}
+	o := newQueryOptions(opts)
 	resp, err := c.stub.Ask(ctx, &pb.AskRequest{
-		Question:   question,
-		MaxResults: maxResults,
+		Question:       question,
+		MaxResults:     maxResults,
+		MetadataFilter: o.metadataFilter,
 	})
 	if err != nil {
 		return nil, err
@@ -310,6 +383,36 @@ func (c *Client) Insert(ctx context.Context, content string, opts ...WriteOption
 	return resp.GetId(), nil
 }
 
+// BatchInsert stores multiple knowledge objects in a single request and
+// returns their IDs in the same order as the supplied items. Each item's
+// Importance defaults to 0.5 when left as the zero value.
+func (c *Client) BatchInsert(ctx context.Context, items []InsertItem) ([]string, error) {
+	reqItems := make([]*pb.InsertRequest, 0, len(items))
+	for _, it := range items {
+		reqItems = append(reqItems, it.toProto())
+	}
+	resp, err := c.stub.BatchInsert(ctx, &pb.BatchInsertRequest{Items: reqItems})
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetIds(), nil
+}
+
+// List returns a page of stored knowledge objects ordered by the server's
+// default ordering, along with the total number of objects in the store (for
+// pagination). A limit of 0 means the server default page size.
+func (c *Client) List(ctx context.Context, offset, limit uint32) ([]KnowledgeObject, uint64, error) {
+	resp, err := c.stub.List(ctx, &pb.ListRequest{Offset: offset, Limit: limit})
+	if err != nil {
+		return nil, 0, err
+	}
+	objects := make([]KnowledgeObject, 0, len(resp.GetObjects()))
+	for _, o := range resp.GetObjects() {
+		objects = append(objects, *knowledgeObjectFromProto(o))
+	}
+	return objects, resp.GetTotal(), nil
+}
+
 // Get retrieves a knowledge object by ID. It returns (nil, nil) when no
 // object exists for the given ID.
 func (c *Client) Get(ctx context.Context, id string) (*KnowledgeObject, error) {
@@ -321,15 +424,7 @@ func (c *Client) Get(ctx context.Context, id string) (*KnowledgeObject, error) {
 	if o == nil {
 		return nil, nil
 	}
-	return &KnowledgeObject{
-		ID:         o.GetId(),
-		Content:    o.GetContent(),
-		Keywords:   o.GetKeywords(),
-		Metadata:   o.GetMetadata(),
-		Importance: o.GetImportance(),
-		CreatedAt:  o.GetCreatedAt(),
-		UpdatedAt:  o.GetUpdatedAt(),
-	}, nil
+	return knowledgeObjectFromProto(o), nil
 }
 
 // Update modifies an existing knowledge object in place. Only the fields set
@@ -362,14 +457,17 @@ func (c *Client) Delete(ctx context.Context, id string) (bool, error) {
 }
 
 // Search performs a direct search, bypassing the AI planner. If topK <= 0 a
-// default of 20 is used.
-func (c *Client) Search(ctx context.Context, query string, topK int32) ([]SearchResult, error) {
+// default of 20 is used. Pass WithMetadataFilter to restrict results to
+// objects whose metadata matches the given key/value pairs.
+func (c *Client) Search(ctx context.Context, query string, topK int32, opts ...QueryOption) ([]SearchResult, error) {
 	if topK <= 0 {
 		topK = 20
 	}
+	o := newQueryOptions(opts)
 	resp, err := c.stub.Search(ctx, &pb.SearchRequest{
-		Query: query,
-		TopK:  topK,
+		Query:          query,
+		TopK:           topK,
+		MetadataFilter: o.metadataFilter,
 	})
 	if err != nil {
 		return nil, err

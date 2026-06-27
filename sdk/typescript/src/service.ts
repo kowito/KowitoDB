@@ -23,6 +23,10 @@ import { loadSync, Options as ProtoLoaderOptions } from "@grpc/proto-loader";
 import type {
   InsertRequest,
   InsertResponse,
+  BatchInsertRequest,
+  BatchInsertResponse,
+  ListRequest,
+  ListResponse,
   GetRequest,
   GetResponse,
   UpdateRequest,
@@ -76,9 +80,11 @@ type UnaryMethod<TRequest, TResponse> = {
  */
 export interface KowitoDBGrpcClient extends Client {
   insert: UnaryMethod<InsertRequest, InsertResponse>;
+  batchInsert: UnaryMethod<BatchInsertRequest, BatchInsertResponse>;
   get: UnaryMethod<GetRequest, GetResponse>;
   update: UnaryMethod<UpdateRequest, UpdateResponse>;
   delete: UnaryMethod<DeleteRequest, DeleteResponse>;
+  list: UnaryMethod<ListRequest, ListResponse>;
   search: UnaryMethod<SearchRequest, SearchResponse>;
   ask: UnaryMethod<AskRequest, AskResponse>;
   remember: UnaryMethod<RememberRequest, RememberResponse>;

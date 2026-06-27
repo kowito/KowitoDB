@@ -25,6 +25,12 @@ export type {
   InsertRequest,
   InsertResponse,
   InsertOptions,
+  // Batch insert
+  BatchInsertRequest,
+  BatchInsertResponse,
+  // List
+  ListRequest,
+  ListResponse,
   // Get
   GetRequest,
   GetResponse,
@@ -39,10 +45,12 @@ export type {
   SearchRequest,
   SearchResult,
   SearchResponse,
+  SearchOptions,
   // Ask
   AskRequest,
   AskResult,
   AskResponse,
+  AskOptions,
   // Remember
   RememberRequest,
   RememberResponse,

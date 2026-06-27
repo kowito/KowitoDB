@@ -67,7 +67,9 @@ and assembles a token-budgeted context — behind a single call.
 | Plan cache | TTL + capacity-bounded cache of `(intent, plan)` keyed by question | Implemented |
 | Cost tracker | Estimates embedding + LLM-token + index cost in USD | Implemented |
 | Update + versioning | In-place edit (re-embeds on content change) with version history persisted to storage | Implemented |
-| Agent memory | Conversation sessions, working memory, pinned objects; `RecordTurn`/`GetSession` over gRPC | Implemented (in-memory, not persisted) |
+| Agent memory | Conversation sessions, working memory, pinned objects; `RecordTurn`/`GetSession` over gRPC; persisted to a sled store under `{index_path}/sessions` | Implemented |
+| Bulk + pagination | `BatchInsert` for bulk ingestion; `List` with `offset`/`limit` + total count | Implemented |
+| Filtered retrieval | Exact-match `metadata_filter` on `Ask`/`Search`, applied via the metadata index | Implemented |
 | Embedding clients | Deterministic proxy (default) + OpenAI-compatible HTTP client, selected via env | Implemented |
 | Index rebuild on restart | `open()` re-reads the object store and repopulates the in-memory vector/metadata/time/graph indexes | Implemented |
 | Storage: sled | Default persistent embedded key/value store | Implemented |
@@ -247,11 +249,13 @@ The service is defined in [`proto/kowitodb.proto`](proto/kowitodb.proto)
 | RPC | Request → Response | Purpose |
 | --- | --- | --- |
 | `Insert` | `InsertRequest` → `InsertResponse` | Insert a knowledge object (content, embeddings, metadata, keywords, relationships, importance). Returns the new ID. |
+| `BatchInsert` | `BatchInsertRequest` → `BatchInsertResponse` | Insert many objects in one call (bulk ingestion). Returns the new IDs in order. |
 | `Get` | `GetRequest` → `GetResponse` | Fetch a knowledge object by UUID. |
 | `Update` | `UpdateRequest` → `UpdateResponse` | In-place edit by ID (content/metadata/keywords/importance). Records a version-history entry and re-embeds on content change. Returns `updated` and the new `version` count. |
 | `Delete` | `DeleteRequest` → `DeleteResponse` | Delete by ID; reports whether it existed. |
-| `Search` | `SearchRequest` → `SearchResponse` | Direct search by `query` + `top_k`. Internally runs the same `ask` pipeline and returns `SearchResult`s plus a plan explanation. |
-| `Ask` | `AskRequest` → `AskResponse` | High-level `ai.ask()`: returns `AskResult`s with `relevance_score` and `retrieval_source`, the `detected_intent`, and a `plan_explanation`. |
+| `List` | `ListRequest` → `ListResponse` | Enumerate stored objects with `offset`/`limit` pagination. Returns the page plus the `total` count. |
+| `Search` | `SearchRequest` → `SearchResponse` | Direct search by `query` + `top_k`, optionally constrained by an exact-match `metadata_filter`. Returns `SearchResult`s plus a plan explanation. |
+| `Ask` | `AskRequest` → `AskResponse` | High-level `ai.ask()`: returns `AskResult`s with `relevance_score` and `retrieval_source`, the `detected_intent`, and a `plan_explanation`. Accepts an optional exact-match `metadata_filter`. |
 | `Remember` | `RememberRequest` → `RememberResponse` | High-level `ai.remember()`: store content with optional embeddings/metadata/keywords/importance. Returns the ID. |
 | `Sql` | `SqlRequest` → `SqlResponse` | Run a SQL query through the DataFusion engine (projection/`WHERE`/`ORDER BY`/`GROUP BY`/aggregates/`LIMIT`). Returns rows as ordered column-name → value maps. |
 | `RecordTurn` | `RecordTurnRequest` → `RecordTurnResponse` | Append a turn (`user`/`assistant`/`system`/`observation`) to an agent session. Returns the new turn count. |

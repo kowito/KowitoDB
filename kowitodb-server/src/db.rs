@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kowitodb_core::Result as KResult;
@@ -293,6 +293,55 @@ impl KowitoDBEngine {
         Ok(id)
     }
 
+    /// Insert many objects in one call, returning their ids in order.
+    pub async fn batch_insert(&self, objects: Vec<KnowledgeObject>) -> KResult<Vec<ObjectId>> {
+        let mut ids = Vec::with_capacity(objects.len());
+        for obj in objects {
+            ids.push(self.insert(obj).await?);
+        }
+        Ok(ids)
+    }
+
+    /// List stored objects with pagination. Returns the requested page (ordered
+    /// by id for stable paging) and the total object count.
+    pub async fn list(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> KResult<(Vec<KnowledgeObject>, usize)> {
+        let mut ids = self.storage.list_ids().await?;
+        ids.sort();
+        let total = ids.len();
+
+        let mut objects = Vec::new();
+        for id in ids.into_iter().skip(offset).take(limit) {
+            if let Some(obj) = self.get(id).await? {
+                objects.push(obj);
+            }
+        }
+        Ok((objects, total))
+    }
+
+    /// Intersection of object ids matching every exact metadata pair (AND).
+    fn metadata_allowed_set(&self, filter: &HashMap<String, String>) -> HashSet<ObjectId> {
+        let mut allowed: Option<HashSet<ObjectId>> = None;
+        for (key, value) in filter {
+            let ids: HashSet<ObjectId> = self
+                .metadata_index
+                .query_exact(key, value)
+                .into_iter()
+                .collect();
+            allowed = Some(match allowed {
+                Some(acc) => acc.intersection(&ids).copied().collect(),
+                None => ids,
+            });
+            if allowed.as_ref().is_some_and(|s| s.is_empty()) {
+                break;
+            }
+        }
+        allowed.unwrap_or_default()
+    }
+
     /// Retrieve by ID (checks content cache first, then storage).
     pub async fn get(&self, id: ObjectId) -> KResult<Option<KnowledgeObject>> {
         match self.storage.get(id).await? {
@@ -373,7 +422,8 @@ impl KowitoDBEngine {
 
     /// The core `ai.ask()` method — full pipeline with real content.
     pub async fn ask(&self, question: &str, max_results: usize) -> KResult<AskResponse> {
-        self.ask_with_budget(question, max_results, None).await
+        self.ask_filtered(question, max_results, None, &HashMap::new())
+            .await
     }
 
     /// `ai.ask()` with an optional context-token budget that honors a request's
@@ -383,6 +433,19 @@ impl KowitoDBEngine {
         question: &str,
         max_results: usize,
         max_context_tokens: Option<usize>,
+    ) -> KResult<AskResponse> {
+        self.ask_filtered(question, max_results, max_context_tokens, &HashMap::new())
+            .await
+    }
+
+    /// `ai.ask()` constrained to objects matching every `metadata_filter` pair
+    /// (exact match, ANDed). An empty filter retrieves without constraint.
+    pub async fn ask_filtered(
+        &self,
+        question: &str,
+        max_results: usize,
+        max_context_tokens: Option<usize>,
+        metadata_filter: &HashMap<String, String>,
     ) -> KResult<AskResponse> {
         // Check plan cache
         let (intent, plan) = if let Some(cached) = self.plan_cache.get(question) {
@@ -404,6 +467,18 @@ impl KowitoDBEngine {
 
         // Rerank
         let ranked = self.reranker.rerank_simple(&all_results);
+
+        // Apply metadata filter (via the metadata index) before limiting, so the
+        // result count reflects the constraint.
+        let ranked: Vec<RankedResult> = if metadata_filter.is_empty() {
+            ranked
+        } else {
+            let allowed = self.metadata_allowed_set(metadata_filter);
+            ranked
+                .into_iter()
+                .filter(|r| allowed.contains(&r.id))
+                .collect()
+        };
 
         // Limit + load real content
         let limited: Vec<RankedResult> = ranked.into_iter().take(max_results).collect();
@@ -1130,6 +1205,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing, None);
+    }
+
+    #[tokio::test]
+    async fn test_batch_insert_and_list_pagination() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let objs: Vec<_> = (0..5)
+            .map(|i| {
+                KnowledgeObject::new(format!("document number {i}")).with_metadata("kind", "note")
+            })
+            .collect();
+        let ids = engine.batch_insert(objs).await.unwrap();
+        assert_eq!(ids.len(), 5);
+
+        let (page, total) = engine.list(0, 2).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 2);
+
+        let (last, total) = engine.list(4, 10).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(last.len(), 1);
+
+        // Offset past the end yields an empty page but the correct total.
+        let (none, total) = engine.list(99, 10).await.unwrap();
+        assert_eq!(total, 5);
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ask_with_metadata_filter() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("Acme enterprise renewal closed")
+                    .with_metadata("company", "Acme")
+                    .with_keywords(vec!["enterprise".into(), "renewal".into()]),
+            )
+            .await
+            .unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("Globex enterprise renewal closed")
+                    .with_metadata("company", "Globex")
+                    .with_keywords(vec!["enterprise".into(), "renewal".into()]),
+            )
+            .await
+            .unwrap();
+
+        let filter = HashMap::from([("company".to_string(), "Acme".to_string())]);
+        let resp = engine
+            .ask_filtered("enterprise renewal", 10, None, &filter)
+            .await
+            .unwrap();
+
+        assert!(!resp.results.is_empty(), "filter excluded everything");
+        for r in &resp.results {
+            assert!(
+                r.content.contains("Acme") && !r.content.contains("Globex"),
+                "metadata filter leaked a non-matching object: {}",
+                r.content
+            );
+        }
     }
 
     #[tokio::test]

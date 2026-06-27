@@ -33,27 +33,7 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::InsertRequest>,
     ) -> Result<Response<proto::InsertResponse>, Status> {
         let req = request.into_inner();
-        let mut obj = kowitodb_core::KnowledgeObject::new(req.content);
-
-        for (model, vec_proto) in req.embeddings {
-            obj.embeddings.insert(model, vec_proto.values);
-        }
-        for (k, v) in req.metadata {
-            obj.metadata.insert(k, serde_json::Value::String(v));
-        }
-        obj.keywords = req.keywords;
-        for rel in req.relationships {
-            if let Ok(target_id) = uuid::Uuid::parse_str(&rel.target_id) {
-                obj.relationships.push(kowitodb_core::Relationship {
-                    relation_type: rel.relation_type,
-                    target_id,
-                    weight: rel.weight,
-                });
-            }
-        }
-        if req.importance > 0.0 {
-            obj.importance = req.importance.clamp(0.0, 1.0);
-        }
+        let obj = insert_req_to_obj(req);
 
         match self.engine.insert(obj).await {
             Ok(id) => {
@@ -81,37 +61,56 @@ impl KowitoDb for KowitoDBService {
             Status::internal(e.to_string())
         })?;
 
-        Ok(Response::new(match obj {
-            Some(o) => proto::GetResponse {
-                object: Some(proto::KnowledgeObject {
-                    id: o.id.to_string(),
-                    content: o.content,
-                    embeddings: o
-                        .embeddings
-                        .into_iter()
-                        .map(|(k, v)| (k, proto::EmbeddingVector { values: v }))
-                        .collect(),
-                    metadata: o
-                        .metadata
-                        .into_iter()
-                        .map(|(k, v)| (k, v.to_string()))
-                        .collect(),
-                    keywords: o.keywords,
-                    relationships: o
-                        .relationships
-                        .into_iter()
-                        .map(|r| proto::Relationship {
-                            relation_type: r.relation_type,
-                            target_id: r.target_id.to_string(),
-                            weight: r.weight,
-                        })
-                        .collect(),
-                    importance: o.importance,
-                    created_at: o.created_at.to_rfc3339(),
-                    updated_at: o.updated_at.to_rfc3339(),
-                }),
-            },
-            None => proto::GetResponse { object: None },
+        Ok(Response::new(proto::GetResponse {
+            object: obj.map(knowledge_to_proto),
+        }))
+    }
+
+    async fn batch_insert(
+        &self,
+        request: Request<proto::BatchInsertRequest>,
+    ) -> Result<Response<proto::BatchInsertResponse>, Status> {
+        let req = request.into_inner();
+        let objects: Vec<_> = req.items.into_iter().map(insert_req_to_obj).collect();
+        let count = objects.len();
+
+        let ids = self.engine.batch_insert(objects).await.map_err(|e| {
+            self.metrics.record_error();
+            Status::internal(e.to_string())
+        })?;
+
+        for _ in 0..count {
+            self.metrics.record_insert();
+        }
+        info!("BatchInsert: {} objects", count);
+        Ok(Response::new(proto::BatchInsertResponse {
+            ids: ids.into_iter().map(|id| id.to_string()).collect(),
+        }))
+    }
+
+    async fn list(
+        &self,
+        request: Request<proto::ListRequest>,
+    ) -> Result<Response<proto::ListResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            self.max_results as usize
+        } else {
+            req.limit as usize
+        };
+
+        let (objects, total) = self
+            .engine
+            .list(req.offset as usize, limit)
+            .await
+            .map_err(|e| {
+                self.metrics.record_error();
+                Status::internal(e.to_string())
+            })?;
+
+        Ok(Response::new(proto::ListResponse {
+            objects: objects.into_iter().map(knowledge_to_proto).collect(),
+            total: total as u64,
         }))
     }
 
@@ -141,7 +140,7 @@ impl KowitoDb for KowitoDBService {
         let start = Instant::now();
         let response = self
             .engine
-            .ask(&req.query, max_results)
+            .ask_filtered(&req.query, max_results, None, &req.metadata_filter)
             .await
             .map_err(|e| {
                 self.metrics.record_error();
@@ -180,7 +179,7 @@ impl KowitoDb for KowitoDBService {
         let start = Instant::now();
         let response = self
             .engine
-            .ask_with_budget(&req.question, max_results, budget)
+            .ask_filtered(&req.question, max_results, budget, &req.metadata_filter)
             .await
             .map_err(|e| {
                 self.metrics.record_error();
@@ -352,5 +351,62 @@ impl KowitoDb for KowitoDBService {
                 },
             },
         ))
+    }
+}
+
+/// Build a `KnowledgeObject` from an `InsertRequest` (shared by Insert/BatchInsert).
+fn insert_req_to_obj(req: proto::InsertRequest) -> kowitodb_core::KnowledgeObject {
+    let mut obj = kowitodb_core::KnowledgeObject::new(req.content);
+
+    for (model, vec_proto) in req.embeddings {
+        obj.embeddings.insert(model, vec_proto.values);
+    }
+    for (k, v) in req.metadata {
+        obj.metadata.insert(k, serde_json::Value::String(v));
+    }
+    obj.keywords = req.keywords;
+    for rel in req.relationships {
+        if let Ok(target_id) = uuid::Uuid::parse_str(&rel.target_id) {
+            obj.relationships.push(kowitodb_core::Relationship {
+                relation_type: rel.relation_type,
+                target_id,
+                weight: rel.weight,
+            });
+        }
+    }
+    if req.importance > 0.0 {
+        obj.importance = req.importance.clamp(0.0, 1.0);
+    }
+    obj
+}
+
+/// Convert a `KnowledgeObject` to its proto form (shared by Get/List).
+fn knowledge_to_proto(o: kowitodb_core::KnowledgeObject) -> proto::KnowledgeObject {
+    proto::KnowledgeObject {
+        id: o.id.to_string(),
+        content: o.content,
+        embeddings: o
+            .embeddings
+            .into_iter()
+            .map(|(k, v)| (k, proto::EmbeddingVector { values: v }))
+            .collect(),
+        metadata: o
+            .metadata
+            .into_iter()
+            .map(|(k, v)| (k, v.to_string()))
+            .collect(),
+        keywords: o.keywords,
+        relationships: o
+            .relationships
+            .into_iter()
+            .map(|r| proto::Relationship {
+                relation_type: r.relation_type,
+                target_id: r.target_id.to_string(),
+                weight: r.weight,
+            })
+            .collect(),
+        importance: o.importance,
+        created_at: o.created_at.to_rfc3339(),
+        updated_at: o.updated_at.to_rfc3339(),
     }
 }

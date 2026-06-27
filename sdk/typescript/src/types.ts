@@ -55,6 +55,30 @@ export interface InsertResponse {
   id: string;
 }
 
+// ---- Batch insert ----
+
+export interface BatchInsertRequest {
+  items: InsertRequest[];
+}
+
+export interface BatchInsertResponse {
+  ids: string[];
+}
+
+// ---- List / scroll ----
+
+export interface ListRequest {
+  offset: number;
+  /** Page size; 0 means the server default. */
+  limit: number;
+}
+
+export interface ListResponse {
+  objects: KnowledgeObject[];
+  /** Total number of objects in the store (for pagination). */
+  total: number;
+}
+
 // ---- Get ----
 
 export interface GetRequest {
@@ -80,6 +104,8 @@ export interface DeleteResponse {
 export interface SearchRequest {
   query: string;
   top_k: number;
+  /** Exact-match metadata constraints (ANDed); empty means no filtering. */
+  metadata_filter?: Record<string, string>;
 }
 
 export interface SearchResult {
@@ -101,6 +127,8 @@ export interface AskRequest {
   question: string;
   max_results: number;
   max_context_tokens?: number;
+  /** Exact-match metadata constraints (ANDed); empty means no filtering. */
+  metadata_filter?: Record<string, string>;
 }
 
 export interface AskResult {
@@ -225,6 +253,20 @@ export interface InsertOptions {
   /** Tuples of [relation_type, target_id]. */
   relationships?: Array<[string, string]>;
   importance?: number;
+}
+
+export interface AskOptions {
+  /** Maximum number of results to return. */
+  maxResults?: number;
+  /** Exact-match metadata constraints (ANDed); empty means no filtering. */
+  metadataFilter?: Record<string, string>;
+}
+
+export interface SearchOptions {
+  /** Maximum number of results to return. */
+  topK?: number;
+  /** Exact-match metadata constraints (ANDed); empty means no filtering. */
+  metadataFilter?: Record<string, string>;
 }
 
 export interface UpdateOptions {

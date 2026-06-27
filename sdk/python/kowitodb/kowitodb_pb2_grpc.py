@@ -41,6 +41,11 @@ class KowitoDBStub:
                 request_serializer=kowitodb__pb2.InsertRequest.SerializeToString,
                 response_deserializer=kowitodb__pb2.InsertResponse.FromString,
                 _registered_method=True)
+        self.BatchInsert = channel.unary_unary(
+                '/kowitodb.KowitoDB/BatchInsert',
+                request_serializer=kowitodb__pb2.BatchInsertRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.BatchInsertResponse.FromString,
+                _registered_method=True)
         self.Get = channel.unary_unary(
                 '/kowitodb.KowitoDB/Get',
                 request_serializer=kowitodb__pb2.GetRequest.SerializeToString,
@@ -55,6 +60,11 @@ class KowitoDBStub:
                 '/kowitodb.KowitoDB/Delete',
                 request_serializer=kowitodb__pb2.DeleteRequest.SerializeToString,
                 response_deserializer=kowitodb__pb2.DeleteResponse.FromString,
+                _registered_method=True)
+        self.List = channel.unary_unary(
+                '/kowitodb.KowitoDB/List',
+                request_serializer=kowitodb__pb2.ListRequest.SerializeToString,
+                response_deserializer=kowitodb__pb2.ListResponse.FromString,
                 _registered_method=True)
         self.Search = channel.unary_unary(
                 '/kowitodb.KowitoDB/Search',
@@ -104,6 +114,12 @@ class KowitoDBServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def BatchInsert(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Get(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -117,6 +133,12 @@ class KowitoDBServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Delete(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def List(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -175,6 +197,11 @@ def add_KowitoDBServicer_to_server(servicer, server):
                     request_deserializer=kowitodb__pb2.InsertRequest.FromString,
                     response_serializer=kowitodb__pb2.InsertResponse.SerializeToString,
             ),
+            'BatchInsert': grpc.unary_unary_rpc_method_handler(
+                    servicer.BatchInsert,
+                    request_deserializer=kowitodb__pb2.BatchInsertRequest.FromString,
+                    response_serializer=kowitodb__pb2.BatchInsertResponse.SerializeToString,
+            ),
             'Get': grpc.unary_unary_rpc_method_handler(
                     servicer.Get,
                     request_deserializer=kowitodb__pb2.GetRequest.FromString,
@@ -189,6 +216,11 @@ def add_KowitoDBServicer_to_server(servicer, server):
                     servicer.Delete,
                     request_deserializer=kowitodb__pb2.DeleteRequest.FromString,
                     response_serializer=kowitodb__pb2.DeleteResponse.SerializeToString,
+            ),
+            'List': grpc.unary_unary_rpc_method_handler(
+                    servicer.List,
+                    request_deserializer=kowitodb__pb2.ListRequest.FromString,
+                    response_serializer=kowitodb__pb2.ListResponse.SerializeToString,
             ),
             'Search': grpc.unary_unary_rpc_method_handler(
                     servicer.Search,
@@ -255,6 +287,33 @@ class KowitoDB:
             '/kowitodb.KowitoDB/Insert',
             kowitodb__pb2.InsertRequest.SerializeToString,
             kowitodb__pb2.InsertResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BatchInsert(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/BatchInsert',
+            kowitodb__pb2.BatchInsertRequest.SerializeToString,
+            kowitodb__pb2.BatchInsertResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -336,6 +395,33 @@ class KowitoDB:
             '/kowitodb.KowitoDB/Delete',
             kowitodb__pb2.DeleteRequest.SerializeToString,
             kowitodb__pb2.DeleteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def List(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kowitodb.KowitoDB/List',
+            kowitodb__pb2.ListRequest.SerializeToString,
+            kowitodb__pb2.ListResponse.FromString,
             options,
             channel_credentials,
             insecure,
