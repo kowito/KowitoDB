@@ -78,6 +78,9 @@ pub struct KowitoDBEngine {
     pub embedding_client: Arc<dyn EmbeddingClient>,
     pub plan_cache: Arc<QueryCache<(DetectedIntent, ExecutionPlan)>>,
     content_cache: Arc<ContentCache>,
+    /// Index directory; when set, the vector index is persisted here as a
+    /// snapshot (`None` for in-memory engines).
+    index_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     default_model: String,
 }
@@ -91,7 +94,12 @@ impl KowitoDBEngine {
         let index_ref = index_path.as_ref();
         let agent_memory = open_session_store(index_ref)?;
         let fulltext_index = FullTextIndex::open(index_ref)?;
-        let engine = Self::assemble(storage, fulltext_index, agent_memory);
+        let engine = Self::assemble(
+            storage,
+            fulltext_index,
+            agent_memory,
+            Some(index_ref.to_path_buf()),
+        );
         info!("KowitoDB engine initialized with all subsystems (sled storage)");
         Ok(engine)
     }
@@ -105,8 +113,8 @@ impl KowitoDBEngine {
         storage_path: impl AsRef<std::path::Path>,
         index_path: impl AsRef<std::path::Path>,
     ) -> KResult<Self> {
-        let engine = Self::new(storage_path, index_path)?;
-        engine.reindex_from_storage().await?;
+        let mut engine = Self::new(storage_path, index_path)?;
+        engine.load_or_reindex().await?;
         Ok(engine)
     }
 
@@ -122,8 +130,13 @@ impl KowitoDBEngine {
         let index_ref = index_path.as_ref();
         let agent_memory = open_session_store(index_ref)?;
         let fulltext_index = FullTextIndex::open(index_ref)?;
-        let engine = Self::assemble(storage, fulltext_index, agent_memory);
-        engine.reindex_from_storage().await?;
+        let mut engine = Self::assemble(
+            storage,
+            fulltext_index,
+            agent_memory,
+            Some(index_ref.to_path_buf()),
+        );
+        engine.load_or_reindex().await?;
         info!("KowitoDB engine initialized with all subsystems (Lance storage)");
         Ok(engine)
     }
@@ -135,7 +148,12 @@ impl KowitoDBEngine {
         let tmp = std::env::temp_dir().join(format!("kowitodb-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).map_err(kowitodb_core::KowitoError::Io)?;
         let fulltext_index = FullTextIndex::open(&tmp)?;
-        Ok(Self::assemble(storage, fulltext_index, AgentMemory::new()))
+        Ok(Self::assemble(
+            storage,
+            fulltext_index,
+            AgentMemory::new(),
+            None,
+        ))
     }
 
     /// Assemble the full engine (all indexes, planner, optimizers) over a given
@@ -145,6 +163,7 @@ impl KowitoDBEngine {
         storage: Arc<dyn StorageBackend>,
         fulltext_index: FullTextIndex,
         agent_memory: AgentMemory,
+        index_path: Option<std::path::PathBuf>,
     ) -> Self {
         let embedding_client = select_embedding_client();
         let plan_cache: QueryCache<(DetectedIntent, ExecutionPlan)> = QueryCache::new(300, 1000);
@@ -165,8 +184,54 @@ impl KowitoDBEngine {
             embedding_client,
             plan_cache: Arc::new(plan_cache),
             content_cache: Arc::new(ContentCache::new(CONTENT_CACHE_CAP)),
+            index_path,
             default_model: "default".to_string(),
         }
+    }
+
+    /// Path of the persisted vector-index snapshot, if this engine has an index
+    /// directory.
+    fn hnsw_snapshot_path(&self) -> Option<std::path::PathBuf> {
+        self.index_path.as_ref().map(|p| p.join("hnsw.bin"))
+    }
+
+    /// Load the persisted vector index if a snapshot exists, then rebuild the
+    /// remaining in-memory indexes from storage. If no snapshot is found the
+    /// vector index is rebuilt from stored embeddings too.
+    async fn load_or_reindex(&mut self) -> KResult<()> {
+        let loaded = match self.hnsw_snapshot_path() {
+            Some(path) => match HnswIndex::load(&path) {
+                Ok(Some(index)) => {
+                    info!("Loaded persisted vector index ({} vectors)", index.len());
+                    self.hnsw_index = Arc::new(index);
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    tracing::warn!("Could not load vector index snapshot ({e}); rebuilding");
+                    false
+                }
+            },
+            None => false,
+        };
+        self.reindex_from_storage(!loaded).await?;
+        Ok(())
+    }
+
+    /// Persist the vector index to disk so it need not be rebuilt on restart.
+    /// No-op for in-memory engines.
+    pub fn checkpoint(&self) -> KResult<()> {
+        if let Some(path) = self.hnsw_snapshot_path() {
+            self.hnsw_index
+                .save(&path)
+                .map_err(kowitodb_core::KowitoError::Io)?;
+            debug!(
+                "Checkpointed vector index ({} vectors) to {:?}",
+                self.hnsw_index.len(),
+                path
+            );
+        }
+        Ok(())
     }
 
     /// Rebuild the in-memory indexes (vector/metadata/time/graph) and content
@@ -176,7 +241,10 @@ impl KowitoDBEngine {
     /// The full-text index is intentionally skipped: it persists to disk and is
     /// already loaded on open, so re-inserting would duplicate documents.
     /// Embeddings are taken from storage — no embedding API calls are made.
-    pub async fn reindex_from_storage(&self) -> KResult<usize> {
+    ///
+    /// When `include_vectors` is false the HNSW index is left untouched (e.g. it
+    /// was just loaded from a snapshot); the other indexes are still rebuilt.
+    pub async fn reindex_from_storage(&self, include_vectors: bool) -> KResult<usize> {
         let objects = self.storage.search(StorageFilter::default()).await?;
         let count = objects.len();
 
@@ -184,8 +252,10 @@ impl KowitoDBEngine {
             let obj = stored_to_obj(stored)?;
             self.content_cache.insert(obj.id, obj.content.clone());
 
-            for embedding in obj.embeddings.values() {
-                self.hnsw_index.insert(obj.id, embedding.clone());
+            if include_vectors {
+                for embedding in obj.embeddings.values() {
+                    self.hnsw_index.insert(obj.id, embedding.clone());
+                }
             }
             for (key, value) in &obj.metadata {
                 let val_str = match value {
@@ -1180,6 +1250,44 @@ mod tests {
         // End-to-end ask works after restart.
         let resp = engine.ask("enterprise contract", 5).await.unwrap();
         assert!(!resp.results.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_vector_index_checkpoint_and_reload() {
+        let base = std::env::temp_dir().join(format!("kowitodb-ckpt-{}", uuid::Uuid::new_v4()));
+        let storage_path = base.join("storage");
+        let index_path = base.join("index");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        std::fs::create_dir_all(&index_path).unwrap();
+
+        {
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
+                .unwrap();
+            for i in 0..3 {
+                engine
+                    .insert(KnowledgeObject::new(format!("document {i}")))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(engine.stats().await.unwrap().vector_count, 3);
+            engine.checkpoint().unwrap();
+        }
+
+        // The checkpoint wrote a snapshot.
+        assert!(
+            index_path.join("hnsw.bin").exists(),
+            "checkpoint must write hnsw.bin"
+        );
+
+        // Reopen: the snapshot is loaded and vectors are intact + searchable.
+        let engine = KowitoDBEngine::open(&storage_path, &index_path)
+            .await
+            .unwrap();
+        assert_eq!(engine.stats().await.unwrap().vector_count, 3);
+        assert!(!engine.ask("document", 5).await.unwrap().results.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }

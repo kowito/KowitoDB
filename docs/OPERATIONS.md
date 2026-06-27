@@ -26,12 +26,16 @@ A running server owns two persistent directories (the paths passed to `serve`):
 {index-path}/tantivy/    Tantivy full-text index    (persistent)
 ```
 
-Everything else (HNSW vector, brute-force vector, metadata, time, and graph
-indexes; plan cache; agent memory) is **in-memory**. The HNSW vector, metadata,
-time, and graph indexes are rebuilt from the object store on startup (see
-[Index persistence and restarts](#index-persistence-and-restarts)); the plan
-cache and agent memory are ephemeral. With the Lance backend the object store is
-a Lance dataset at the configured URI instead of the sled directory.
+The in-memory indexes work as follows. The **HNSW vector index is persisted**
+as a snapshot at `{index_path}/hnsw.bin` (checkpointed periodically and on
+graceful shutdown) and loaded on startup, so it is not rebuilt from scratch; if
+the snapshot is missing (e.g. after a hard kill) it falls back to a rebuild from
+stored embeddings. The metadata, time, and graph indexes are still rebuilt from
+the object store on startup (see
+[Index persistence and restarts](#index-persistence-and-restarts)). **Agent
+memory is persisted** to a sled store at `{index_path}/sessions`. The plan cache
+is ephemeral. With the Lance backend the object store is a Lance dataset at the
+configured URI instead of the sled directory.
 
 ## Backup and restore
 

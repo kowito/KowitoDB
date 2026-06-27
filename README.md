@@ -359,10 +359,13 @@ These are accurate to the current code and are documented in detail in
   and reflection services are always on and intentionally unauthenticated, so
   restrict network access at the infrastructure layer regardless.
 - **Single-node only.** No replication, sharding, or clustering.
-- **Secondary indexes are in-memory** (HNSW vector, graph, metadata, time).
-  They are **rebuilt from the object store on startup** via `open()`, at a cost
-  of O(stored objects); they are not separately persisted. The working set must
-  fit in RAM.
+- **Secondary indexes are in-memory.** The HNSW **vector index is persisted**
+  as a snapshot (`{index_path}/hnsw.bin`), checkpointed periodically and on
+  graceful shutdown, and loaded on startup — so it is not rebuilt from scratch.
+  The graph, metadata, and time indexes are still rebuilt from the object store
+  on `open()` (O(stored objects)). The working set must fit in RAM. A hard kill
+  (SIGKILL) skips the final checkpoint; the vector index then falls back to a
+  rebuild from stored embeddings.
 - **Default embeddings are a deterministic hash proxy** (not semantic) unless
   you choose a real model: build with `--features local-embeddings` and set
   `KOWITODB_EMBEDDING_PROVIDER=local` for an on-device Candle model, or use the

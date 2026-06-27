@@ -54,7 +54,24 @@ pub async fn serve_with_config(
 ) -> anyhow::Result<()> {
     let metrics = Arc::new(MetricsCollector::new());
     let max_results = config.max_results.unwrap_or(config::DEFAULT_MAX_RESULTS);
-    let service = KowitoDBService::new(engine, metrics.clone(), max_results);
+    let engine = Arc::new(engine);
+    let service = KowitoDBService::new(engine.clone(), metrics.clone(), max_results);
+
+    // Periodically persist the vector index so it survives restarts without a
+    // full rebuild from storage.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                if let Err(e) = engine.checkpoint() {
+                    warn!("Periodic vector-index checkpoint failed: {}", e);
+                }
+            }
+        });
+    }
 
     // Optional Prometheus/health HTTP endpoint on a separate port.
     if let Some(metrics_addr) = config.metrics_addr {
@@ -101,12 +118,24 @@ pub async fn serve_with_config(
         }
     );
 
+    // Graceful shutdown on Ctrl-C / SIGINT so the final index checkpoint runs.
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Shutdown signal received; draining");
+    };
+
     builder
         .add_service(health_service)
         .add_service(reflection)
         .add_service(main_service)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
+
+    // Persist the vector index one last time on the way out.
+    match engine.checkpoint() {
+        Ok(()) => info!("Final vector-index checkpoint written"),
+        Err(e) => warn!("Final vector-index checkpoint failed: {}", e),
+    }
 
     Ok(())
 }

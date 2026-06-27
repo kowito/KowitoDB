@@ -10,14 +10,18 @@ use crate::proto;
 use crate::proto::kowito_db_server::KowitoDb;
 
 pub struct KowitoDBService {
-    engine: KowitoDBEngine,
+    engine: Arc<KowitoDBEngine>,
     metrics: Arc<MetricsCollector>,
     /// Upper bound on results returned by Ask/Search.
     max_results: i32,
 }
 
 impl KowitoDBService {
-    pub fn new(engine: KowitoDBEngine, metrics: Arc<MetricsCollector>, max_results: usize) -> Self {
+    pub fn new(
+        engine: Arc<KowitoDBEngine>,
+        metrics: Arc<MetricsCollector>,
+        max_results: usize,
+    ) -> Self {
         Self {
             engine,
             metrics,

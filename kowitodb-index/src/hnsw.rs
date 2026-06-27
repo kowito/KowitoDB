@@ -10,11 +10,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use kowitodb_core::{Embedding, ObjectId};
 use parking_lot::RwLock;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// A float wrapper that provides total ordering for BinaryHeap use.
@@ -39,19 +41,17 @@ impl Ord for OrdFloat {
 }
 
 /// A node in the HNSW graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HnswNode {
-    #[allow(dead_code)]
     id: ObjectId,
     vector: Embedding,
-    #[allow(dead_code)]
     max_layer: usize,
     /// Per-layer neighbor sets: layer → set of neighbor IDs.
     neighbors: HashMap<usize, HashSet<ObjectId>>,
 }
 
 /// HNSW index parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswParams {
     /// Number of neighbors per node per layer (default 16).
     pub m: usize,
@@ -93,6 +93,24 @@ pub struct HnswIndex {
     max_layer: Arc<RwLock<usize>>,
     /// Configuration.
     params: HnswParams,
+}
+
+/// Borrowed view of the index for zero-copy serialization on `save`.
+#[derive(Serialize)]
+struct HnswSnapshotRef<'a> {
+    params: &'a HnswParams,
+    nodes: &'a HashMap<ObjectId, HnswNode>,
+    entry_point: Option<ObjectId>,
+    max_layer: usize,
+}
+
+/// Owned snapshot for deserialization on `load`.
+#[derive(Deserialize)]
+struct HnswSnapshot {
+    params: HnswParams,
+    nodes: HashMap<ObjectId, HnswNode>,
+    entry_point: Option<ObjectId>,
+    max_layer: usize,
 }
 
 impl HnswIndex {
@@ -268,6 +286,41 @@ impl HnswIndex {
     /// Whether the index is empty.
     pub fn is_empty(&self) -> bool {
         self.nodes.read().is_empty()
+    }
+
+    /// Persist the index to `path` (atomic write via a temp file + rename).
+    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let nodes = self.nodes.read();
+        let snapshot = HnswSnapshotRef {
+            params: &self.params,
+            nodes: &nodes,
+            entry_point: *self.entry_point.read(),
+            max_layer: *self.max_layer.read(),
+        };
+        let bytes = bincode::serialize(&snapshot)
+            .map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load an index from `path`, or `Ok(None)` if the file does not exist.
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(path)?;
+        let snapshot: HnswSnapshot = bincode::deserialize(&bytes)
+            .map_err(std::io::Error::other)?;
+        Ok(Some(Self {
+            nodes: Arc::new(RwLock::new(snapshot.nodes)),
+            entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
+            max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
+            params: snapshot.params,
+        }))
     }
 
     // ---- Internal methods ----
@@ -536,6 +589,50 @@ mod tests {
                 "Results should be sorted by descending score"
             );
         }
+    }
+
+    #[test]
+    fn test_hnsw_save_load_roundtrip() {
+        let idx = HnswIndex::new(HnswParams {
+            m: 8,
+            ef_construction: 50,
+            ef_search: 20,
+            ..Default::default()
+        });
+        let mut ids = Vec::new();
+        for i in 0..50 {
+            let id = uuid::Uuid::new_v4();
+            let vec: Vec<f32> = (0..16).map(|j| ((i * 7 + j * 3) as f32).sin()).collect();
+            idx.insert(id, vec);
+            ids.push(id);
+        }
+
+        let path = std::env::temp_dir().join(format!("kowitodb-hnsw-{}.bin", uuid::Uuid::new_v4()));
+        idx.save(&path).unwrap();
+
+        // Loading a missing file yields None.
+        let missing = std::env::temp_dir().join("kowitodb-hnsw-does-not-exist.bin");
+        assert!(HnswIndex::load(&missing).unwrap().is_none());
+
+        let loaded = HnswIndex::load(&path)
+            .unwrap()
+            .expect("snapshot should load");
+        assert_eq!(loaded.len(), idx.len());
+
+        // The loaded index returns the same neighbors as the original.
+        let query: Vec<f32> = (0..16)
+            .map(|j| (25.0 * 7.0 + j as f32 * 3.0).sin())
+            .collect();
+        let before = idx.search(&query, 5);
+        let after = loaded.search(&query, 5);
+        let before_ids: Vec<_> = before.iter().map(|(id, _)| *id).collect();
+        let after_ids: Vec<_> = after.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            before_ids, after_ids,
+            "search results must survive save/load"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
