@@ -10,14 +10,14 @@ research notes; each item below tags maturity and the key paper/system.
 
 **Legend:** ✅ shipped · 🔜 in progress · 📋 planned · 🔬 potential / exploratory · ⛔ deliberately not pursuing
 
-**Status (v0.28):** every roadmap item is **resolved** — shipped (✅) or a
+**Status (v0.29):** every roadmap item is **resolved** — shipped (✅) or a
 deliberate, documented non-goal (⛔). The remaining ⛔ items (Raft consensus,
-DiskANN on-disk graph, ColBERT late-interaction, full distributed-SQL planner,
-GPU indexes) are each a dedicated multi-week subsystem; they are deferred with
-rationale rather than faked. Everything buildable to a *tested, honest* state in
-this product's scope is done — including full GraphRAG community summarization
-(v0.28), which was previously deferred on cost grounds and is now shipped as an
-opt-in mechanism.
+DiskANN on-disk graph, full distributed-SQL planner, GPU indexes) are each a
+dedicated multi-week subsystem; they are deferred with rationale rather than
+faked. Everything buildable to a *tested, honest* state in this product's scope
+is done — including full GraphRAG community summarization (v0.28) and
+ColBERT-style late-interaction MaxSim (v0.29), both previously deferred and now
+shipped.
 
 ---
 
@@ -139,11 +139,18 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 
 ## Potential / exploratory (🔬)
 
-- ⛔ **Late interaction (ColBERTv2 / PLAID):** multi-vector MaxSim; highest
-  quality ceiling but it replaces the single-vector index model wholesale (a
-  per-token multi-vector store + PLAID-style pruning) — a dedicated multi-month
-  index rewrite, off the current single-vector + reranker thesis. *Deliberately
-  deferred*, not faked. — arxiv 2112.01488, 2205.09707.
+- ✅ **Late interaction (ColBERTv2-style MaxSim) — shipped (v0.29):** a
+  `MultiVectorIndex` stores a *set* of token vectors per object and scores by
+  **MaxSim** (`Σ_q max_d q·d`), preserving term-level matching a single pooled
+  vector averages away — the highest quality ceiling among dense retrievers.
+  Supports brute-force scoring or candidate-restricted rerank (the production
+  ANN→MaxSim two-stage). Engine methods `index_token_vectors` /
+  `late_interaction_search`, persisted in a snapshot, cleaned up on delete.
+  Unit-tested (token-level matching, candidate restriction, save/load). The
+  token vectors come from a multi-vector model (e.g. ColBERT) — KowitoDB indexes
+  and scores them; it does not bundle the model (same boundary as the
+  cross-encoder). PLAID-style centroid pruning for scale remains future work.
+  — arxiv 2112.01488, 2205.09707.
 - ✅ **Matryoshka embeddings (MRL) — shipped (v0.22.0):** adaptive-dimension
   retrieval. With `HnswParams::coarse_dim = Some(d)` (or
   `KOWITODB_VECTOR_COARSE_DIM=d`) the HNSW graph is navigated using only the
@@ -231,7 +238,8 @@ strongly-consistent cluster would require.
   aggregates are pushed down and merged (v0.27); general distributed query
   planning (shuffle joins, partial GROUP BY → re-aggregate) is a query-engine
   project of its own, beyond the integrated-retrieval thesis.
-- **Late interaction (ColBERT/PLAID)** and **DiskANN on-disk graph:** real and
-  valuable, but each is a dedicated multi-week index-model rewrite — deferred as
-  explicit next-major-efforts rather than faked (see "Potential / exploratory").
+- **DiskANN on-disk graph:** real and valuable, but a dedicated multi-week
+  on-disk ANN subsystem (memory-mapped graph + SSD I/O scheduling) — deferred as
+  an explicit next-major-effort rather than faked (see "Potential / exploratory").
+  (Late interaction / ColBERT MaxSim, formerly here, is now shipped — v0.29.)
 - **GPU indexes (CAGRA):** off-thesis for a single-node, on-device-friendly engine.

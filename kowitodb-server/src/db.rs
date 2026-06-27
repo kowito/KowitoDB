@@ -5,7 +5,7 @@ use kowitodb_core::Result as KResult;
 use kowitodb_core::{Embedding, KnowledgeObject, ObjectId, Relationship};
 use kowitodb_index::{
     FullTextIndex, GraphIndex, HnswParams, IndexResult, IndexSource, MetadataIndex,
-    ShardedHnswIndex, TimeIndex, VectorIndex,
+    MultiVectorIndex, ShardedHnswIndex, TimeIndex, VectorIndex,
 };
 use kowitodb_planner::{
     cache::QueryCache, context::ContextOptimizer, cost::CostTracker, reranker::Reranker,
@@ -267,6 +267,9 @@ pub struct KowitoDBEngine {
     pub metadata_index: Arc<MetadataIndex>,
     pub time_index: Arc<TimeIndex>,
     pub graph_index: Arc<GraphIndex>,
+    /// Late-interaction (ColBERT-style) multi-vector index for MaxSim retrieval.
+    /// Populated only when token vectors are supplied (needs a multi-vector model).
+    pub multivector_index: Arc<MultiVectorIndex>,
     pub planner: Arc<QueryPlanner>,
     pub reranker: Arc<Reranker>,
     pub context_optimizer: Arc<ContextOptimizer>,
@@ -388,6 +391,7 @@ impl KowitoDBEngine {
             metadata_index: Arc::new(MetadataIndex::new()),
             time_index: Arc::new(TimeIndex::new()),
             graph_index: Arc::new(GraphIndex::new()),
+            multivector_index: Arc::new(MultiVectorIndex::new()),
             planner: Arc::new(QueryPlanner::new()),
             reranker: Arc::new(Reranker::new()),
             context_optimizer: Arc::new(ContextOptimizer::new(4096)),
@@ -407,6 +411,10 @@ impl KowitoDBEngine {
 
     /// Path of the persisted vector-index snapshot, if this engine has an index
     /// directory.
+    fn multivector_snapshot_path(&self) -> Option<std::path::PathBuf> {
+        self.index_path.as_ref().map(|p| p.join("multivector.bin"))
+    }
+
     fn hnsw_snapshot_path(&self) -> Option<std::path::PathBuf> {
         self.index_path.as_ref().map(|p| p.join("hnsw.bin"))
     }
@@ -430,6 +438,14 @@ impl KowitoDBEngine {
             },
             None => false,
         };
+        // Restore the late-interaction index if a snapshot exists (token vectors
+        // can't be rebuilt from storage without a multi-vector model).
+        if let Some(path) = self.multivector_snapshot_path() {
+            if let Ok(Some(mv)) = MultiVectorIndex::load(&path) {
+                info!("Loaded late-interaction index ({} docs)", mv.len());
+                self.multivector_index = Arc::new(mv);
+            }
+        }
         self.reindex_from_storage(!loaded).await?;
         Ok(())
     }
@@ -446,6 +462,15 @@ impl KowitoDBEngine {
                 self.hnsw_index.len(),
                 path
             );
+        }
+        // Persist the late-interaction index too (token vectors can't be rebuilt
+        // from storage — there is no bundled multi-vector model).
+        if let Some(path) = self.multivector_snapshot_path() {
+            if !self.multivector_index.is_empty() {
+                self.multivector_index
+                    .save(&path)
+                    .map_err(kowitodb_core::KowitoError::Io)?;
+            }
         }
         Ok(())
     }
@@ -704,6 +729,7 @@ impl KowitoDBEngine {
         self.metadata_index.remove_object(id);
         self.time_index.remove(id);
         self.graph_index.remove_object(id);
+        self.multivector_index.remove(id);
         self.content_cache.remove(&id);
 
         let existed = self.storage.delete(id).await?;
@@ -1438,6 +1464,29 @@ impl KowitoDBEngine {
         self.community_summaries.lock().clone()
     }
 
+    // ---- Late interaction (ColBERT-style multi-vector) ----
+
+    /// Store late-interaction token vectors for an object, enabling MaxSim
+    /// retrieval via [`Self::late_interaction_search`]. The token vectors come
+    /// from a multi-vector model (e.g. ColBERT) — KowitoDB indexes and scores
+    /// them; it does not bundle the model.
+    pub fn index_token_vectors(&self, id: ObjectId, tokens: Vec<Vec<f32>>) {
+        self.multivector_index.insert(id, tokens);
+    }
+
+    /// Late-interaction retrieval: top-`k` objects by MaxSim against the
+    /// multi-vector `query`. With `candidates`, MaxSim only re-ranks that
+    /// shortlist (the production ANN→MaxSim two-stage); otherwise it scores all
+    /// objects that have token vectors.
+    pub fn late_interaction_search(
+        &self,
+        query: &[Vec<f32>],
+        k: usize,
+        candidates: Option<&[ObjectId]>,
+    ) -> Vec<(ObjectId, f32)> {
+        self.multivector_index.search(query, k, candidates)
+    }
+
     /// Record an agent conversation turn AND promote it into searchable,
     /// graph-able knowledge (Mem0-style episodic memory). Returns the session's
     /// turn count.
@@ -2098,6 +2147,35 @@ mod tests {
                 .any(|r| r.content == "The user prefers dark mode."),
             "distilled fact should be the searchable memory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_late_interaction_maxsim_retrieval() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let basis = |i: usize| {
+            let mut v = vec![0.0f32; 4];
+            v[i] = 1.0;
+            v
+        };
+        let a = engine
+            .insert(KnowledgeObject::new("alpha doc"))
+            .await
+            .unwrap();
+        let b = engine
+            .insert(KnowledgeObject::new("beta doc"))
+            .await
+            .unwrap();
+        // Token vectors (from a hypothetical ColBERT model): A covers e0/e1, B e2/e3.
+        engine.index_token_vectors(a, vec![basis(0), basis(1)]);
+        engine.index_token_vectors(b, vec![basis(2), basis(3)]);
+
+        let res = engine.late_interaction_search(&[basis(0)], 2, None);
+        assert_eq!(res[0].0, a, "MaxSim ranks the token-matching doc first");
+
+        // Delete drops its token vectors from the index too.
+        engine.delete(a).await.unwrap();
+        let res = engine.late_interaction_search(&[basis(0)], 2, None);
+        assert!(res.iter().all(|(id, _)| *id != a));
     }
 
     #[tokio::test]
