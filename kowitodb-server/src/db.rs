@@ -491,20 +491,23 @@ impl KowitoDBEngine {
         Ok((objects, total))
     }
 
-    /// Multiply the top `window` results' scores by an importance factor
-    /// (`1 + IMPORTANCE_WEIGHT * importance`, importance ∈ [0,1]) and re-sort, so
-    /// high-importance objects rank higher. A uniform default importance (0.5)
-    /// leaves the order unchanged.
-    async fn apply_importance_boost(
+    /// Re-rank the top `window` results by stored ranking signals: an importance
+    /// factor (`1 + IMPORTANCE_WEIGHT * importance`) and a recency factor
+    /// (`1 + RECENCY_WEIGHT * exp(-age_days / HALF_LIFE)`). A uniform default
+    /// importance (0.5) and equal ages leave the order unchanged.
+    async fn apply_ranking_signals(
         &self,
         mut ranked: Vec<RankedResult>,
         window: usize,
     ) -> Vec<RankedResult> {
         const IMPORTANCE_WEIGHT: f32 = 0.5;
+        const RECENCY_WEIGHT: f32 = 0.2;
         let window = window.min(ranked.len());
         for r in ranked.iter_mut().take(window) {
             if let Ok(Some(stored)) = self.storage.get(r.id).await {
-                r.score *= 1.0 + IMPORTANCE_WEIGHT * stored.importance;
+                let importance_factor = 1.0 + IMPORTANCE_WEIGHT * stored.importance;
+                let recency_factor = 1.0 + RECENCY_WEIGHT * recency_score(&stored.created_at);
+                r.score *= importance_factor * recency_factor;
             }
         }
         ranked.sort_by(|a, b| {
@@ -713,11 +716,11 @@ impl KowitoDBEngine {
                 .collect()
         };
 
-        // Importance-weighted ranking: boost results by each object's stored
-        // `importance` so high-priority knowledge surfaces. Applied over a
-        // candidate window so an important item just below the cut can rise.
+        // Boost results by stored `importance` (priority) and recency (newer
+        // knowledge), so high-priority and fresh items surface. Applied over a
+        // candidate window so an item just below the cut can rise.
         let ranked = self
-            .apply_importance_boost(ranked, max_results.saturating_mul(3))
+            .apply_ranking_signals(ranked, max_results.saturating_mul(3))
             .await;
 
         // Limit + load real content
@@ -1257,6 +1260,21 @@ fn local_embedding_client() -> Arc<dyn EmbeddingClient> {
          local-embeddings feature; using the proxy"
     );
     proxy_embedding_client()
+}
+
+/// Recency score in [0, 1] from an RFC3339 timestamp: 1.0 for "now", decaying
+/// with an ~30-day half-life. Returns 0 for unparseable timestamps.
+fn recency_score(created_at: &str) -> f32 {
+    const HALF_LIFE_DAYS: f32 = 30.0;
+    match chrono::DateTime::parse_from_rfc3339(created_at) {
+        Ok(dt) => {
+            let age_days = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc))
+                .num_days()
+                .max(0) as f32;
+            (-age_days / HALF_LIFE_DAYS).exp()
+        }
+        Err(_) => 0.0,
+    }
 }
 
 /// Deterministic memory id from `(session_id, content)`, so the same turn maps
@@ -1800,6 +1818,30 @@ mod tests {
         assert!(
             hp.unwrap() < lp.unwrap(),
             "higher-importance object should rank above the lower-importance one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recency_weighted_ranking() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        // Same importance, same match terms; only age differs.
+        let mut old = KnowledgeObject::new("enterprise widget historical")
+            .with_keywords(vec!["enterprise".into()]);
+        old.created_at = chrono::Utc::now() - chrono::Duration::days(120);
+        let old_id = engine.insert(old).await.unwrap();
+        let new_id = engine
+            .insert(
+                KnowledgeObject::new("enterprise widget current")
+                    .with_keywords(vec!["enterprise".into()]),
+            )
+            .await
+            .unwrap();
+
+        let resp = engine.ask("enterprise widget", 5).await.unwrap();
+        let pos = |id: ObjectId| resp.results.iter().position(|r| r.id == id.to_string());
+        assert!(
+            pos(new_id).unwrap() < pos(old_id).unwrap(),
+            "more recent object should rank above the older one"
         );
     }
 

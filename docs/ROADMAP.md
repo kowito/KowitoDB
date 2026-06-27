@@ -15,8 +15,9 @@ research notes; each item below tags maturity and the key paper/system.
 ## Recently shipped (v0.2 → v0.10)
 
 - ✅ Retrieval quality: Contextual Retrieval (v0.9), CRAG-style corrective gate
-  (v0.10), Mem0 searchable memory + graph links (v0.15–0.16), importance-weighted
-  ranking (v0.17); RRF hybrid fusion + rule-engine query routing were already present
+  (v0.10), Mem0 searchable memory + graph links (v0.15–0.16), importance- and
+  recency-weighted ranking (v0.17–0.18); RRF hybrid fusion + rule-engine query
+  routing were already present
 
 - ✅ Data plane: batch insert, metadata-filtered retrieval, list/pagination
 - ✅ Real embeddings (on-device Candle / OpenAI / Ollama), HNSW recall fix (~94%)
