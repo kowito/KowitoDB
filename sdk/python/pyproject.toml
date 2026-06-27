@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kowitodb"
-version = "0.3.0"
+version = "0.4.0"
 description = "AI Knowledge Operating System — Python SDK"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,7 +13,11 @@ authors = [{ name = "KowitoDB Contributors" }]
 
 [project.optional-dependencies]
 grpc = ["grpcio>=1.60", "grpcio-tools>=1.60"]
-all = ["kowitodb[grpc]"]
+langchain = ["langchain-core>=0.3"]
+llamaindex = ["llama-index-core>=0.10"]
+all = ["kowitodb[grpc]", "kowitodb[langchain]", "kowitodb[llamaindex]"]
 
+# Auto-discovers `kowitodb` and `kowitodb.integrations`.
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["kowitodb*"]

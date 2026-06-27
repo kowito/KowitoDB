@@ -343,3 +343,45 @@ The `kowitodb sql` CLI command uses a separate, lighter index-routed parser
 path (`sql_query`); the SDK `sql()` helpers do **not** use it. See
 [ARCHITECTURE.md → The DataFusion SQL path](ARCHITECTURE.md#the-datafusion-sql-path)
 for details.
+
+## Framework integrations (Python)
+
+The Python SDK ships LangChain and LlamaIndex adapters so KowitoDB can be used
+as a retriever / vector store directly inside those frameworks. Install the
+extra for the framework you use:
+
+```bash
+pip install "kowitodb[langchain]"
+pip install "kowitodb[llamaindex]"
+```
+
+**LangChain** — `kowitodb.integrations.langchain`:
+
+```python
+from kowitodb import KowitoDBClient
+from kowitodb.integrations.langchain import KowitoDBRetriever, KowitoDBVectorStore
+
+client = KowitoDBClient("localhost:50051")
+
+retriever = KowitoDBRetriever(client=client, max_results=5)   # uses ai.ask() by default
+docs = retriever.invoke("which customers renewed after Series A?")
+
+store = KowitoDBVectorStore(client)                            # embedding happens server-side
+store.add_texts(["Acme renewed.", "Globex churned."],
+                metadatas=[{"company": "Acme"}, {"company": "Globex"}])
+hits = store.similarity_search("renewals", k=3)
+```
+
+**LlamaIndex** — `kowitodb.integrations.llamaindex`:
+
+```python
+from kowitodb import KowitoDBClient
+from kowitodb.integrations.llamaindex import KowitoDBRetriever
+
+retriever = KowitoDBRetriever(KowitoDBClient("localhost:50051"), top_k=5)
+nodes = retriever.retrieve("which customers renewed after Series A?")
+```
+
+Both retrievers default to the `ai.ask()` pipeline (intent detection,
+multi-index retrieval, graph traversal, rerank); pass `use_ask=False` for the
+raw `search()` path, and `metadata_filter=` to constrain by metadata.
