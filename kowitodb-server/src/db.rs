@@ -1078,19 +1078,33 @@ impl KowitoDBEngine {
         let count = session.turn_count() as u32;
         self.agent_memory.save(session);
 
-        // Promote to searchable knowledge (idempotent by stable id).
+        // Promote to searchable knowledge (idempotent by stable id), linked in
+        // the graph to the existing knowledge the turn mentions.
         if !matches!(turn_role, TurnRole::System) && !content.trim().is_empty() {
             let mem_id = stable_memory_id(session_id, &content);
             if self.get(mem_id).await?.is_none() {
+                let related = self.find_related_objects(&content, 3);
                 let mut obj = KnowledgeObject::new(content)
                     .with_metadata("session_id", session_id)
                     .with_metadata("role", role)
                     .with_metadata("kind", "memory");
                 obj.id = mem_id;
+                for target in related {
+                    obj = obj.with_relationship("mentions", target);
+                }
                 self.insert(obj).await?;
             }
         }
         Ok(count)
+    }
+
+    /// Up to `k` existing knowledge objects related to `text` (via the full-text
+    /// index) — used to link a new memory to the entities it mentions.
+    fn find_related_objects(&self, text: &str, k: usize) -> Vec<ObjectId> {
+        match self.fulltext_index.search(text, k) {
+            Ok(results) => results.into_iter().map(|(id, _)| id).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Comprehensive database stats.
@@ -1608,6 +1622,36 @@ mod tests {
                 .iter()
                 .any(|o| o.content.contains("helpful assistant")),
             "system turns are not promoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_links_to_related_knowledge() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+
+        // An existing knowledge entity.
+        let acme_id = engine
+            .insert(
+                KnowledgeObject::new("Acme Corp raised a Series A funding round")
+                    .with_keywords(vec!["acme".into()]),
+            )
+            .await
+            .unwrap();
+
+        // A turn that mentions it → the promoted memory links to it in the graph.
+        engine
+            .remember_turn("s1", "user", "I met with Acme about the renewal".into())
+            .await
+            .unwrap();
+
+        let mem_id = stable_memory_id("s1", "I met with Acme about the renewal");
+        let memory = engine.get(mem_id).await.unwrap().unwrap();
+        assert!(
+            memory
+                .relationships
+                .iter()
+                .any(|r| r.target_id == acme_id && r.relation_type == "mentions"),
+            "memory should be graph-linked to the Acme entity it mentions"
         );
     }
 

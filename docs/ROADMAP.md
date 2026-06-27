@@ -56,8 +56,11 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   searchable knowledge object (stable id → idempotent; `system` turns excluded),
   so past conversation is retrievable via `ai.ask()` and lives in the same store
   as ingested knowledge. The `RecordTurn` RPC routes through it.
+- ✅ **Shipped (v0.16):** **memory↔entity graph edges** — a promoted memory is
+  linked (`mentions`) to the existing knowledge it references (top full-text
+  matches), so memories and facts are mutually traversable in the graph.
 - 📋 **Remaining:** LLM-driven extract → consolidate → update (ADD/UPDATE/DELETE/
-  NOOP) for salient-fact distillation, and explicit memory↔entity graph edges.
+  NOOP) for salient-fact distillation.
 - **Why us:** we already persist agent memory **and** have a graph index — the
   most *differentiating* item; it makes "agent-memory OS" real.
 
