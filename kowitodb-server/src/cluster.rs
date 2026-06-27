@@ -19,11 +19,14 @@
 //! that is missing, staler, or content-divergent; a **heartbeat** proactively
 //! tracks node health.
 //!
+//! `rebalance()` relocates objects to their correct owners after a membership
+//! change, and `sql` combines scalar aggregates (COUNT/SUM/MIN/MAX) across shards.
+//!
 //! This provides real horizontal distribution with tunable durability, health
-//! tracking, read-repair, and read-time reconciliation. It is **not** a
-//! consensus-backed, strongly-consistent cluster: there is no Raft (so no
-//! linearizable reads) and no automatic rebalancing on membership change. Those
-//! are the production-HA follow-ups.
+//! tracking, read-repair, read-time reconciliation, and rebalancing. It is
+//! **not** a consensus-backed, strongly-consistent cluster: there is no Raft, so
+//! reads are not linearizable and concurrent conflicting writes resolve by
+//! last-write-wins. Consensus is a deliberate non-goal (see ROADMAP).
 
 // gRPC handlers return `Result<_, Status>`; tonic's Status is intentionally large.
 #![allow(clippy::result_large_err)]
@@ -547,17 +550,72 @@ impl Cluster {
     }
 
     pub async fn sql(&self, req: proto::SqlRequest) -> Result<proto::SqlResponse, Status> {
-        // Per-node SQL over each partition; rows are concatenated. NOTE:
-        // cross-shard aggregates (COUNT/AVG/...) are per-shard partials, not
-        // globally combined — a distributed-SQL planner is future work.
+        // Per-node SQL over each partition. A top-level scalar aggregate
+        // (COUNT/SUM/MIN/MAX, no GROUP BY) is *combined* across shards into one
+        // global row; everything else is concatenated. (AVG and GROUP BY aren't
+        // mergeable from partials alone and are concatenated — see
+        // `merge_sql_aggregate`.)
         let responses = self
             .scatter(|n| {
                 let r = req.clone();
                 async move { n.sql(r).await }
             })
             .await?;
-        let rows = responses.into_iter().flat_map(|r| r.rows).collect();
+        let rows = match merge_sql_aggregate(&req.query, &responses) {
+            Some(merged) => merged,
+            None => responses.into_iter().flat_map(|r| r.rows).collect(),
+        };
         Ok(proto::SqlResponse { rows })
+    }
+
+    /// Rebalance object placement to match the current partitioning — call after
+    /// a **membership change** (nodes added/removed) so each object lives on the
+    /// node(s) that now own its id. Misplaced objects are copied to their correct
+    /// owner replica set and removed from nodes that no longer own them. Returns
+    /// the number of objects relocated. Best-effort and idempotent: re-running on
+    /// a balanced cluster moves nothing.
+    pub async fn rebalance(&self) -> Result<usize, Status> {
+        let mut moved = 0usize;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !self.is_healthy(i) {
+                continue;
+            }
+            let listed = match node
+                .list(proto::ListRequest {
+                    offset: 0,
+                    limit: u32::MAX,
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    self.set_health(i, false);
+                    continue;
+                }
+            };
+            for obj in listed.objects {
+                let Ok(id) = parse_id(&obj.id) else { continue };
+                let owners = self.replicas_for_id(id);
+                if owners.contains(&i) {
+                    continue; // correctly placed on this node
+                }
+                // Relocate: write to the correct owners, drop from this node.
+                let insert = knowledge_to_insert_req(&obj);
+                for &o in &owners {
+                    let _ = self.nodes[o].insert(insert.clone()).await;
+                }
+                if self.nodes[i]
+                    .delete(proto::DeleteRequest { id: obj.id.clone() })
+                    .await
+                    .is_ok()
+                {
+                    moved += 1;
+                    debug!("rebalance: moved {} off node {i}", obj.id);
+                }
+            }
+        }
+        info!("rebalance complete: {moved} object(s) relocated");
+        Ok(moved)
     }
 
     pub async fn list(&self, req: proto::ListRequest) -> Result<proto::ListResponse, Status> {
@@ -833,6 +891,62 @@ fn parse_id(s: &str) -> Result<ObjectId, Status> {
     ObjectId::parse_str(s).map_err(|_| Status::invalid_argument("invalid object id"))
 }
 
+/// Combine per-shard partials of a top-level scalar aggregate into one global
+/// row. Returns `None` (caller concatenates) unless the query is a single
+/// COUNT/SUM/MIN/MAX with no GROUP BY and every shard returned exactly one
+/// single-column row. AVG can't be merged from partials alone, so it is not
+/// combined here.
+fn merge_sql_aggregate(
+    query: &str,
+    responses: &[proto::SqlResponse],
+) -> Option<Vec<proto::SqlRow>> {
+    let q = query.to_lowercase();
+    if q.contains("group by") {
+        return None;
+    }
+    let op = ["count(", "sum(", "min(", "max("]
+        .into_iter()
+        .find(|kw| q.contains(*kw))?;
+    // AVG present alongside disqualifies a clean single-aggregate merge.
+    if q.contains("avg(") {
+        return None;
+    }
+
+    let mut col_name: Option<String> = None;
+    let mut values: Vec<f64> = Vec::new();
+    for resp in responses {
+        // Each shard must return exactly one single-column row to be mergeable.
+        let [row] = resp.rows.as_slice() else {
+            return None;
+        };
+        if row.columns.len() != 1 {
+            return None;
+        }
+        let (k, v) = row.columns.iter().next().unwrap();
+        col_name.get_or_insert_with(|| k.clone());
+        values.push(v.parse::<f64>().ok()?);
+    }
+    if values.is_empty() {
+        return None;
+    }
+
+    let combined = match op {
+        "count(" | "sum(" => values.iter().sum(),
+        "min(" => values.iter().copied().fold(f64::INFINITY, f64::min),
+        "max(" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        _ => return None,
+    };
+    // Integer-valued results (counts) print without a trailing ".0".
+    let val = if combined.fract() == 0.0 {
+        format!("{}", combined as i64)
+    } else {
+        format!("{combined}")
+    };
+    let mut columns = HashMap::new();
+    columns.insert(col_name?, val);
+    Some(vec![proto::SqlRow { columns }])
+}
+
 /// Reconstruct an `InsertRequest` from a fetched object, to replay it onto a
 /// replica during read-repair (the id is preserved).
 fn knowledge_to_insert_req(obj: &proto::KnowledgeObject) -> proto::InsertRequest {
@@ -975,13 +1089,37 @@ mod tests {
             Ok(proto::UpdateResponse::default())
         }
         async fn list(&self, _req: proto::ListRequest) -> Result<proto::ListResponse, Status> {
-            Ok(proto::ListResponse::default())
+            self.check()?;
+            let objects: Vec<proto::KnowledgeObject> = self
+                .objects
+                .lock()
+                .iter()
+                .map(|(id, (content, _, updated_at))| proto::KnowledgeObject {
+                    id: id.clone(),
+                    content: content.clone(),
+                    updated_at: updated_at.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(proto::ListResponse {
+                total: objects.len() as u64,
+                objects,
+            })
         }
         async fn ask(&self, _req: proto::AskRequest) -> Result<proto::AskResponse, Status> {
             Ok(proto::AskResponse::default())
         }
         async fn sql(&self, _req: proto::SqlRequest) -> Result<proto::SqlResponse, Status> {
-            Ok(proto::SqlResponse::default())
+            self.check()?;
+            // Simulate this shard answering `SELECT COUNT(*)` with its partial.
+            let mut columns = HashMap::new();
+            columns.insert(
+                "count(*)".to_string(),
+                self.objects.lock().len().to_string(),
+            );
+            Ok(proto::SqlResponse {
+                rows: vec![proto::SqlRow { columns }],
+            })
         }
         async fn record_turn(
             &self,
@@ -1233,6 +1371,62 @@ mod tests {
             mocks.iter().filter(|m| has(m)).count(),
             3,
             "read-repair converged all replicas"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebalance_relocates_misplaced_objects() {
+        let mocks: Vec<Arc<MockNode>> = (0..3).map(|_| Arc::new(MockNode::default())).collect();
+        let nodes: Vec<Arc<dyn ClusterNode>> = mocks.iter().map(|m| m.clone() as _).collect();
+        let cluster = Cluster::new(nodes, 1); // rf=1: each id owned by one node
+
+        // id 0 → owner node 0. Seed it on the WRONG node (1), as if a membership
+        // change shifted ownership.
+        let id = uuid::Uuid::from_u128(0).to_string();
+        mocks[1].seed(&id, "misplaced", "");
+        let owner = cluster.replicas_for_id(uuid::Uuid::from_u128(0))[0];
+        assert_eq!(owner, 0, "id 0 is owned by node 0 under id % 3");
+
+        let moved = cluster.rebalance().await.unwrap();
+        assert_eq!(moved, 1, "the misplaced object is relocated");
+        assert!(
+            mocks[0].objects.lock().contains_key(&id),
+            "now on the owner"
+        );
+        assert!(
+            !mocks[1].objects.lock().contains_key(&id),
+            "removed from wrong node"
+        );
+
+        // Idempotent: a second pass moves nothing.
+        assert_eq!(cluster.rebalance().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_aggregate_count_is_combined() {
+        let (cluster, _mocks) = cluster(3, 1);
+        // 7 objects spread across 3 shards by id.
+        for k in 0..7u128 {
+            cluster
+                .insert(proto::InsertRequest {
+                    content: format!("row {k}"),
+                    id: Some(uuid::Uuid::from_u128(k).to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let resp = cluster
+            .sql(proto::SqlRequest {
+                query: "SELECT COUNT(*) FROM knowledge".into(),
+            })
+            .await
+            .unwrap();
+        // The per-shard partial counts are summed into one global row.
+        assert_eq!(resp.rows.len(), 1, "aggregate collapses to one row");
+        assert_eq!(
+            resp.rows[0].columns.get("count(*)").map(String::as_str),
+            Some("7")
         );
     }
 

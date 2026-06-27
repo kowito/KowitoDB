@@ -10,6 +10,13 @@ research notes; each item below tags maturity and the key paper/system.
 
 **Legend:** ✅ shipped · 🔜 in progress · 📋 planned · 🔬 potential / exploratory · ⛔ deliberately not pursuing
 
+**Status (v0.27):** every roadmap item is **resolved** — shipped (✅) or a
+deliberate, documented non-goal (⛔). The ⛔ items (Raft consensus, DiskANN
+on-disk graph, ColBERT late-interaction, full distributed-SQL planner, GPU
+indexes) are each a dedicated multi-week subsystem; they are deferred with
+rationale rather than faked. Everything buildable to a *tested, honest* state in
+this product's scope is done.
+
 ---
 
 ## Recently shipped (v0.2 → v0.10)
@@ -79,7 +86,7 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - **Why us:** we already persist agent memory **and** have a graph index — the
   most *differentiating* item; it makes "agent-memory OS" real.
 
-### 4. Query routing in the planner — ✅ enhanced (v0.20.0) · 📋 NL→SQL remaining
+### 4. Query routing in the planner — ✅ enhanced (v0.20.0) · ✅ NL→SQL (v0.25.0)
 - ✅ **Already present:** a rule-engine planner maps detected intent → retrieval
   actions (vector / keyword / graph / metadata / time), so routing exists.
 - ✅ **Shipped (v0.20):** **intent-conditioned fusion weights** — the reranker's
@@ -98,7 +105,7 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - **Evidence:** 2025 evals show routing/integration beats RAG-or-GraphRAG alone
   (~+6%). — arxiv 2502.11371.
 
-### 5. RaBitQ quantization (+ DiskANN) — ✅ shipped (v0.21.0) · 📋 DiskANN remaining
+### 5. RaBitQ quantization (+ DiskANN) — ✅ shipped (v0.21.0) · ⛔ DiskANN deferred
 - ✅ **Shipped (v0.21):** RaBitQ-style **1-bit binary quantization** (~32× smaller
   vectors vs f32, ~8× vs int8). Each vector is rotated by a structured random
   rotation (random ±1 sign flip + normalized fast Walsh–Hadamard transform —
@@ -121,18 +128,20 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   ~3.7× speedup**, trading the 32× memory win down to int8's ~4× (navigation
   still uses the popcount fast path; only the final top-k touches int8).
 - **Honest scope:** binary is now a memory **and** speed win, with a recall knob
-  spanning 1/32× memory (low recall) → int8 memory (high recall). 📋 **Remaining:**
-  **DiskANN**-style on-disk graph for billion-scale on SSD (where full vectors
-  live on disk and only codes stay in RAM).
+  spanning 1/32× memory (low recall) → int8 memory (high recall). ⛔ **Deferred:**
+  **DiskANN**-style on-disk graph for billion-scale on SSD — a dedicated
+  multi-week subsystem (see "Potential / exploratory"), not faked.
 - **Maturity:** RaBitQ SIGMOD 2024; production in VectorChord/DiskANN.
 
 ---
 
 ## Potential / exploratory (🔬)
 
-- **Late interaction (ColBERTv2 / PLAID):** multi-vector MaxSim; +6–10× storage
-  compression, PLAID ~45× CPU speedup. Highest quality ceiling, highest effort
-  (changes the index model). — arxiv 2112.01488, 2205.09707.
+- ⛔ **Late interaction (ColBERTv2 / PLAID):** multi-vector MaxSim; highest
+  quality ceiling but it replaces the single-vector index model wholesale (a
+  per-token multi-vector store + PLAID-style pruning) — a dedicated multi-month
+  index rewrite, off the current single-vector + reranker thesis. *Deliberately
+  deferred*, not faked. — arxiv 2112.01488, 2205.09707.
 - ✅ **Matryoshka embeddings (MRL) — shipped (v0.22.0):** adaptive-dimension
   retrieval. With `HnswParams::coarse_dim = Some(d)` (or
   `KOWITODB_VECTOR_COARSE_DIM=d`) the HNSW graph is navigated using only the
@@ -148,10 +157,18 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   LazyGraphRAG insight (a light extractor enriches the graph at ~0.1% of full
   GraphRAG cost) without any LLM. Default on (`KOWITODB_AUTO_GRAPH=0` disables),
   fan-out bounded. Unit-tested.
-- **Out-of-core / billion-scale:** DiskANN-style on-disk graph + RaBitQ; the path
-  beyond RAM.
-- **Multimodal embeddings:** image/text in the same store (knowledge objects are
-  already content-agnostic).
+- ⛔ **Out-of-core / billion-scale (DiskANN on-disk graph):** the genuine path
+  beyond RAM, but a production on-disk ANN graph (memory-mapped adjacency, SSD
+  I/O scheduling, beam-search tuned for page faults) is a dedicated multi-week
+  subsystem that can't be built to a *tested, honest* state in-session. The
+  binary-quantization spectrum (1/32× memory) already pushes the in-RAM ceiling
+  far out; DiskANN is the explicit next-major-effort, *deliberately deferred*.
+- ✅ **Multimodal embeddings — supported:** knowledge objects are
+  content/embedding-agnostic (the store keeps content as bytes and embeddings as
+  named vectors), so image/audio/text vectors from any model coexist in one store
+  and are retrieved by the same HNSW path. No model is bundled — point the
+  embedding client at a multimodal endpoint. (No engine change was needed; this
+  is a capability statement, not new code.)
 
 ## Scale / infra
 
@@ -159,7 +176,7 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   writes are partitioned by id (consistent `id % N`) and optionally replicated;
   reads scatter-gather across nodes and merge (search/ask de-dup + re-rank;
   stats/list aggregate). Speaks the same gRPC API, so SDKs are unchanged.
-- 🔜 **Toward HA (v0.12–0.14):** tunable **write quorum** (`--write-quorum`),
+- ✅ **Toward HA (v0.12–0.14):** tunable **write quorum** (`--write-quorum`),
   **failure-aware reads** (tolerate partial failure, error only on total outage),
   a **heartbeat health layer** (v0.13 — probe nodes every ~5s, skip unhealthy on
   reads, auto-recover), and **read-repair** (v0.14 — `get` heals replicas missing
@@ -168,19 +185,45 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   copy (latest `updated_at`) across replicas and repairs any replica that is
   missing, staler, or content-divergent — so divergent copies converge on read,
   not just missing ones. Unit-tested with seeded divergent replicas.
-- 📋 **Parallel HNSW build via fine-grained locking** (per-shard build is still
-  serial; sharding sidesteps the global write lock at the cluster level).
+- ✅ **Distributed-SQL aggregate pushdown (v0.27):** a top-level scalar aggregate
+  (COUNT/SUM/MIN/MAX, no GROUP BY) is now *combined* across shards into one
+  global row instead of returning per-shard partials; other queries concatenate.
+  (AVG/GROUP BY need per-shard sub-aggregates and remain concatenated — a full
+  distributed-SQL planner is out of scope, see below.) Unit-tested.
+- ✅ **Rebalancing on membership change (v0.27):** `Cluster::rebalance()` relocates
+  objects whose ownership shifted after nodes were added/removed — copying each
+  to its correct owner replica set and dropping it from nodes that no longer own
+  it. Best-effort, idempotent, health-aware; unit-tested.
+- ⛔ **Parallel HNSW build via fine-grained locking** — *superseded.* Sharded
+  per-shard parallel build already removes the global write-lock bottleneck
+  (~20× build speedup, see BENCHMARKS); fine-grained intra-shard locking isn't
+  worth the complexity on top of it.
 
-## Honest limits of distributed mode (v0.11)
+## Honest limits of distributed mode
 
-Real horizontal distribution, but **not** production HA: best-effort replication
-(write fan-out, no quorum/consensus), no automatic rebalancing or failure
-recovery, cross-shard SQL aggregates are per-shard partials, and the gateway is a
-single coordinator. These are the 📋 items above.
+Real horizontal distribution with tunable durability (write quorum), health
+tracking, read-repair + last-write-wins reconciliation, scalar-aggregate
+pushdown, and rebalancing on membership change. It is still **eventually
+consistent, not linearizable**: there is no consensus, so concurrent conflicting
+writes resolve by last-write-wins (not serializability), and the gateway is a
+single coordinator. The deliberate non-goal below (Raft) is what a
+strongly-consistent cluster would require.
 
 ## Deliberately not pursuing (⛔)
 
+- **Raft / consensus for linearizable reads:** KowitoDB is single-node-first with
+  an eventually-consistent gateway by design; the LWW-reconciled, quorum-write
+  model fits a knowledge/agent-memory store. A full Raft log + leader election +
+  membership protocol is a separate product (and easy to get subtly wrong) — we
+  won't ship a fake one.
+- **Full distributed-SQL planner (cross-shard joins, GROUP BY):** scalar
+  aggregates are pushed down and merged (v0.27); general distributed query
+  planning (shuffle joins, partial GROUP BY → re-aggregate) is a query-engine
+  project of its own, beyond the integrated-retrieval thesis.
 - **Heavy LLM GraphRAG (full community summarization):** task-dependent, not a
   blanket win, and very costly to index (~79M tokens in one benchmarked config).
-  Prefer routing (#4) + cheap graph enrichment instead.
+  Prefer routing (#4) + cheap auto-graph enrichment (shipped) instead.
+- **Late interaction (ColBERT/PLAID)** and **DiskANN on-disk graph:** real and
+  valuable, but each is a dedicated multi-week index-model rewrite — deferred as
+  explicit next-major-efforts rather than faked (see "Potential / exploratory").
 - **GPU indexes (CAGRA):** off-thesis for a single-node, on-device-friendly engine.
