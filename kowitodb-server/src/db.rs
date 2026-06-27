@@ -38,7 +38,18 @@ fn vector_shard_count() -> usize {
 /// Whether to int8-quantize stored vectors (4× less memory), via
 /// `KOWITODB_VECTOR_QUANTIZE=1`. Off by default.
 fn vector_quantize_enabled() -> bool {
-    std::env::var("KOWITODB_VECTOR_QUANTIZE")
+    env_flag("KOWITODB_VECTOR_QUANTIZE")
+}
+
+/// Whether to RaBitQ-style 1-bit binary-quantize stored vectors (~32× less
+/// memory), via `KOWITODB_VECTOR_BINARY_QUANTIZE=1`. Off by default; takes
+/// precedence over int8 quantization when both are set.
+fn vector_binary_quantize_enabled() -> bool {
+    env_flag("KOWITODB_VECTOR_BINARY_QUANTIZE")
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
         .unwrap_or(false)
 }
@@ -47,6 +58,7 @@ fn vector_quantize_enabled() -> bool {
 fn vector_index_params() -> HnswParams {
     HnswParams {
         quantize: vector_quantize_enabled(),
+        binary_quantize: vector_binary_quantize_enabled(),
         ..Default::default()
     }
 }

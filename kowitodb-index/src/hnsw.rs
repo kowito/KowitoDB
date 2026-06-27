@@ -30,12 +30,98 @@ type NodeMap = HashMap<ObjectId, HnswNode, ahash::RandomState>;
 /// as produced by the embedding models KowitoDB uses.
 const QUANT_SCALE: f32 = 127.0;
 
-/// Stored vector — either full f32 precision or int8-quantized (4× smaller).
+/// Fixed seed for the structured random rotation used by binary quantization.
+/// Deterministic so a saved index reloads with the same basis.
+const ROTATION_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// In-place fast Walsh–Hadamard transform. `a.len()` must be a power of two.
+fn fwht(a: &mut [f32]) {
+    let n = a.len();
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let x = a[j];
+                let y = a[j + h];
+                a[j] = x + y;
+                a[j + h] = x - y;
+            }
+            i += 2 * h;
+        }
+        h *= 2;
+    }
+}
+
+/// A structured random rotation (random ±1 sign flip followed by a normalized
+/// fast Walsh–Hadamard transform). Orthonormal, so it preserves L2 distances
+/// while decorrelating coordinates — the precondition that makes 1-bit
+/// (sign) quantization a well-behaved estimator (RaBitQ, SIGMOD 2024). Cheap
+/// O(d log d) to apply and trivially serializable (just the sign vector).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Rotation {
+    /// ±1 per padded dimension.
+    signs: Vec<f32>,
+    /// Working dimension (the original dim rounded up to a power of two).
+    dim_padded: usize,
+}
+
+impl Rotation {
+    fn new(orig_dim: usize, seed: u64) -> Self {
+        let dim_padded = orig_dim.max(1).next_power_of_two();
+        // Deterministic ±1 signs from a SplitMix64-style stream.
+        let mut state = seed | 1;
+        let signs = (0..dim_padded)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (state >> 63) & 1 == 1 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            })
+            .collect();
+        Self { signs, dim_padded }
+    }
+
+    /// Rotate `v` into the working basis (length `dim_padded`).
+    fn apply(&self, v: &[f32]) -> Vec<f32> {
+        let mut buf = vec![0.0f32; self.dim_padded];
+        for i in 0..v.len().min(self.dim_padded) {
+            buf[i] = v[i] * self.signs[i];
+        }
+        fwht(&mut buf);
+        let scale = 1.0 / (self.dim_padded as f32).sqrt();
+        for x in &mut buf {
+            *x *= scale;
+        }
+        buf
+    }
+}
+
+/// Stored vector — full f32, int8-quantized (4× smaller), or RaBitQ-style
+/// 1-bit binary (~32× smaller).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum NodeVector {
     Full(Vec<f32>),
     /// Scalar-quantized to int8 at `QUANT_SCALE`; dequantized on the fly.
     Quantized(Vec<i8>),
+    /// RaBitQ-style 1-bit code over the *rotated* vector: one sign bit per
+    /// working dimension plus two scalars for an unbiased distance estimator.
+    /// Queries are searched in the same rotated basis (see [`Rotation`]).
+    Binary {
+        /// Sign bits, packed 64 per word (bit set ⇔ rotated component ≥ 0).
+        code: Vec<u64>,
+        /// ‖o‖² of the original vector.
+        norm_sq: f32,
+        /// `‖o‖²·√D / Σ|õ_i|` — rescales the sign-dot into an inner-product
+        /// estimate (handles the quantization-induced shrinkage).
+        factor: f32,
+        /// Working (padded) dimension.
+        dim_padded: usize,
+    },
 }
 
 impl NodeVector {
@@ -53,7 +139,36 @@ impl NodeVector {
         }
     }
 
-    /// Squared Euclidean distance to a full-precision query vector.
+    /// Build a 1-bit binary code from an already-rotated vector `rotated`
+    /// (length `dim_padded`).
+    fn new_binary(rotated: &[f32], dim_padded: usize) -> Self {
+        let words = dim_padded.div_ceil(64);
+        let mut code = vec![0u64; words];
+        let mut abs_sum = 0.0f32;
+        let mut norm_sq = 0.0f32;
+        for (i, &x) in rotated.iter().enumerate().take(dim_padded) {
+            norm_sq += x * x;
+            abs_sum += x.abs();
+            if x >= 0.0 {
+                code[i / 64] |= 1u64 << (i % 64);
+            }
+        }
+        let factor = if abs_sum > 0.0 {
+            norm_sq * (dim_padded as f32).sqrt() / abs_sum
+        } else {
+            0.0
+        };
+        NodeVector::Binary {
+            code,
+            norm_sq,
+            factor,
+            dim_padded,
+        }
+    }
+
+    /// Squared Euclidean distance to a query vector. For `Full`/`Quantized` the
+    /// query is in the original space; for `Binary` it is the **rotated** query
+    /// (length `dim_padded`), and the result is the RaBitQ distance *estimate*.
     #[inline]
     fn dist_sq(&self, query: &[f32]) -> f32 {
         match self {
@@ -66,6 +181,27 @@ impl NodeVector {
                     d * d
                 })
                 .sum(),
+            NodeVector::Binary {
+                code,
+                norm_sq,
+                factor,
+                dim_padded,
+            } => {
+                let mut signed_sum = 0.0f32;
+                let mut q_norm_sq = 0.0f32;
+                for (i, &qi) in query.iter().enumerate().take(*dim_padded) {
+                    q_norm_sq += qi * qi;
+                    let bit = (code[i / 64] >> (i % 64)) & 1;
+                    if bit == 1 {
+                        signed_sum += qi;
+                    } else {
+                        signed_sum -= qi;
+                    }
+                }
+                let inv_sqrt = 1.0 / (*dim_padded as f32).sqrt();
+                let ip_est = *factor * signed_sum * inv_sqrt;
+                (*norm_sq + q_norm_sq - 2.0 * ip_est).max(0.0)
+            }
         }
     }
 }
@@ -118,6 +254,12 @@ pub struct HnswParams {
     /// Off by default; best for normalized embeddings.
     #[serde(default)]
     pub quantize: bool,
+    /// Store vectors RaBitQ-style 1-bit binary (~32× less memory) over a
+    /// structured random rotation. Off by default; takes precedence over
+    /// `quantize` when both are set. Recall is lower than full/int8 but the
+    /// memory win is the lever for very large in-RAM collections.
+    #[serde(default)]
+    pub binary_quantize: bool,
 }
 
 impl Default for HnswParams {
@@ -133,6 +275,7 @@ impl Default for HnswParams {
             m_max: m,
             m0: 2 * m,
             quantize: false,
+            binary_quantize: false,
         }
     }
 }
@@ -147,6 +290,10 @@ pub struct HnswIndex {
     entry_point: Arc<RwLock<Option<ObjectId>>>,
     /// Current maximum layer across all nodes.
     max_layer: Arc<RwLock<usize>>,
+    /// Structured random rotation for binary quantization (lazily created on
+    /// the first insert once the dimensionality is known). `None` unless
+    /// `params.binary_quantize` is set.
+    rotation: Arc<RwLock<Option<Rotation>>>,
     /// Configuration.
     params: HnswParams,
 }
@@ -158,6 +305,8 @@ struct HnswSnapshotRef<'a> {
     nodes: &'a NodeMap,
     entry_point: Option<ObjectId>,
     max_layer: usize,
+    #[serde(default)]
+    rotation: Option<Rotation>,
 }
 
 /// Owned snapshot for deserialization on `load`.
@@ -167,6 +316,8 @@ struct HnswSnapshot {
     nodes: NodeMap,
     entry_point: Option<ObjectId>,
     max_layer: usize,
+    #[serde(default)]
+    rotation: Option<Rotation>,
 }
 
 impl HnswIndex {
@@ -175,6 +326,7 @@ impl HnswIndex {
             nodes: Arc::new(RwLock::new(NodeMap::default())),
             entry_point: Arc::new(RwLock::new(None)),
             max_layer: Arc::new(RwLock::new(0)),
+            rotation: Arc::new(RwLock::new(None)),
             params,
         }
     }
@@ -190,9 +342,28 @@ impl HnswIndex {
         // Compute random layer using exponential distribution
         let node_layer = self.random_layer();
 
+        // Binary quantization navigates the graph in a rotated basis (so 1-bit
+        // sign codes are a good estimator); `search_vec` is the query used for
+        // all neighbor searches below — rotated when binary, raw otherwise.
+        let (node_vector, rotated) = if self.params.binary_quantize {
+            let mut rot = self.rotation.write();
+            if rot.is_none() {
+                *rot = Some(Rotation::new(vector.len(), ROTATION_SEED));
+            }
+            let r = rot.as_ref().unwrap();
+            let rotated = r.apply(&vector);
+            (
+                NodeVector::new_binary(&rotated, r.dim_padded),
+                Some(rotated),
+            )
+        } else {
+            (NodeVector::new(vector.clone(), self.params.quantize), None)
+        };
+        let search_vec: &[f32] = rotated.as_deref().unwrap_or(&vector);
+
         let mut node = HnswNode {
             id,
-            vector: NodeVector::new(vector.clone(), self.params.quantize),
+            vector: node_vector,
             max_layer: node_layer,
             neighbors: HashMap::new(),
         };
@@ -220,7 +391,7 @@ impl HnswIndex {
         // Greedy descent from top layer to node_layer + 1
         for lc in ((node_layer + 1)..=global_max).rev() {
             if curr_ep_exists {
-                let (nearest, _) = self.search_layer_greedy(&vector, &[curr_ep], lc, 1, &nodes);
+                let (nearest, _) = self.search_layer_greedy(search_vec, &[curr_ep], lc, 1, &nodes);
                 if let Some(nearest_id) = nearest.into_iter().next() {
                     curr_ep = nearest_id;
                     curr_ep_exists = nodes.contains_key(&nearest_id);
@@ -234,8 +405,13 @@ impl HnswIndex {
 
         for lc in (0..=start_layer).rev() {
             // Search for neighbors at this layer
-            let (candidates, _) =
-                self.search_layer_beam(&vector, &ep_set, lc, self.params.ef_construction, &nodes);
+            let (candidates, _) = self.search_layer_beam(
+                search_vec,
+                &ep_set,
+                lc,
+                self.params.ef_construction,
+                &nodes,
+            );
 
             // Select M (or M0 at layer 0) best neighbors
             let m = if lc == 0 {
@@ -244,7 +420,7 @@ impl HnswIndex {
                 self.params.m
             };
             let selected: Vec<ObjectId> =
-                self.select_neighbors_heuristic(&vector, &candidates, m, lc, &nodes);
+                self.select_neighbors_heuristic(search_vec, &candidates, m, lc, &nodes);
 
             // Add bidirectional edges
             node.neighbors.entry(lc).or_default();
@@ -308,6 +484,11 @@ impl HnswIndex {
             None => return Vec::new(),
         };
 
+        // In binary mode the graph lives in the rotated basis, so rotate the
+        // query once and navigate with it.
+        let rotated = self.rotation.read().as_ref().map(|r| r.apply(query));
+        let query: &[f32] = rotated.as_deref().unwrap_or(query);
+
         // Greedy descent from top layer to layer 1
         let mut curr_ep = ep;
         let global_max = *max_layer;
@@ -355,6 +536,7 @@ impl HnswIndex {
             nodes: &nodes,
             entry_point: *self.entry_point.read(),
             max_layer: *self.max_layer.read(),
+            rotation: self.rotation.read().clone(),
         };
         bincode::serialize(&snapshot).map_err(std::io::Error::other)
     }
@@ -366,6 +548,7 @@ impl HnswIndex {
             nodes: Arc::new(RwLock::new(snapshot.nodes)),
             entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
             max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
+            rotation: Arc::new(RwLock::new(snapshot.rotation)),
             params: snapshot.params,
         })
     }
@@ -646,6 +829,87 @@ mod tests {
             results[0].0, *qid,
             "exact match should remain top-1 under int8 quantization"
         );
+    }
+
+    #[test]
+    fn test_binary_quantized_search_recall() {
+        // RaBitQ-style 1-bit index: exact matches stay near the top and
+        // recall@10 vs brute force is reasonable despite ~32× compression.
+        let idx = HnswIndex::new(HnswParams {
+            m: 16,
+            ef_construction: 100,
+            ef_search: 100,
+            binary_quantize: true,
+            ..Default::default()
+        });
+        let mut items = Vec::new();
+        for i in 0..200u32 {
+            let id = uuid::Uuid::from_u128(i as u128 + 1);
+            let v: Vec<f32> = (0..64)
+                .map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin())
+                .collect();
+            idx.insert(id, v.clone());
+            items.push((id, v));
+        }
+
+        let (qid, qv) = &items[42];
+        let res = idx.search(qv, 5);
+        assert!(
+            res.iter().take(3).any(|(id, _)| id == qid),
+            "exact match should be near top-1 under binary quantization"
+        );
+
+        // Recall@10 vs brute-force ground truth over a few probes.
+        let probes = [7usize, 99, 150];
+        let (mut hit, mut total) = (0usize, 0usize);
+        for &p in &probes {
+            let q = &items[p].1;
+            let mut bf: Vec<_> = items
+                .iter()
+                .map(|(id, v)| (*id, squared_dist(q, v)))
+                .collect();
+            bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
+            for (id, _) in idx.search(q, 10) {
+                if truth.contains(&id) {
+                    hit += 1;
+                }
+                total += 1;
+            }
+        }
+        let recall = hit as f32 / total as f32;
+        assert!(recall >= 0.5, "binary recall@10 too low: {recall}");
+    }
+
+    #[test]
+    fn test_binary_quantized_save_load() {
+        let idx = HnswIndex::new(HnswParams {
+            m: 8,
+            ef_construction: 50,
+            ef_search: 50,
+            binary_quantize: true,
+            ..Default::default()
+        });
+        let mut items = Vec::new();
+        for i in 0..60u32 {
+            let id = uuid::Uuid::from_u128(i as u128 + 1);
+            let v: Vec<f32> = (0..32)
+                .map(|j| (((i * 11 + j * 5) as f32) * 0.1).sin())
+                .collect();
+            idx.insert(id, v.clone());
+            items.push((id, v));
+        }
+
+        let path = std::env::temp_dir().join(format!("kowitodb-bq-{}.bin", uuid::Uuid::new_v4()));
+        idx.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path).unwrap().expect("snapshot loads");
+
+        // The rotation must survive the round-trip, so results match exactly.
+        let q = &items[20].1;
+        let before: Vec<_> = idx.search(q, 5).into_iter().map(|(id, _)| id).collect();
+        let after: Vec<_> = loaded.search(q, 5).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(before, after, "binary search must survive save/load");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

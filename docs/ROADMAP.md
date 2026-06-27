@@ -88,11 +88,23 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
 - **Evidence:** 2025 evals show routing/integration beats RAG-or-GraphRAG alone
   (~+6%). — arxiv 2502.11371.
 
-### 5. RaBitQ quantization (+ DiskANN) — 🔬 potential (the real scale lever)
-Upgrade int8 SQ → ~1 bit/dim with a *theoretical* error bound (~32× compression);
-DiskANN + RaBitQ enables billion-scale on SSD.
+### 5. RaBitQ quantization (+ DiskANN) — ✅ shipped (v0.21.0) · 📋 DiskANN remaining
+- ✅ **Shipped (v0.21):** RaBitQ-style **1-bit binary quantization** (~32× smaller
+  vectors vs f32, ~8× vs int8). Each vector is rotated by a structured random
+  rotation (random ±1 sign flip + normalized fast Walsh–Hadamard transform —
+  orthonormal, O(d log d), decorrelates coordinates so sign quantization is a
+  well-behaved estimator), stored as one sign bit/dim plus two scalars, and the
+  graph is navigated in the rotated basis. Distances use the **unbiased RaBitQ
+  estimator** (`‖o‖² + ‖q‖² − 2·factor·⟨sign,q̃⟩/√D`). Enabled with
+  `KOWITODB_VECTOR_BINARY_QUANTIZE=1` (or `HnswParams::binary_quantize`); the
+  rotation persists in the index snapshot. Recall@10 validated vs brute force in
+  a unit test; exact matches stay near top-1.
+- **Honest scope:** the win here is **memory** (the lever for very large in-RAM
+  collections), not yet query *speed* — the estimator is still O(d) per node.
+  📋 **Remaining:** an int-quantized-query **popcount fast path** (bitwise
+  distance) for the speedup, and **DiskANN**-style on-disk graph for true
+  billion-scale on SSD.
 - **Maturity:** RaBitQ SIGMOD 2024; production in VectorChord/DiskANN.
-- **Effort:** medium-high (math-heavy). Slots into the existing `quantize` param.
 
 ---
 

@@ -82,6 +82,17 @@ costs a few points of recall: **~91% recall@10** (vs ~100% sharded full
 precision). It assumes ~unit-norm embeddings (the models KowitoDB uses produce
 these). Off by default.
 
+**RaBitQ-style 1-bit binary quantization** (`HnswParams { binary_quantize: true }`,
+or `KOWITODB_VECTOR_BINARY_QUANTIZE=1`) goes further — **~32× less memory** than
+f32 (one sign bit per dimension plus two scalars). Each vector is rotated by a
+structured random rotation (random ±1 signs + a normalized fast Walsh–Hadamard
+transform, O(d log d)) so the sign codes are a good estimator, and distances use
+the unbiased RaBitQ estimator. The trade is recall (lower than int8 — a unit test
+asserts recall@10 ≥ 0.5 on a 64-dim synthetic set, with exact matches near top-1),
+and at present it is a memory win, not a query-speed win (the estimator is still
+O(d) per node; a popcount fast path is future work). Off by default; takes
+precedence over int8 when both are set.
+
 ## Optimizations
 
 The hot path (graph traversal + distance) was tuned without changing recall:
