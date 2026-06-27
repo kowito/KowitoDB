@@ -14,10 +14,15 @@
 //!   surfaces as an error (vs. an empty "no matches" result).
 //! - **Agent sessions** partition by `session_id`.
 //!
-//! This provides real horizontal distribution with tunable write durability. It
-//! is **not** a consensus-backed, strongly-consistent cluster: there is no Raft
-//! (so no linearizable reads), no automatic rebalancing on membership change, and
-//! no read-repair. Those are the production-HA follow-ups.
+//! `get` performs **read-repair**: replicas missing an object are healed from a
+//! replica that has it (converging after a quorum write that reached only W of R
+//! replicas), and a **heartbeat** proactively tracks node health.
+//!
+//! This provides real horizontal distribution with tunable durability, health
+//! tracking, and read-repair. It is **not** a consensus-backed, strongly-
+//! consistent cluster: there is no Raft (so no linearizable reads), no automatic
+//! rebalancing on membership change, and no version reconciliation for divergent
+//! copies. Those are the production-HA follow-ups.
 
 // gRPC handlers return `Result<_, Status>`; tonic's Status is intentionally large.
 #![allow(clippy::result_large_err)]
@@ -29,7 +34,7 @@ use std::sync::Arc;
 use kowitodb_core::ObjectId;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::proto;
 use crate::proto::kowito_db_client::KowitoDbClient;
@@ -366,16 +371,57 @@ impl Cluster {
 
     // ---- Id-keyed ops ----
 
+    /// Read an object, with **read-repair**: query all healthy replicas; if some
+    /// have the object and others are missing it (e.g. after a quorum write that
+    /// reached only W of R replicas), write it back to the missing replicas so
+    /// the cluster converges. (Version reconciliation for *divergent* copies
+    /// needs proper versioning and is future work — this handles the common
+    /// missing-replica case.)
     pub async fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, Status> {
         let id = parse_id(&req.id)?;
-        for &i in &self.replicas_for_id(id) {
-            if let Ok(resp) = self.nodes[i].get(req.clone()).await {
-                if resp.object.is_some() {
-                    return Ok(resp);
+        let replicas: Vec<usize> = self
+            .replicas_for_id(id)
+            .into_iter()
+            .filter(|&i| self.is_healthy(i))
+            .collect();
+
+        let futures = replicas.iter().map(|&i| {
+            let node = self.nodes[i].clone();
+            let req = req.clone();
+            async move { (i, node.get(req).await) }
+        });
+        let outcomes = futures::future::join_all(futures).await;
+
+        let mut found: Option<proto::KnowledgeObject> = None;
+        let mut missing: Vec<usize> = Vec::new();
+        for (i, outcome) in outcomes {
+            match outcome {
+                Ok(resp) => {
+                    self.set_health(i, true);
+                    match resp.object {
+                        Some(obj) => {
+                            if found.is_none() {
+                                found = Some(obj);
+                            }
+                        }
+                        None => missing.push(i),
+                    }
+                }
+                Err(_) => self.set_health(i, false),
+            }
+        }
+
+        if let Some(obj) = &found {
+            if !missing.is_empty() {
+                let repair = knowledge_to_insert_req(obj);
+                for i in missing {
+                    if self.nodes[i].insert(repair.clone()).await.is_ok() {
+                        debug!("read-repair: restored {} on node {i}", obj.id);
+                    }
                 }
             }
         }
-        Ok(proto::GetResponse { object: None })
+        Ok(proto::GetResponse { object: found })
     }
 
     pub async fn update(&self, req: proto::UpdateRequest) -> Result<proto::UpdateResponse, Status> {
@@ -773,6 +819,28 @@ fn parse_id(s: &str) -> Result<ObjectId, Status> {
     ObjectId::parse_str(s).map_err(|_| Status::invalid_argument("invalid object id"))
 }
 
+/// Reconstruct an `InsertRequest` from a fetched object, to replay it onto a
+/// replica during read-repair (the id is preserved).
+fn knowledge_to_insert_req(obj: &proto::KnowledgeObject) -> proto::InsertRequest {
+    proto::InsertRequest {
+        id: Some(obj.id.clone()),
+        content: obj.content.clone(),
+        embeddings: obj.embeddings.clone(),
+        metadata: obj.metadata.clone(),
+        keywords: obj.keywords.clone(),
+        relationships: obj
+            .relationships
+            .iter()
+            .map(|r| proto::RelationshipInput {
+                relation_type: r.relation_type.clone(),
+                target_id: r.target_id.clone(),
+                weight: r.weight,
+            })
+            .collect(),
+        importance: obj.importance,
+    }
+}
+
 fn parse_or_new_id(s: Option<&str>) -> ObjectId {
     s.and_then(|s| ObjectId::parse_str(s).ok())
         .unwrap_or_else(uuid::Uuid::new_v4)
@@ -1101,5 +1169,46 @@ mod tests {
         mocks[1].set_fail(false);
         cluster.heartbeat_once().await;
         assert!(cluster.is_healthy(1));
+    }
+
+    #[tokio::test]
+    async fn test_read_repair() {
+        // 3 replicas (rf=3=n), write_quorum=1 → a write can land on just 1 node.
+        let mocks: Vec<Arc<MockNode>> = (0..3).map(|_| Arc::new(MockNode::default())).collect();
+        let nodes: Vec<Arc<dyn ClusterNode>> = mocks.iter().map(|m| m.clone() as _).collect();
+        let cluster = Cluster::new(nodes, 3); // write_quorum defaults to 1
+        let id = uuid::Uuid::from_u128(0).to_string();
+        let has = |m: &Arc<MockNode>| m.objects.lock().contains_key(&id);
+
+        // Two replicas down during the write → only node 0 stores it (quorum 1 ok).
+        mocks[1].set_fail(true);
+        mocks[2].set_fail(true);
+        cluster
+            .insert(proto::InsertRequest {
+                content: "durable".into(),
+                id: Some(id.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mocks.iter().filter(|m| has(m)).count(), 1, "only one copy");
+
+        // Heal the nodes; the heartbeat restores their health.
+        mocks[1].set_fail(false);
+        mocks[2].set_fail(false);
+        cluster.heartbeat_once().await;
+
+        // A read finds it on node 0, sees nodes 1 & 2 missing it → read-repair.
+        assert!(cluster
+            .get(proto::GetRequest { id: id.clone() })
+            .await
+            .unwrap()
+            .object
+            .is_some());
+        assert_eq!(
+            mocks.iter().filter(|m| has(m)).count(),
+            3,
+            "read-repair converged all replicas"
+        );
     }
 }

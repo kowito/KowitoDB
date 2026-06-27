@@ -94,13 +94,13 @@ DiskANN + RaBitQ enables billion-scale on SSD.
   writes are partitioned by id (consistent `id % N`) and optionally replicated;
   reads scatter-gather across nodes and merge (search/ask de-dup + re-rank;
   stats/list aggregate). Speaks the same gRPC API, so SDKs are unchanged.
-- 🔜 **Toward HA (v0.12–0.13):** tunable **write quorum** (`--write-quorum`),
+- 🔜 **Toward HA (v0.12–0.14):** tunable **write quorum** (`--write-quorum`),
   **failure-aware reads** (tolerate partial failure, error only on total outage),
-  and a **heartbeat health layer** (v0.13) — the gateway probes nodes every ~5s,
-  skips nodes marked unhealthy on reads, and recovers them automatically; health
-  also updates from each request's outcome. Remaining 📋: Raft/consensus for
-  linearizable reads, automatic rebalancing on membership change, read-repair,
-  and a distributed-SQL planner (cross-shard aggregates).
+  a **heartbeat health layer** (v0.13 — probe nodes every ~5s, skip unhealthy on
+  reads, auto-recover), and **read-repair** (v0.14 — `get` heals replicas missing
+  an object, converging after a W-of-R quorum write). Remaining 📋: Raft/consensus
+  for linearizable reads, automatic rebalancing on membership change, version
+  reconciliation for divergent copies, and a distributed-SQL planner.
 - 📋 **Parallel HNSW build via fine-grained locking** (per-shard build is still
   serial; sharding sidesteps the global write lock at the cluster level).
 
