@@ -491,6 +491,30 @@ impl KowitoDBEngine {
         Ok((objects, total))
     }
 
+    /// Multiply the top `window` results' scores by an importance factor
+    /// (`1 + IMPORTANCE_WEIGHT * importance`, importance ∈ [0,1]) and re-sort, so
+    /// high-importance objects rank higher. A uniform default importance (0.5)
+    /// leaves the order unchanged.
+    async fn apply_importance_boost(
+        &self,
+        mut ranked: Vec<RankedResult>,
+        window: usize,
+    ) -> Vec<RankedResult> {
+        const IMPORTANCE_WEIGHT: f32 = 0.5;
+        let window = window.min(ranked.len());
+        for r in ranked.iter_mut().take(window) {
+            if let Ok(Some(stored)) = self.storage.get(r.id).await {
+                r.score *= 1.0 + IMPORTANCE_WEIGHT * stored.importance;
+            }
+        }
+        ranked.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked
+    }
+
     /// Intersection of object ids matching every exact metadata pair (AND).
     fn metadata_allowed_set(&self, filter: &HashMap<String, String>) -> HashSet<ObjectId> {
         let mut allowed: Option<HashSet<ObjectId>> = None;
@@ -688,6 +712,13 @@ impl KowitoDBEngine {
                 .filter(|r| allowed.contains(&r.id))
                 .collect()
         };
+
+        // Importance-weighted ranking: boost results by each object's stored
+        // `importance` so high-priority knowledge surfaces. Applied over a
+        // candidate window so an important item just below the cut can rise.
+        let ranked = self
+            .apply_importance_boost(ranked, max_results.saturating_mul(3))
+            .await;
 
         // Limit + load real content
         let limited: Vec<RankedResult> = ranked.into_iter().take(max_results).collect();
@@ -1740,6 +1771,36 @@ mod tests {
         let (none, total) = engine.list(99, 10).await.unwrap();
         assert_eq!(total, 5);
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_importance_weighted_ranking() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let low = engine
+            .insert(
+                KnowledgeObject::new("enterprise widget alpha")
+                    .with_keywords(vec!["enterprise".into()])
+                    .with_importance(0.1),
+            )
+            .await
+            .unwrap();
+        let high = engine
+            .insert(
+                KnowledgeObject::new("enterprise widget beta")
+                    .with_keywords(vec!["enterprise".into()])
+                    .with_importance(0.9),
+            )
+            .await
+            .unwrap();
+
+        let resp = engine.ask("enterprise widget", 5).await.unwrap();
+        let pos = |id: ObjectId| resp.results.iter().position(|r| r.id == id.to_string());
+        let (hp, lp) = (pos(high), pos(low));
+        assert!(hp.is_some() && lp.is_some(), "both should be retrieved");
+        assert!(
+            hp.unwrap() < lp.unwrap(),
+            "higher-importance object should rank above the lower-importance one"
+        );
     }
 
     #[tokio::test]
