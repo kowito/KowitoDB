@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use kowitodb_core::Result as KResult;
-use kowitodb_core::{Embedding, KnowledgeObject, ObjectId};
+use kowitodb_core::{Embedding, KnowledgeObject, ObjectId, Relationship};
 use kowitodb_index::{
     FullTextIndex, GraphIndex, HnswParams, IndexResult, IndexSource, MetadataIndex,
     ShardedHnswIndex, TimeIndex, VectorIndex,
@@ -126,6 +126,38 @@ fn llm_contextual_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to auto-enrich the graph with `co_mentions` edges at ingest
+/// (LazyGraphRAG-style; default on, disable with `KOWITODB_AUTO_GRAPH=0`).
+fn auto_graph_enabled() -> bool {
+    std::env::var("KOWITODB_AUTO_GRAPH")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(true)
+}
+
+/// Max prior objects linked per shared entity at ingest (bounds fan-out).
+const AUTO_GRAPH_FANOUT: usize = 5;
+
+/// Cheap deterministic entity extraction: capitalized tokens (proper nouns)
+/// from the content plus the object's explicit keywords, normalized for
+/// matching. The LazyGraphRAG insight — a light extractor at ingest is enough
+/// to enrich a graph — without the cost of full LLM relation extraction.
+fn extract_entities(obj: &KnowledgeObject) -> Vec<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    for word in obj.content.split_whitespace() {
+        let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+        if clean.chars().count() > 2 && clean.chars().next().is_some_and(|c| c.is_uppercase()) {
+            set.insert(clean.to_lowercase());
+        }
+    }
+    for kw in &obj.keywords {
+        let k = kw.trim().to_lowercase();
+        if k.len() > 1 {
+            set.insert(k);
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// Strip Markdown code fences and a leading `sql` tag from an LLM SQL reply.
 fn strip_sql_fence(s: &str) -> String {
     let mut t = s.trim();
@@ -238,6 +270,9 @@ pub struct KowitoDBEngine {
     /// routing, and Mem0-style consolidation. `None` ⇒ those features fall back
     /// to their deterministic behavior.
     llm_client: Option<Arc<dyn LlmClient>>,
+    /// Inverted index of extracted entity → objects mentioning it, used to
+    /// auto-build `co_mentions` graph edges at ingest (LazyGraphRAG-style).
+    entity_index: Arc<Mutex<HashMap<String, Vec<ObjectId>>>>,
     #[allow(dead_code)]
     default_model: String,
 }
@@ -347,6 +382,7 @@ impl KowitoDBEngine {
             index_path,
             reranker_model: select_reranker(),
             llm_client: crate::llm::from_env(),
+            entity_index: Arc::new(Mutex::new(HashMap::new())),
             default_model: "default".to_string(),
         }
     }
@@ -502,6 +538,12 @@ impl KowitoDBEngine {
         if !obj.relationships.is_empty() {
             self.graph_index
                 .insert_relationships(id, &obj.relationships);
+        }
+
+        // LazyGraphRAG-style auto-enrichment: link to prior objects that share
+        // an entity, so the graph is useful even without explicit relationships.
+        if auto_graph_enabled() {
+            self.auto_link_entities(id, &obj);
         }
 
         // Persist to storage
@@ -1316,6 +1358,46 @@ impl KowitoDBEngine {
         Ok(count)
     }
 
+    /// LazyGraphRAG-style auto-enrichment: extract entities from `obj`, link it
+    /// (bidirectional `co_mentions` edges) to prior objects sharing an entity,
+    /// and register its own entities for future inserts. Cheap and deterministic
+    /// — no LLM. Bounded by [`AUTO_GRAPH_FANOUT`] per shared entity.
+    fn auto_link_entities(&self, id: ObjectId, obj: &KnowledgeObject) {
+        let entities = extract_entities(obj);
+        if entities.is_empty() {
+            return;
+        }
+        let mut idx = self.entity_index.lock();
+        let mut targets: HashSet<ObjectId> = HashSet::new();
+        for e in &entities {
+            if let Some(objs) = idx.get(e) {
+                for &o in objs.iter().rev().take(AUTO_GRAPH_FANOUT) {
+                    if o != id {
+                        targets.insert(o);
+                    }
+                }
+            }
+        }
+        for e in &entities {
+            idx.entry(e.clone()).or_default().push(id);
+        }
+        drop(idx);
+
+        if targets.is_empty() {
+            return;
+        }
+        let edge = |target_id: ObjectId| Relationship {
+            relation_type: "co_mentions".into(),
+            target_id,
+            weight: Some(0.5),
+        };
+        let out: Vec<Relationship> = targets.iter().map(|&t| edge(t)).collect();
+        self.graph_index.insert_relationships(id, &out);
+        for &t in &targets {
+            self.graph_index.insert_relationships(t, &[edge(id)]);
+        }
+    }
+
     /// Up to `k` existing knowledge objects related to `text` (via the full-text
     /// index) — used to link a new memory to the entities it mentions.
     fn find_related_objects(&self, text: &str, k: usize) -> Vec<ObjectId> {
@@ -1881,6 +1963,37 @@ mod tests {
                 .any(|r| r.content == "The user prefers dark mode."),
             "distilled fact should be the searchable memory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_auto_graph_links_co_mentions() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let a = engine
+            .insert(KnowledgeObject::new(
+                "Acme Corporation raised a Series A round.",
+            ))
+            .await
+            .unwrap();
+        let b = engine
+            .insert(KnowledgeObject::new(
+                "Later, Acme Corporation hired a new CEO.",
+            ))
+            .await
+            .unwrap();
+        // Shared entity "Acme"/"Corporation" → an auto co_mentions edge b↔a.
+        let out_b = engine.graph_index.out_edges(b);
+        assert!(
+            out_b
+                .iter()
+                .any(|r| r.target_id == a && r.relation_type == "co_mentions"),
+            "auto-graph should link co-mentioning objects"
+        );
+        // And it is bidirectional.
+        assert!(engine
+            .graph_index
+            .out_edges(a)
+            .iter()
+            .any(|r| r.target_id == b));
     }
 
     #[tokio::test]

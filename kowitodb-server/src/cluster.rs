@@ -14,15 +14,16 @@
 //!   surfaces as an error (vs. an empty "no matches" result).
 //! - **Agent sessions** partition by `session_id`.
 //!
-//! `get` performs **read-repair**: replicas missing an object are healed from a
-//! replica that has it (converging after a quorum write that reached only W of R
-//! replicas), and a **heartbeat** proactively tracks node health.
+//! `get` performs **read-repair + last-write-wins reconciliation**: it returns
+//! the freshest copy (latest `updated_at`) across replicas and heals any replica
+//! that is missing, staler, or content-divergent; a **heartbeat** proactively
+//! tracks node health.
 //!
 //! This provides real horizontal distribution with tunable durability, health
-//! tracking, and read-repair. It is **not** a consensus-backed, strongly-
-//! consistent cluster: there is no Raft (so no linearizable reads), no automatic
-//! rebalancing on membership change, and no version reconciliation for divergent
-//! copies. Those are the production-HA follow-ups.
+//! tracking, read-repair, and read-time reconciliation. It is **not** a
+//! consensus-backed, strongly-consistent cluster: there is no Raft (so no
+//! linearizable reads) and no automatic rebalancing on membership change. Those
+//! are the production-HA follow-ups.
 
 // gRPC handlers return `Result<_, Status>`; tonic's Status is intentionally large.
 #![allow(clippy::result_large_err)]
@@ -371,12 +372,11 @@ impl Cluster {
 
     // ---- Id-keyed ops ----
 
-    /// Read an object, with **read-repair**: query all healthy replicas; if some
-    /// have the object and others are missing it (e.g. after a quorum write that
-    /// reached only W of R replicas), write it back to the missing replicas so
-    /// the cluster converges. (Version reconciliation for *divergent* copies
-    /// needs proper versioning and is future work — this handles the common
-    /// missing-replica case.)
+    /// Read an object, with **read-repair + last-write-wins reconciliation**:
+    /// query all healthy replicas, return the freshest copy (latest
+    /// `updated_at`), and write that copy back to any replica that is missing it
+    /// *or holds a staler/divergent copy* — so the cluster converges on the most
+    /// recent version after a partial write or a divergence.
     pub async fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, Status> {
         let id = parse_id(&req.id)?;
         let replicas: Vec<usize> = self
@@ -392,36 +392,50 @@ impl Cluster {
         });
         let outcomes = futures::future::join_all(futures).await;
 
-        let mut found: Option<proto::KnowledgeObject> = None;
-        let mut missing: Vec<usize> = Vec::new();
+        // Gather each replica's copy (if any) and the set that responded.
+        let mut copies: Vec<(usize, proto::KnowledgeObject)> = Vec::new();
+        let mut responded: Vec<usize> = Vec::new();
         for (i, outcome) in outcomes {
             match outcome {
                 Ok(resp) => {
                     self.set_health(i, true);
-                    match resp.object {
-                        Some(obj) => {
-                            if found.is_none() {
-                                found = Some(obj);
-                            }
-                        }
-                        None => missing.push(i),
+                    responded.push(i);
+                    if let Some(obj) = resp.object {
+                        copies.push((i, obj));
                     }
                 }
                 Err(_) => self.set_health(i, false),
             }
         }
 
-        if let Some(obj) = &found {
-            if !missing.is_empty() {
+        // Last-write-wins: the freshest copy by `updated_at` (RFC3339 sorts
+        // lexicographically; an empty timestamp is treated as oldest).
+        let winner = copies
+            .iter()
+            .max_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at))
+            .map(|(_, o)| o.clone());
+
+        if let Some(obj) = &winner {
+            // Repair any responding replica whose copy is missing, staler, or
+            // divergent in content from the winner.
+            let stale: Vec<usize> = responded
+                .iter()
+                .copied()
+                .filter(|i| match copies.iter().find(|(ci, _)| ci == i) {
+                    Some((_, o)) => o.updated_at < obj.updated_at || o.content != obj.content,
+                    None => true,
+                })
+                .collect();
+            if !stale.is_empty() {
                 let repair = knowledge_to_insert_req(obj);
-                for i in missing {
+                for i in stale {
                     if self.nodes[i].insert(repair.clone()).await.is_ok() {
-                        debug!("read-repair: restored {} on node {i}", obj.id);
+                        debug!("read-repair: reconciled {} on node {i}", obj.id);
                     }
                 }
             }
         }
-        Ok(proto::GetResponse { object: found })
+        Ok(proto::GetResponse { object: winner })
     }
 
     pub async fn update(&self, req: proto::UpdateRequest) -> Result<proto::UpdateResponse, Status> {
@@ -855,13 +869,21 @@ mod tests {
     /// `fail` makes every call return Unavailable (simulating a downed node).
     #[derive(Default)]
     struct MockNode {
-        objects: Mutex<HashMap<String, (String, f32)>>, // id -> (content, score)
+        // id -> (content, score, updated_at)
+        objects: Mutex<HashMap<String, (String, f32, String)>>,
         fail: std::sync::atomic::AtomicBool,
     }
 
     impl MockNode {
         fn set_fail(&self, f: bool) {
             self.fail.store(f, std::sync::atomic::Ordering::SeqCst);
+        }
+        /// Seed a copy with an explicit `updated_at` (for reconciliation tests).
+        fn seed(&self, id: &str, content: &str, updated_at: &str) {
+            self.objects.lock().insert(
+                id.to_string(),
+                (content.to_string(), 1.0, updated_at.to_string()),
+            );
         }
         fn check(&self) -> Result<(), Status> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
@@ -877,9 +899,10 @@ mod tests {
         async fn insert(&self, req: proto::InsertRequest) -> Result<proto::InsertResponse, Status> {
             self.check()?;
             let id = req.id.clone().unwrap();
-            self.objects
-                .lock()
-                .insert(id.clone(), (req.content, req.importance.max(0.1)));
+            self.objects.lock().insert(
+                id.clone(),
+                (req.content, req.importance.max(0.1), String::new()),
+            );
             Ok(proto::InsertResponse { id })
         }
         async fn search(&self, req: proto::SearchRequest) -> Result<proto::SearchResponse, Status> {
@@ -888,8 +911,8 @@ mod tests {
                 .objects
                 .lock()
                 .iter()
-                .filter(|(_, (content, _))| content.contains(&req.query))
-                .map(|(id, (content, score))| proto::SearchResult {
+                .filter(|(_, (content, _, _))| content.contains(&req.query))
+                .map(|(id, (content, score, _))| proto::SearchResult {
                     id: id.clone(),
                     content: content.clone(),
                     score: *score,
@@ -904,15 +927,16 @@ mod tests {
         }
         async fn get(&self, req: proto::GetRequest) -> Result<proto::GetResponse, Status> {
             self.check()?;
-            let object =
-                self.objects
-                    .lock()
-                    .get(&req.id)
-                    .map(|(content, _)| proto::KnowledgeObject {
-                        id: req.id.clone(),
-                        content: content.clone(),
-                        ..Default::default()
-                    });
+            let object = self
+                .objects
+                .lock()
+                .get(&req.id)
+                .map(|(content, _, updated_at)| proto::KnowledgeObject {
+                    id: req.id.clone(),
+                    content: content.clone(),
+                    updated_at: updated_at.clone(),
+                    ..Default::default()
+                });
             Ok(proto::GetResponse { object })
         }
         async fn delete(&self, req: proto::DeleteRequest) -> Result<proto::DeleteResponse, Status> {
@@ -1210,5 +1234,34 @@ mod tests {
             3,
             "read-repair converged all replicas"
         );
+    }
+
+    #[tokio::test]
+    async fn test_last_write_wins_reconciliation() {
+        let mocks: Vec<Arc<MockNode>> = (0..3).map(|_| Arc::new(MockNode::default())).collect();
+        let nodes: Vec<Arc<dyn ClusterNode>> = mocks.iter().map(|m| m.clone() as _).collect();
+        let cluster = Cluster::new(nodes, 3);
+        let id = uuid::Uuid::from_u128(0).to_string();
+
+        // Divergent copies: node 0 stale, node 1 freshest, node 2 missing.
+        mocks[0].seed(&id, "old version", "2026-01-01T00:00:00Z");
+        mocks[1].seed(&id, "new version", "2026-06-01T00:00:00Z");
+
+        let got = cluster
+            .get(proto::GetRequest { id: id.clone() })
+            .await
+            .unwrap()
+            .object
+            .expect("object present");
+        assert_eq!(got.content, "new version", "returns the freshest copy");
+
+        // All replicas converge on the freshest content.
+        for m in &mocks {
+            assert_eq!(
+                m.objects.lock().get(&id).map(|(c, _, _)| c.clone()),
+                Some("new version".to_string()),
+                "every replica reconciled to the latest version"
+            );
+        }
     }
 }

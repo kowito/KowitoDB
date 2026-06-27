@@ -141,8 +141,13 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   embeddings whose prefixes are valid (OpenAI `text-embedding-3`); ignored under
   binary quantization (the rotation precludes prefixes). Recall@10 ≥ 0.7 vs brute
   force validated in a unit test. Pairs with the quantization + reranker layers.
-- **LazyGraphRAG-style auto-graph:** cheap entity/relation extraction at ingest to
-  enrich the graph index (~0.1% of full GraphRAG indexing cost, *unverified*).
+- ✅ **LazyGraphRAG-style auto-graph — shipped (v0.26):** a cheap deterministic
+  entity extractor at ingest (capitalized proper nouns + keywords) links each
+  object to prior objects sharing an entity via bidirectional `co_mentions`
+  graph edges, so the graph is useful even without explicit relationships — the
+  LazyGraphRAG insight (a light extractor enriches the graph at ~0.1% of full
+  GraphRAG cost) without any LLM. Default on (`KOWITODB_AUTO_GRAPH=0` disables),
+  fan-out bounded. Unit-tested.
 - **Out-of-core / billion-scale:** DiskANN-style on-disk graph + RaBitQ; the path
   beyond RAM.
 - **Multimodal embeddings:** image/text in the same store (knowledge objects are
@@ -158,9 +163,11 @@ lightweight retrieval-quality evaluator) was the verified part of CRAG.
   **failure-aware reads** (tolerate partial failure, error only on total outage),
   a **heartbeat health layer** (v0.13 — probe nodes every ~5s, skip unhealthy on
   reads, auto-recover), and **read-repair** (v0.14 — `get` heals replicas missing
-  an object, converging after a W-of-R quorum write). Remaining 📋: Raft/consensus
-  for linearizable reads, automatic rebalancing on membership change, version
-  reconciliation for divergent copies, and a distributed-SQL planner.
+  an object, converging after a W-of-R quorum write).
+- ✅ **Last-write-wins reconciliation (v0.26):** `get` now returns the *freshest*
+  copy (latest `updated_at`) across replicas and repairs any replica that is
+  missing, staler, or content-divergent — so divergent copies converge on read,
+  not just missing ones. Unit-tested with seeded divergent replicas.
 - 📋 **Parallel HNSW build via fine-grained locking** (per-shard build is still
   serial; sharding sidesteps the global write lock at the cluster level).
 
