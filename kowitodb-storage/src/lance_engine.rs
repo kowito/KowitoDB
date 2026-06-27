@@ -56,6 +56,7 @@ impl LanceStorage {
             Field::new("keywords_json", DataType::Utf8, false),
             Field::new("relationships_json", DataType::Utf8, false),
             Field::new("embeddings_json", DataType::Utf8, false),
+            Field::new("version_history_json", DataType::Utf8, false),
             Field::new("importance", DataType::Float32, false),
             Field::new("created_at", DataType::Utf8, false),
             Field::new("updated_at", DataType::Utf8, false),
@@ -73,6 +74,7 @@ impl LanceStorage {
                 Arc::new(StringArray::from(vec![obj.keywords_json.clone()])),
                 Arc::new(StringArray::from(vec![obj.relationships_json.clone()])),
                 Arc::new(StringArray::from(vec![obj.embeddings_json.clone()])),
+                Arc::new(StringArray::from(vec![obj.version_history_json.clone()])),
                 Arc::new(Float32Array::from(vec![obj.importance])),
                 Arc::new(StringArray::from(vec![obj.created_at.clone()])),
                 Arc::new(StringArray::from(vec![obj.updated_at.clone()])),
@@ -95,6 +97,7 @@ impl LanceStorage {
         let keywords_json = col("keywords_json")?;
         let relationships_json = col("relationships_json")?;
         let embeddings_json = col("embeddings_json")?;
+        let version_history_json = col("version_history_json")?;
         let importance = batch
             .column_by_name("importance")
             .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
@@ -114,6 +117,7 @@ impl LanceStorage {
                 keywords_json: keywords_json.value(i).to_string(),
                 relationships_json: relationships_json.value(i).to_string(),
                 embeddings_json: embeddings_json.value(i).to_string(),
+                version_history_json: version_history_json.value(i).to_string(),
                 importance: importance.value(i),
                 created_at: created_at.value(i).to_string(),
                 updated_at: updated_at.value(i).to_string(),
@@ -308,6 +312,7 @@ mod tests {
             keywords_json: "[\"alpha\"]".to_string(),
             relationships_json: "[]".to_string(),
             embeddings_json: "{}".to_string(),
+            version_history_json: "[]".to_string(),
             importance,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),

@@ -309,6 +309,53 @@ impl KowitoDBEngine {
         Ok(existed)
     }
 
+    /// Update an existing object in place (id preserved), recording a version
+    /// history entry. Returns the new version count, or `None` if not found.
+    ///
+    /// Changing the content clears the stored embedding so it is regenerated on
+    /// re-insert, keeping the vector index accurate.
+    pub async fn update(
+        &self,
+        id: ObjectId,
+        content: Option<String>,
+        metadata: HashMap<String, String>,
+        keywords: Vec<String>,
+        importance: Option<f32>,
+        change_description: Option<String>,
+    ) -> KResult<Option<usize>> {
+        let Some(mut obj) = self.get(id).await? else {
+            return Ok(None);
+        };
+
+        let content_changed = match content {
+            Some(c) => {
+                let changed = c != obj.content;
+                obj.content = c;
+                changed
+            }
+            None => false,
+        };
+        for (k, v) in metadata {
+            obj.metadata.insert(k, serde_json::Value::String(v));
+        }
+        if !keywords.is_empty() {
+            obj.keywords = keywords;
+        }
+        if let Some(imp) = importance {
+            obj.importance = imp.clamp(0.0, 1.0);
+        }
+        obj.record_version(change_description);
+        if content_changed {
+            obj.embeddings.clear();
+        }
+        let version = obj.version_history.len();
+
+        // Re-index: drop stale entries, then re-insert under the same id.
+        self.delete(id).await?;
+        self.insert(obj).await?;
+        Ok(Some(version))
+    }
+
     /// The core `ai.ask()` method — full pipeline with real content.
     pub async fn ask(&self, question: &str, max_results: usize) -> KResult<AskResponse> {
         self.ask_with_budget(question, max_results, None).await
@@ -786,6 +833,8 @@ fn obj_to_stored(obj: &KnowledgeObject) -> KResult<StoredObject> {
             .map_err(|e| kowitodb_core::KowitoError::Serialization(e.to_string()))?,
         embeddings_json: serde_json::to_string(&obj.embeddings)
             .map_err(|e| kowitodb_core::KowitoError::Serialization(e.to_string()))?,
+        version_history_json: serde_json::to_string(&obj.version_history)
+            .map_err(|e| kowitodb_core::KowitoError::Serialization(e.to_string()))?,
         importance: obj.importance,
         created_at: obj.created_at.to_rfc3339(),
         updated_at: obj.updated_at.to_rfc3339(),
@@ -804,6 +853,7 @@ fn stored_to_obj(stored: &StoredObject) -> KResult<KnowledgeObject> {
             .map_err(|e| kowitodb_core::KowitoError::Serialization(e.to_string()))?,
         relationships: serde_json::from_str(&stored.relationships_json)
             .map_err(|e| kowitodb_core::KowitoError::Serialization(e.to_string()))?,
+        version_history: serde_json::from_str(&stored.version_history_json).unwrap_or_default(),
         importance: stored.importance,
         created_at: chrono::DateTime::parse_from_rfc3339(&stored.created_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -811,7 +861,6 @@ fn stored_to_obj(stored: &StoredObject) -> KResult<KnowledgeObject> {
         updated_at: chrono::DateTime::parse_from_rfc3339(&stored.updated_at)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now()),
-        version_history: Vec::new(),
     })
 }
 
@@ -994,6 +1043,51 @@ mod tests {
         assert!(!resp.results.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_update_and_versioning() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let id = engine
+            .insert(KnowledgeObject::new("original content").with_metadata("k", "v1"))
+            .await
+            .unwrap();
+
+        // First update: change content + metadata + importance.
+        let v = engine
+            .update(
+                id,
+                Some("updated content".into()),
+                HashMap::from([("k".to_string(), "v2".to_string())]),
+                vec![],
+                Some(0.9),
+                Some("edit 1".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v, Some(1));
+
+        let obj = engine.get(id).await.unwrap().unwrap();
+        assert_eq!(obj.content, "updated content");
+        assert_eq!(obj.metadata.get("k").and_then(|x| x.as_str()), Some("v2"));
+        assert!((obj.importance - 0.9).abs() < 1e-6);
+        assert_eq!(obj.version_history.len(), 1);
+
+        // Second update accumulates history — proving versions persist across
+        // storage round-trips.
+        let v2 = engine
+            .update(id, None, HashMap::new(), vec![], None, Some("edit 2".into()))
+            .await
+            .unwrap();
+        assert_eq!(v2, Some(2));
+        assert_eq!(engine.get(id).await.unwrap().unwrap().version_history.len(), 2);
+
+        // Updating a missing object returns None.
+        let missing = engine
+            .update(uuid::Uuid::new_v4(), Some("x".into()), HashMap::new(), vec![], None, None)
+            .await
+            .unwrap();
+        assert_eq!(missing, None);
     }
 
     #[tokio::test]

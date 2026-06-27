@@ -226,12 +226,122 @@ impl KowitoDb for KowitoDBService {
             Status::internal(e.to_string())
         })?;
 
-        let snapshot = self.metrics.snapshot();
+        let (cache_entries, cache_hit_rate) = stats
+            .cache_stats
+            .as_ref()
+            .map(|c| (c.entries as u64, c.hit_rate as f64))
+            .unwrap_or((0, 0.0));
 
         Ok(Response::new(proto::StatsResponse {
             total_objects: stats.total_objects,
             vector_count: stats.vector_count,
-            index_size_bytes: stats.index_size_bytes + snapshot.ask_count,
+            index_size_bytes: stats.index_size_bytes,
+            graph_nodes: stats.graph_nodes,
+            graph_edges: stats.graph_edges,
+            active_agent_sessions: stats.active_agent_sessions,
+            total_cost_usd: stats.total_cost_usd,
+            cache_entries,
+            cache_hit_rate,
+        }))
+    }
+
+    async fn update(
+        &self,
+        request: Request<proto::UpdateRequest>,
+    ) -> Result<Response<proto::UpdateResponse>, Status> {
+        let req = request.into_inner();
+        let id =
+            uuid::Uuid::parse_str(&req.id).map_err(|_| Status::invalid_argument("Invalid UUID"))?;
+
+        let version = self
+            .engine
+            .update(
+                id,
+                req.content,
+                req.metadata,
+                req.keywords,
+                req.importance,
+                req.change_description,
+            )
+            .await
+            .map_err(|e| {
+                self.metrics.record_error();
+                Status::internal(e.to_string())
+            })?;
+
+        Ok(Response::new(match version {
+            Some(v) => proto::UpdateResponse {
+                updated: true,
+                version: v as u32,
+            },
+            None => proto::UpdateResponse {
+                updated: false,
+                version: 0,
+            },
+        }))
+    }
+
+    async fn sql(
+        &self,
+        request: Request<proto::SqlRequest>,
+    ) -> Result<Response<proto::SqlResponse>, Status> {
+        let req = request.into_inner();
+        let rows = self.engine.sql_select(&req.query).await.map_err(|e| {
+            self.metrics.record_error();
+            Status::invalid_argument(e.to_string())
+        })?;
+
+        Ok(Response::new(proto::SqlResponse {
+            rows: rows
+                .into_iter()
+                .map(|columns| proto::SqlRow { columns })
+                .collect(),
+        }))
+    }
+
+    async fn record_turn(
+        &self,
+        request: Request<proto::RecordTurnRequest>,
+    ) -> Result<Response<proto::RecordTurnResponse>, Status> {
+        use crate::memory::TurnRole;
+        let req = request.into_inner();
+        let role = match req.role.to_lowercase().as_str() {
+            "assistant" => TurnRole::Assistant,
+            "system" => TurnRole::System,
+            "observation" => TurnRole::Observation,
+            _ => TurnRole::User,
+        };
+
+        let mut session = self.engine.agent_memory.get_or_create(&req.session_id);
+        session.add_turn(role, req.content);
+        let turn_count = session.turn_count() as u32;
+        self.engine.agent_memory.save(session);
+
+        Ok(Response::new(proto::RecordTurnResponse { turn_count }))
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<proto::GetSessionRequest>,
+    ) -> Result<Response<proto::GetSessionResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(match self.engine.agent_memory.get(&req.session_id) {
+            Some(session) => proto::GetSessionResponse {
+                found: true,
+                turns: session
+                    .turns
+                    .into_iter()
+                    .map(|t| proto::ConversationTurnProto {
+                        role: format!("{:?}", t.role).to_lowercase(),
+                        content: t.content,
+                        timestamp: t.timestamp.to_rfc3339(),
+                    })
+                    .collect(),
+            },
+            None => proto::GetSessionResponse {
+                found: false,
+                turns: Vec::new(),
+            },
         }))
     }
 }

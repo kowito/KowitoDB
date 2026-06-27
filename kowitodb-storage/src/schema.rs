@@ -10,9 +10,17 @@ pub struct StoredObject {
     pub keywords_json: String,
     pub relationships_json: String,
     pub embeddings_json: String,
+    /// Version history as JSON (`[]` when none). `serde(default)` keeps records
+    /// written before this field was added readable.
+    #[serde(default = "empty_json_array")]
+    pub version_history_json: String,
     pub importance: f32,
     pub created_at: String, // ISO-8601
     pub updated_at: String,
+}
+
+fn empty_json_array() -> String {
+    "[]".to_string()
 }
 
 /// Search filter for the storage layer.

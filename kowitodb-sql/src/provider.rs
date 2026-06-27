@@ -217,6 +217,7 @@ mod tests {
             keywords_json: "[]".to_string(),
             relationships_json: "[]".to_string(),
             embeddings_json: "{}".to_string(),
+            version_history_json: "[]".to_string(),
             importance,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
