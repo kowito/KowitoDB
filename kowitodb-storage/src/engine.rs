@@ -6,7 +6,7 @@ use kowitodb_core::{KowitoError, ObjectId, Result};
 use sled::Db;
 use tracing::{debug, info};
 
-use super::schema::{StorageBackend, StorageFilter, StoredObject};
+use super::schema::{filter_matches, StorageBackend, StorageFilter, StoredObject};
 
 /// Sled-backed storage engine.
 ///
@@ -97,48 +97,24 @@ impl StorageBackend for StorageEngine {
     }
 
     async fn search(&self, filter: StorageFilter) -> Result<Vec<StoredObject>> {
-        // Scan all objects (in Phase 1, we rely on the index layer for efficient
-        // filtering; this provides a fallback scan).
-        let mut results: Vec<StoredObject> = Vec::new();
+        // Fast path: filtering by id is a single key lookup, not a full scan.
+        if let Some(target_id) = filter.id {
+            return Ok(match self.get(target_id).await? {
+                Some(obj) if filter_matches(&obj, &filter) => vec![obj],
+                _ => Vec::new(),
+            });
+        }
 
+        // Fallback scan over all objects, applying the remaining predicates.
+        let mut results: Vec<StoredObject> = Vec::new();
         for item in self.db.iter() {
             let (_key, value) = item.map_err(|e| KowitoError::Storage(e.to_string()))?;
             let obj: StoredObject = serde_json::from_slice(&value)
                 .map_err(|e| KowitoError::Serialization(e.to_string()))?;
 
-            // Apply filters
-            if let Some(ref target_id) = filter.id {
-                if obj.id != *target_id {
-                    continue;
-                }
+            if !filter_matches(&obj, &filter) {
+                continue;
             }
-            if let Some(ref kw) = filter.keyword {
-                let keywords: Vec<String> =
-                    serde_json::from_str(&obj.keywords_json).unwrap_or_default();
-                if !keywords.iter().any(|k| k.contains(kw)) {
-                    continue;
-                }
-            }
-            if let Some(min_imp) = filter.min_importance {
-                if obj.importance < min_imp {
-                    continue;
-                }
-            }
-            if let Some(ref after) = filter.created_after {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
-                    if parsed < *after {
-                        continue;
-                    }
-                }
-            }
-            if let Some(ref before) = filter.created_before {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
-                    if parsed > *before {
-                        continue;
-                    }
-                }
-            }
-
             results.push(obj);
 
             if let Some(limit) = filter.limit {

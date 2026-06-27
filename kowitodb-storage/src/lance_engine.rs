@@ -18,7 +18,7 @@ use lance::dataset::{Dataset, WriteMode, WriteParams};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::schema::{StorageBackend, StorageFilter, StoredObject};
+use crate::schema::{filter_matches, StorageBackend, StorageFilter, StoredObject};
 
 /// Lance-backed implementation of [`StorageBackend`].
 pub struct LanceStorage {
@@ -126,22 +126,6 @@ impl LanceStorage {
         Ok(out)
     }
 
-    /// Read all rows into memory as a single batch (or `None` if no dataset).
-    async fn scan_all(&self) -> Result<Option<RecordBatch>> {
-        let guard = self.dataset.read().await;
-        let Some(ds) = guard.as_ref() else {
-            return Ok(None);
-        };
-        if ds.count_rows(None).await.map_err(map_lance)? == 0 {
-            return Ok(None);
-        }
-        let batch = ds
-            .scan()
-            .try_into_batch()
-            .await
-            .map_err(map_lance)?;
-        Ok(Some(batch))
-    }
 }
 
 #[async_trait::async_trait]
@@ -210,48 +194,38 @@ impl StorageBackend for LanceStorage {
     }
 
     async fn search(&self, filter: StorageFilter) -> Result<Vec<StoredObject>> {
-        // Materialize all rows and apply the filter in Rust, matching the
-        // semantics of the default sled engine. (Predicate pushdown into Lance
-        // is a future optimization.)
-        let Some(batch) = self.scan_all().await? else {
+        let guard = self.dataset.read().await;
+        let Some(ds) = guard.as_ref() else {
             return Ok(Vec::new());
         };
-        let all = Self::objects_from(&batch)?;
+
+        // Push the predicates Lance can evaluate natively (id, importance) down
+        // into the scan; the remaining predicates (keyword JSON, time) are
+        // applied in Rust via the shared filter to keep semantics identical.
+        let mut pushdown: Vec<String> = Vec::new();
+        if let Some(id) = filter.id {
+            pushdown.push(format!("id = '{id}'"));
+        }
+        if let Some(min_imp) = filter.min_importance {
+            pushdown.push(format!("importance >= {min_imp}"));
+        }
+
+        let mut scanner = ds.scan();
+        if !pushdown.is_empty() {
+            scanner
+                .filter(&pushdown.join(" AND "))
+                .map_err(map_lance)?;
+        }
+        let batch = scanner.try_into_batch().await.map_err(map_lance)?;
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut results = Vec::new();
-
-        for obj in all {
-            if let Some(ref target_id) = filter.id {
-                if obj.id != *target_id {
-                    continue;
-                }
+        for obj in Self::objects_from(&batch)? {
+            if !filter_matches(&obj, &filter) {
+                continue;
             }
-            if let Some(ref kw) = filter.keyword {
-                let keywords: Vec<String> =
-                    serde_json::from_str(&obj.keywords_json).unwrap_or_default();
-                if !keywords.iter().any(|k| k.contains(kw)) {
-                    continue;
-                }
-            }
-            if let Some(min_imp) = filter.min_importance {
-                if obj.importance < min_imp {
-                    continue;
-                }
-            }
-            if let Some(ref after) = filter.created_after {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
-                    if parsed < *after {
-                        continue;
-                    }
-                }
-            }
-            if let Some(ref before) = filter.created_before {
-                if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
-                    if parsed > *before {
-                        continue;
-                    }
-                }
-            }
-
             results.push(obj);
             if let Some(limit) = filter.limit {
                 if results.len() >= limit {

@@ -71,11 +71,14 @@ impl KnowledgeTableProvider {
         ]))
     }
 
-    /// Read every stored object and pack it into a single record batch.
-    async fn build_batch(&self) -> DfResult<RecordBatch> {
+    /// Read stored objects (optionally limited) and pack them into one batch.
+    async fn build_batch(&self, limit: Option<usize>) -> DfResult<RecordBatch> {
         let objects = self
             .storage
-            .search(StorageFilter::default())
+            .search(StorageFilter {
+                limit,
+                ..Default::default()
+            })
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -135,7 +138,11 @@ impl TableProvider for KnowledgeTableProvider {
         // Snapshot current storage into an in-memory table and let DataFusion's
         // MemTable handle projection/limit; remaining filters are applied by a
         // FilterExec the optimizer inserts above this scan.
-        let batch = self.build_batch().await?;
+        //
+        // Push the row limit into storage only when there are no filters — with
+        // a WHERE clause, limiting before filtering would drop matching rows.
+        let scan_limit = if filters.is_empty() { limit } else { None };
+        let batch = self.build_batch(scan_limit).await?;
         let mem = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
         mem.scan(state, projection, filters, limit).await
     }

@@ -36,6 +36,45 @@ pub struct StorageFilter {
     pub limit: Option<usize>,
 }
 
+/// Test whether a stored object satisfies every predicate in `filter`
+/// (excluding `limit`, which bounds result count rather than rows).
+///
+/// Shared by all backends so filter semantics stay identical regardless of how
+/// much of the predicate was pushed down to the storage layer.
+pub fn filter_matches(obj: &StoredObject, filter: &StorageFilter) -> bool {
+    if let Some(ref target_id) = filter.id {
+        if obj.id != *target_id {
+            return false;
+        }
+    }
+    if let Some(ref kw) = filter.keyword {
+        let keywords: Vec<String> = serde_json::from_str(&obj.keywords_json).unwrap_or_default();
+        if !keywords.iter().any(|k| k.contains(kw)) {
+            return false;
+        }
+    }
+    if let Some(min_imp) = filter.min_importance {
+        if obj.importance < min_imp {
+            return false;
+        }
+    }
+    if let Some(ref after) = filter.created_after {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
+            if parsed < *after {
+                return false;
+            }
+        }
+    }
+    if let Some(ref before) = filter.created_before {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&obj.created_at) {
+            if parsed > *before {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Defines operations the storage engine must support.
 #[async_trait::async_trait]
 pub trait StorageBackend: Send + Sync {
