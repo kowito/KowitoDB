@@ -5,9 +5,12 @@ All three target the same `KowitoDB` service defined in
 [`proto/kowitodb.proto`](../proto/kowitodb.proto) and expose the same core
 surface.
 
-The default server address is `localhost:50051`. All clients use **insecure
-(plaintext)** connections by default — the server does not terminate TLS or
-authenticate (see [DEPLOYMENT.md](DEPLOYMENT.md#security-posture)).
+The default server address is `localhost:50051`. All clients default to
+**insecure (plaintext)** connections. The server's auth and TLS are off by
+default; if you enable them (`--api-key`, `--tls-cert`/`--tls-key` — see
+[DEPLOYMENT.md](DEPLOYMENT.md#security-posture)), pass the matching credentials
+through the client's transport options (e.g. a Bearer / `x-api-key` metadata
+header and TLS channel credentials).
 
 ## Contents
 
@@ -16,7 +19,7 @@ authenticate (see [DEPLOYMENT.md](DEPLOYMENT.md#security-posture)).
 - [TypeScript](#typescript)
 - [Go](#go)
 - [Regenerating gRPC stubs](#regenerating-grpc-stubs)
-- [A note on `sql()`](#a-note-on-sql)
+- [The `sql()` helper](#the-sql-helper)
 
 ## Capability matrix
 
@@ -27,9 +30,18 @@ authenticate (see [DEPLOYMENT.md](DEPLOYMENT.md#security-posture)).
 | `forget(id)` / `Delete` | yes (`forget`) | yes (`forget`) | yes (`Delete`) | `Delete` |
 | `insert(content, …)` | yes | yes | yes | `Insert` |
 | `get(id)` | yes | yes | yes | `Get` |
+| `update(id, …)` | yes | yes | yes | `Update` |
 | `search(query, topK?)` | yes | yes | yes | `Search` |
+| `sql(query)` | yes | yes | yes | `Sql` (DataFusion; returns rows) |
+| `record_turn` / `recordTurn` / `RecordTurn` | yes | yes | yes | `RecordTurn` |
+| `get_session` / `getSession` / `GetSession` | yes | yes | yes | `GetSession` |
 | `stats()` | yes | yes | yes | `Stats` |
-| `sql(query)` | yes | yes | — | `Search` (see [note](#a-note-on-sql)) |
+
+`sql(query)` calls the dedicated `Sql` RPC and returns rows as a list of
+column-name → value maps (Python/TS: `list`/`Array` of dict/`Record`; Go:
+`[]map[string]string`). `stats()` returns the full field set: `total_objects`,
+`vector_count`, `index_size_bytes`, `graph_nodes`, `graph_edges`,
+`active_agent_sessions`, `total_cost_usd`, `cache_entries`, `cache_hit_rate`.
 
 Connection lifecycle: every client connects lazily on first call. Python and
 TypeScript expose explicit `connect()`/`close()`; Go opens on `NewClient` and
@@ -78,6 +90,27 @@ db.close()
 ```
 
 `KowitoDBClient` is also a context manager (`with KowitoDBClient(...) as db:`).
+
+### Update, SQL, and agent memory
+
+```python
+# Edit in place (only the fields you pass change); records version history.
+res = db.update(obj_id, importance=0.95, change_description="bumped priority")
+print("updated:", res.updated, "version:", res.version)
+
+# Full SQL via the DataFusion Sql RPC — rows come back as dicts.
+rows = db.sql("SELECT content, importance FROM knowledge "
+              "WHERE importance >= 0.5 ORDER BY importance DESC")
+for row in rows:
+    print(row["importance"], row["content"])
+
+# Agent conversation memory.
+db.record_turn("session-1", "user", "Who renewed after Series A?")
+db.record_turn("session-1", "assistant", "Acme Corp did.")
+turns = db.get_session("session-1")  # None if the session does not exist
+for t in turns or []:
+    print(t.role, t.content)
+```
 
 ## TypeScript
 
@@ -129,9 +162,29 @@ main().catch((err) => {
 });
 ```
 
+### Update, SQL, and agent memory
+
+```ts
+// Edit in place; only the provided options change. Records version history.
+const upd = await db.update(id, { importance: 0.95, changeDescription: "bump" });
+console.log("updated:", upd.updated, "version:", upd.version);
+
+// Full SQL via the Sql RPC — rows are Record<string, string>.
+const rows = await db.sql(
+  "SELECT content, importance FROM knowledge WHERE importance >= 0.5 ORDER BY importance DESC",
+);
+for (const row of rows) console.log(row.importance, row.content);
+
+// Agent conversation memory.
+await db.recordTurn("session-1", "user", "Who renewed after Series A?");
+await db.recordTurn("session-1", "assistant", "Acme Corp did.");
+const turns = await db.getSession("session-1"); // null if not found
+for (const t of turns ?? []) console.log(t.role, t.content);
+```
+
 The connection is lazy; calling a method auto-connects. All message types
 (`AskResponse`, `AskResult`, `SearchResult`, `KnowledgeObject`, `StatsResponse`,
-…) are exported for type annotations.
+`UpdateResponse`, `ConversationTurnProto`, …) are exported for type annotations.
 
 ## Go
 
@@ -192,8 +245,42 @@ func main() {
 
 `NewClient("")` uses the default address `localhost:50051`. Pass
 `grpc.DialOption`s to `NewClient` to customize transport credentials or
-interceptors. `Remember`/`Insert` accept functional options: `WithKeywords`,
-`WithMetadata`, `WithImportance`, and `WithRelationships` (`Insert` only).
+interceptors (e.g. TLS credentials, or a per-call API-key metadata header when
+the server is run with `--api-key`). `Remember`/`Insert` accept functional
+options: `WithKeywords`, `WithMetadata`, `WithImportance`, and
+`WithRelationships` (`Insert` only).
+
+### Update, SQL, and agent memory
+
+```go
+// Edit in place; UpdateOptions decide which fields change. Records version history.
+updated, version, err := db.Update(ctx, id,
+    kowitodb.WithUpdatedImportance(0.95),
+    kowitodb.WithChangeDescription("bump"),
+)
+// ... handle err
+fmt.Println("updated:", updated, "version:", version)
+
+// Full SQL via the Sql RPC — rows are []map[string]string.
+rows, err := db.Sql(ctx,
+    "SELECT content, importance FROM knowledge WHERE importance >= 0.5 ORDER BY importance DESC")
+// ... handle err
+for _, row := range rows {
+    fmt.Println(row["importance"], row["content"])
+}
+
+// Agent conversation memory.
+_, _ = db.RecordTurn(ctx, "session-1", "user", "Who renewed after Series A?")
+_, _ = db.RecordTurn(ctx, "session-1", "assistant", "Acme Corp did.")
+turns, err := db.GetSession(ctx, "session-1") // empty slice if not found
+// ... handle err
+for _, t := range turns {
+    fmt.Println(t.Role, t.Content)
+}
+```
+
+Update options: `WithUpdatedContent`, `WithUpdatedMetadata`,
+`WithUpdatedKeywords`, `WithUpdatedImportance`, `WithChangeDescription`.
 
 ## Regenerating gRPC stubs
 
@@ -237,17 +324,22 @@ make tools      # install the protoc Go plugins (one-time)
 make generate   # regenerate kowitodbpb/*.pb.go from ../../proto/kowitodb.proto
 ```
 
-## A note on `sql()`
+## The `sql()` helper
 
-The Python and TypeScript clients expose a `sql(query)` helper, but it routes
-the query string through the **`Search` RPC** — i.e. the `ask` retrieval
-pipeline — **not** the SQL engine. There is no dedicated SQL RPC in the proto.
+All three clients (`sql` in Python/TypeScript, `Sql` in Go) call the dedicated
+**`Sql` RPC**, which runs the query through the **DataFusion engine**
+(`KowitoDBEngine::sql_select`). This supports full SQL — projection, `WHERE`,
+`ORDER BY`, `GROUP BY`, aggregates, and `LIMIT` — over the `knowledge` table
+(columns `id`, `content`, `importance`, `created_at`, `updated_at`, `keywords`,
+`metadata`). Rows are returned as column-name → value maps (every value
+stringified):
 
-Full SQL (projection, `WHERE`, `ORDER BY`, `GROUP BY`, aggregates, `LIMIT`) is
-available only:
+```sql
+SELECT COUNT(*) AS n FROM knowledge;
+SELECT content, importance FROM knowledge WHERE importance >= 0.5 ORDER BY importance DESC;
+```
 
-- through the Rust engine API `KowitoDBEngine::sql_select` (DataFusion path), or
-- via the `kowitodb sql` CLI command (the lighter index-routed parser path).
-
-See [ARCHITECTURE.md → The DataFusion SQL path](ARCHITECTURE.md#the-datafusion-sql-path)
+The `kowitodb sql` CLI command uses a separate, lighter index-routed parser
+path (`sql_query`); the SDK `sql()` helpers do **not** use it. See
+[ARCHITECTURE.md → The DataFusion SQL path](ARCHITECTURE.md#the-datafusion-sql-path)
 for details.

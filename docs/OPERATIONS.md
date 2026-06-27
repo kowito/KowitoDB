@@ -12,6 +12,7 @@ complements [DEPLOYMENT.md](DEPLOYMENT.md).
 - [Upgrades](#upgrades)
 - [Metrics and the Stats RPC](#metrics-and-the-stats-rpc)
 - [The cost tracker](#the-cost-tracker)
+- [Updates and version history](#updates-and-version-history)
 - [Plan cache behavior](#plan-cache-behavior)
 - [Known limitations and scaling boundaries](#known-limitations-and-scaling-boundaries)
 - [Operational runbook](#operational-runbook)
@@ -26,9 +27,11 @@ A running server owns two persistent directories (the paths passed to `serve`):
 ```
 
 Everything else (HNSW vector, brute-force vector, metadata, time, and graph
-indexes; plan cache; agent memory) is **in-memory only**. With the Lance backend
-the object store is a Lance dataset at the configured URI instead of the sled
-directory.
+indexes; plan cache; agent memory) is **in-memory**. The HNSW vector, metadata,
+time, and graph indexes are rebuilt from the object store on startup (see
+[Index persistence and restarts](#index-persistence-and-restarts)); the plan
+cache and agent memory are ephemeral. With the Lance backend the object store is
+a Lance dataset at the configured URI instead of the sled directory.
 
 ## Backup and restore
 
@@ -68,8 +71,9 @@ tar xzf kowitodb-backup-YYYY-MM-DD.tgz -C /var/lib/kowitodb
 systemctl start kowitodb
 ```
 
-After restore, the object store and full-text index are intact, but the
-in-memory indexes start empty — see the next section.
+After restore, the object store and full-text index are intact, and the
+in-memory indexes are rebuilt from the object store the next time the engine is
+opened — see the next section.
 
 ### Lance backend
 
@@ -79,44 +83,44 @@ dataset directory as the unit to snapshot, paired with the full-text index.
 
 ## Index persistence and restarts
 
-This is the single most important operational fact about KowitoDB v0.1.0.
+**The in-memory indexes are rebuilt from the object store on startup.** Only the
+object store (sled or Lance) and the Tantivy full-text index are persisted to
+disk, but `KowitoDBEngine::open()` — used by `serve` and by the
+`ask`/`sql`/`stats` CLI commands — runs a `reindex_from_storage()` pass before
+serving. That pass re-reads every persisted object and repopulates the HNSW
+vector, metadata, time, and graph indexes from the stored fields (including the
+**persisted embeddings**, so it makes no embedding API calls). The full-text
+index is skipped because it already persists; the brute-force vector index is
+not rebuilt because it is not on the live `ask` path.
 
-**Only the object store and the Tantivy full-text index survive a restart.** The
-HNSW vector index, metadata index, time index, and graph index are in-memory and
-are populated **only** by `insert` calls at runtime. The engine constructors
-open storage and the full-text index and create *empty* in-memory indexes; there
-is no startup pass that re-reads the object store to rebuild them.
+Net effect: after a restart or restore, **all search modes work immediately** —
+no manual re-ingestion is required. The earlier "indexes are empty until you
+re-insert" caveat no longer applies.
 
-Consequences after any restart or restore:
+What to know operationally:
 
-- `Get` by ID, full-text keyword search, and `sql_select` (DataFusion, which
-  scans the object store directly) all keep working.
-- Vector search, metadata filters, time filters, and graph traversal return
-  nothing for previously-stored objects — so `ask` quality degrades to
-  full-text-only — until those objects are re-inserted.
+- **Startup cost is O(stored objects).** The reindex pass reads and deserializes
+  the whole object set once at boot, so a large corpus adds to startup time
+  (and transiently to memory while batches are loaded). On very large corpora,
+  budget for a longer warm-up before the server reports healthy.
+- **Embeddings must be present in storage** to rebuild the vector index. Objects
+  inserted with auto-embedding have their generated embedding written back and
+  persisted, so they reindex correctly. Objects stored without any embedding are
+  reindexed into the metadata/time/graph indexes but not the vector index.
+- **The full-text index is independent.** If you delete `{index-path}/tantivy/`,
+  it is *not* rebuilt by the reindex pass — you must re-ingest to repopulate it
+  (see [Upgrades](#upgrades)).
 
-### Mitigations
-
-Until index persistence/rebuild-on-start is implemented, treat the object store
-as the source of truth and re-ingest after restart:
-
-- **Re-ingestion pass on startup.** Drive a one-time re-`insert` of every stored
-  object after the server comes up. You can enumerate IDs via the storage
-  layer's `list_ids` / `search` (e.g. through a small admin tool or a
-  `sql_select('SELECT id, content, ... FROM knowledge')` followed by
-  `Insert`/`Remember` calls). This rebuilds all in-memory indexes.
-- **Keep the source corpus.** Maintain the authoritative documents outside
-  KowitoDB so you can always re-ingest deterministically.
-- **Plan restarts as full re-index windows**, and avoid relying on vector/graph
-  results during the warm-up period.
-
-Schedule restarts during low-traffic windows and validate `Stats.vector_count`
-has returned to the expected level before resuming vector-dependent traffic.
+Validate readiness after a restart by checking that `Stats.vector_count` matches
+`Stats.total_objects` (modulo objects with no embedding). Schedule restarts of
+very large instances during low-traffic windows to absorb the reindex time.
 
 ## Upgrades
 
-- **Binary upgrades.** Replace the binary/image and restart. Re-indexing of the
-  in-memory indexes applies as described above; plan for it.
+- **Binary upgrades.** Replace the binary/image and restart. The startup reindex
+  pass rebuilds the in-memory indexes from storage automatically (see
+  [Index persistence and restarts](#index-persistence-and-restarts)); on large
+  corpora budget for the extra startup time.
 - **On-disk format compatibility.** The object store is JSON-per-object in sled,
   and the full-text index is Tantivy. There is no schema-migration tooling in
   v0.1.0. Across versions:
@@ -133,25 +137,26 @@ has returned to the expected level before resuming vector-dependent traffic.
 
 ## Metrics and the Stats RPC
 
-The `Stats` RPC (`StatsResponse`) is the primary in-band telemetry surface:
+The `Stats` RPC (`StatsResponse`) and the `kowitodb stats` CLI command now report
+the **same set of fields** — the earlier discrepancy (gRPC returning only three
+fields) is resolved.
 
 | Field | Source | Meaning |
 | --- | --- | --- |
 | `total_objects` | storage `count()` | Number of stored objects. |
-| `vector_count` | HNSW index `len()` | Vectors currently in the in-memory HNSW index. After a restart this is 0 until re-ingestion — a useful warm-up indicator. |
-| `index_size_bytes` | mixed | Currently `0` plus the server's cumulative `ask` count folded in; **do not** read this as a real byte size. |
+| `vector_count` | HNSW index `len()` | Vectors in the in-memory HNSW index. After a restart this should match `total_objects` (minus any objects with no embedding) once the reindex pass completes — a useful warm-up indicator. |
+| `graph_nodes` / `graph_edges` | graph index | Nodes/edges in the relationship graph. |
+| `active_agent_sessions` | agent memory | Live conversation sessions (in-memory; reset on restart). |
+| `total_cost_usd` | cost tracker | Running estimated USD cost (see below). |
+| `cache_entries` / `cache_hit_rate` | plan cache | Plan-cache size and hit rate. |
+| `index_size_bytes` | — | Currently always `0`; **not** a real byte size — ignore it. |
 
-The engine computes a richer internal `StatsResponse` (graph node/edge counts,
-plan-cache stats, total estimated cost, active agent sessions) that the
-`kowitodb stats` CLI command prints, but the **gRPC** `Stats` response only
-carries the three fields above. For the full picture (cache hit rate, cost,
-graph size, sessions) use the CLI `stats` command against the data directory or
-read the server logs.
-
-`MetricsCollector` also tracks ask/remember/insert/sql/error counts, cumulative
-and average ask latency, and uptime in-process. These are not exported on a
-metrics endpoint; surface them via logs or by extending the service if you need
-Prometheus.
+For Prometheus-style scraping, run the server with `--metrics-addr` and scrape
+`GET /metrics`. That endpoint renders `MetricsCollector`'s
+ask/remember/insert/sql/error counts, cumulative and average ask latency, and
+uptime in Prometheus text format. `GET /healthz` on the same address returns
+`ok`. The gRPC health-checking service (`grpc.health.v1.Health`) and reflection
+are always on as well — see [DEPLOYMENT.md → Observability](DEPLOYMENT.md#observability).
 
 ## The cost tracker
 
@@ -176,6 +181,24 @@ Caveats:
 
 Use `total_cost_usd` to reason about relative query expense (e.g. context-token
 growth driving cost), not as an authoritative invoice.
+
+## Updates and version history
+
+The `Update` RPC (and `KowitoDBEngine::update`) edits an object in place, keyed
+by its existing id:
+
+- Only the fields you supply change: `content` (replaces and triggers
+  re-embedding), `metadata` (merged — keys overwrite), `keywords` (replaces when
+  non-empty), and `importance`. An optional `change_description` is recorded.
+- Each update appends an entry to the object's `version_history`, which is
+  **persisted to storage** (`version_history_json` in sled and Lance) and so
+  accumulates across restarts. The RPC returns the new version count.
+- Updating an object whose content changed clears its stored embedding so a fresh
+  one is generated on re-index, keeping the vector index accurate. If you switch
+  embedding providers/models, re-`update` (or re-insert) affected objects to
+  re-embed them.
+- Operationally, version history grows unbounded with edit frequency; there is no
+  pruning. For heavily-edited objects, account for the storage growth.
 
 ## Plan cache behavior
 
@@ -203,39 +226,47 @@ State these honestly when planning a deployment:
 
 - **Single node.** No replication, sharding, failover, or clustering. The
   ceiling is one machine. There is no horizontal scale-out path in v0.1.0.
-- **In-memory indexes, not rebuilt on restart.** See
-  [Index persistence and restarts](#index-persistence-and-restarts). The working
-  set must fit in RAM, and restarts require re-ingestion to restore
-  vector/metadata/time/graph search.
-- **No authentication, no TLS.** The gRPC endpoint is unauthenticated plaintext.
-  Secure it at the network/proxy layer (see [DEPLOYMENT.md](DEPLOYMENT.md)).
-- **No health/reflection services.** Use TCP or `Stats`-based checks.
-- **Default embeddings are a deterministic proxy**, not a semantic model.
-  Wire the OpenAI-compatible client (or another real embedder) before relying on
-  vector relevance in production. Token counts are heuristic (~4 chars/token).
-- **`Search`/`Ask` results cap at 100**; `max_context_tokens` in the proto is
-  ignored (the optimizer uses its 4096-token default).
-- **No dedicated SQL RPC.** The SDKs' `sql()` helpers route through the `Search`
-  RPC (the `ask` pipeline), **not** the DataFusion engine. Full SQL is available
-  only through the Rust engine API (`sql_select`) and the `kowitodb sql` CLI
-  command (index-routed path).
-- **Storage `search` is a full scan.** The sled and Lance backends both scan all
-  rows and filter in Rust; the DataFusion provider materializes the whole table
-  per query. This is fine at modest scale but is O(n) per query and bounds how
+- **Working set must fit in RAM.** The secondary indexes are in-memory (rebuilt
+  from storage on startup, so no re-ingestion is needed), but the full object set
+  still has to fit in memory across those indexes. There is no spill-to-disk.
+- **Auth and TLS are off by default.** Enable `--api-key` and `--tls-cert`/
+  `--tls-key`, and/or secure the endpoint at the network/proxy layer (see
+  [DEPLOYMENT.md](DEPLOYMENT.md)). When off, the gRPC endpoint is unauthenticated
+  plaintext.
+- **Health-check and reflection services are unauthenticated by design.** The
+  always-on gRPC health/reflection services and the `--metrics-addr` HTTP
+  endpoint do not honor the API key, so probes and tooling work without
+  credentials. Keep them off the public internet.
+- **Agent memory is in-memory and not persisted.** `RecordTurn`/`GetSession`
+  expose conversation sessions over gRPC and they count toward
+  `active_agent_sessions`, but all sessions are lost on restart. Do not treat
+  them as durable storage.
+- **Default embeddings are a deterministic proxy**, not a semantic model. Set
+  `KOWITODB_EMBEDDING_PROVIDER` (openai/ollama) before relying on vector
+  relevance in production. Token counts are heuristic (~4 chars/token).
+- **`Search`/`Ask` results cap at 100.** (`max_context_tokens`, when > 0, is now
+  honored as the per-request context budget; 0/unset uses the 4096-token
+  default.)
+- **Keyword and time predicates still scan storage.** `id` filters take a direct
+  key lookup, and `id`/`min_importance` are pushed down (into the sled fast path
+  and the Lance native scan); the DataFusion provider pushes `LIMIT` into storage
+  only when there is no `WHERE` clause. But keyword and date-range predicates,
+  and any unfiltered scan, are still O(n) over the object store — this bounds how
   large a corpus stays responsive.
-- **Embedded CLI sees only its own process's indexes.** Because the non-full-text
-  indexes are in-memory, `kowitodb ask`/`sql` started fresh will not have the
-  vector/graph/metadata/time indexes populated for data inserted by a different
-  process. For shared querying, run `serve` and use clients.
+- **Single-writer data directory.** sled holds an exclusive lock on its
+  directory, so only one process (the server, or one embedded CLI command) can
+  open a given data directory at a time. For concurrent access, run `serve` and
+  use clients.
 
 ## Operational runbook
 
 | Situation | Action |
 | --- | --- |
-| After a restart, `ask` returns weak/empty results | Expected if you have not re-ingested. Check `Stats.vector_count`; run the re-ingestion pass; resume vector traffic once counts recover. |
+| After a restart, `ask` returns weak/empty results | The startup reindex pass should have rebuilt the indexes. Check that `Stats.vector_count` ≈ `Stats.total_objects`; if it is still climbing, the reindex pass is still running — wait for it. If counts never recover, check the logs for reindex errors and that objects actually carry embeddings. |
+| Slow startup on a large corpus | Expected — the reindex pass is O(stored objects). Budget for it; schedule restarts off-peak. |
 | Plan-cache hit rate near zero during a bulk load | Expected — writes clear the cache. It recovers once writes settle. |
 | Memory pressure / OOM risk | The full working set lives in RAM. Shed objects, raise host memory, or move to a larger node; there is no spill-to-disk for the in-memory indexes. |
-| Need to expose the port externally | Don't, without a TLS-terminating, authenticating proxy in front and network ACLs. |
-| Need a real liveness probe | TCP connect to `--addr`, or a periodic `Stats` RPC from a sidecar. |
+| Need to expose the port externally | Enable `--api-key` and TLS (`--tls-cert`/`--tls-key`), and put network ACLs in front. |
+| Need a real liveness probe | Use the gRPC health service (`grpc_health_probe`), `GET /healthz` on `--metrics-addr`, or a periodic `Stats` RPC. |
 | Corrupt/incompatible data dir after upgrade | Restore from backup, or delete `{index-path}/tantivy/` and re-ingest to rebuild the full-text index. |
-| Need full SQL (aggregates, ORDER BY) | Use `kowitodb sql` (CLI) or the engine `sql_select` API — not the SDK `sql()` helper. |
+| Need full SQL (aggregates, ORDER BY) | Use the `Sql` RPC / SDK `sql()` (DataFusion), the engine `sql_select` API, or the `kowitodb sql` CLI (index-routed path). |

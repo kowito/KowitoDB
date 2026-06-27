@@ -11,6 +11,7 @@ anywhere.
 - [Configuration](#configuration)
 - [Storage backend selection](#storage-backend-selection)
 - [Dockerfile](#dockerfile)
+- [Continuous integration](#continuous-integration)
 - [Resource and sizing guidance](#resource-and-sizing-guidance)
 - [Persistence and data directory](#persistence-and-data-directory)
 - [Observability](#observability)
@@ -63,34 +64,85 @@ the feature and use `KowitoDBEngine::new_with_lance`. See
 ```
 
 The `serve` command creates the storage and index directories if they do not
-exist, opens the engine, and serves the `KowitoDB` gRPC service on `--addr`.
+exist, opens the engine (rebuilding the in-memory indexes from storage — see
+[Persistence and data directory](#persistence-and-data-directory)), and serves
+the `KowitoDB` gRPC service on `--addr`.
+
+A hardened invocation with auth, TLS, and a Prometheus endpoint:
+
+```bash
+KOWITODB_EMBEDDING_PROVIDER=openai OPENAI_API_KEY=sk-... \
+./target/release/kowitodb serve \
+  --addr 0.0.0.0:50051 \
+  --storage-path /var/lib/kowitodb/storage \
+  --index-path /var/lib/kowitodb/index \
+  --api-key "$KOWITODB_API_KEY" \
+  --tls-cert /etc/kowitodb/tls/cert.pem \
+  --tls-key /etc/kowitodb/tls/key.pem \
+  --metrics-addr 0.0.0.0:9090
+```
 
 ## Configuration
 
-All configuration is via CLI flags and one environment variable. There is no
-config file.
+All configuration is via CLI flags (each of which falls back to an environment
+variable) plus a few embedding/logging env vars. There is no config file.
 
 ### CLI flags (`serve`)
 
-| Flag | Short | Default | Description |
-| --- | --- | --- | --- |
-| `--addr` | `-a` | `127.0.0.1:50051` | Socket address to bind the gRPC server. Use `0.0.0.0:50051` to accept remote connections. |
-| `--storage-path` | `-s` | `./data/storage` | Directory for the sled object store. |
-| `--index-path` | `-i` | `./data/index` | Directory for the Tantivy full-text index (created under `{index-path}/tantivy/`). |
+| Flag | Short | Env | Default | Description |
+| --- | --- | --- | --- | --- |
+| `--addr` | `-a` | — | `127.0.0.1:50051` | Socket address to bind the gRPC server. Use `0.0.0.0:50051` to accept remote connections. |
+| `--storage-path` | `-s` | — | `./data/storage` | Directory for the sled object store. |
+| `--index-path` | `-i` | — | `./data/index` | Directory for the Tantivy full-text index (created under `{index-path}/tantivy/`). |
+| `--api-key` | — | `KOWITODB_API_KEY` | _(unset)_ | Require this key on every gRPC call, presented as `authorization: Bearer <key>` or `x-api-key: <key>`. Auth is off when unset. |
+| `--tls-cert` | — | `KOWITODB_TLS_CERT` | _(unset)_ | Path to a PEM TLS certificate chain. Enables TLS together with `--tls-key`. |
+| `--tls-key` | — | `KOWITODB_TLS_KEY` | _(unset)_ | Path to the PEM TLS private key. |
+| `--metrics-addr` | — | `KOWITODB_METRICS_ADDR` | _(unset)_ | Bind an HTTP server exposing Prometheus `/metrics` and `/healthz` (e.g. `0.0.0.0:9090`). |
 
 The default bind address is loopback-only (`127.0.0.1`). Change it deliberately,
-and see [Security posture](#security-posture) first.
+and see [Security posture](#security-posture) first. The gRPC health-checking
+service and reflection are always enabled (and unauthenticated) regardless of
+these flags.
 
 ### Environment variables
 
 | Variable | Effect |
 | --- | --- |
 | `RUST_LOG` | Sets the `tracing-subscriber` `EnvFilter`. Defaults to `info` when unset. Examples: `RUST_LOG=info`, `RUST_LOG=kowitodb=debug,warn`. |
+| `KOWITODB_API_KEY`, `KOWITODB_TLS_CERT`, `KOWITODB_TLS_KEY`, `KOWITODB_METRICS_ADDR` | Fallbacks for the corresponding `serve` flags above. |
+| `KOWITODB_EMBEDDING_PROVIDER` | Selects the embedding provider: `openai`, `ollama`, or (unset/other) the deterministic dev proxy. |
+| `OPENAI_API_KEY` / `KOWITODB_OPENAI_API_KEY` | API key for the `openai` provider. |
+| `KOWITODB_OPENAI_BASE_URL` | OpenAI-compatible base URL (default `https://api.openai.com/v1`). |
+| `KOWITODB_EMBEDDING_MODEL` | Embedding model name (default `text-embedding-3-small`; `nomic-embed-text` for Ollama). |
+| `KOWITODB_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`). |
 
-There are no other environment variables. In particular, there is **no** env
-var for the bind port (use `--addr`), no auth/secret configuration, and no env
-var that switches the storage backend (that is a build-time feature plus a
-code-level constructor choice).
+There is no env var for the bind port (use `--addr`) and no env var that switches
+the storage backend (that is a build-time feature plus a code-level constructor
+choice — see below).
+
+### Embedding provider
+
+Set `KOWITODB_EMBEDDING_PROVIDER` to use a real embedder; otherwise the server
+runs the deterministic hash proxy (fine for development, not for semantic search
+quality). For OpenAI:
+
+```bash
+export KOWITODB_EMBEDDING_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+# optional: KOWITODB_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+For a local Ollama:
+
+```bash
+export KOWITODB_EMBEDDING_PROVIDER=ollama
+# optional: KOWITODB_OLLAMA_URL=http://localhost:11434/v1
+# optional: KOWITODB_EMBEDDING_MODEL=nomic-embed-text
+```
+
+The provider is selected once at engine startup (`OpenAiConfig::from_env`).
+Embeddings are persisted on insert, so the choice only affects newly embedded
+content — re-embed existing objects (via `update`) if you switch models.
 
 ## Storage backend selection
 
@@ -107,60 +159,46 @@ local path or any URI Lance supports.
 
 ## Dockerfile
 
-A multi-stage build that compiles a release binary and ships it on a slim
-runtime image. `protoc` is not required at build time — the proto is compiled by
-`tonic-build` using the vendored compiler via the `prost` toolchain.
+The repository root ships a real multi-stage [`Dockerfile`](../Dockerfile). It:
 
-```dockerfile
-# ---- builder ----
-FROM rust:1-bookworm AS builder
-WORKDIR /src
-
-# Cache dependencies first.
-COPY Cargo.toml Cargo.lock ./
-COPY kowitodb-core/Cargo.toml      kowitodb-core/
-COPY kowitodb-storage/Cargo.toml   kowitodb-storage/
-COPY kowitodb-index/Cargo.toml     kowitodb-index/
-COPY kowitodb-planner/Cargo.toml   kowitodb-planner/
-COPY kowitodb-sql/Cargo.toml       kowitodb-sql/
-COPY kowitodb-server/Cargo.toml    kowitodb-server/
-COPY kowitodb/Cargo.toml           kowitodb/
-
-# Bring in the full source and build.
-COPY . .
-RUN cargo build --release --bin kowitodb
-
-# ---- runtime ----
-FROM debian:bookworm-slim
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
- && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /src/target/release/kowitodb /usr/local/bin/kowitodb
-
-# Persist data on a mounted volume.
-VOLUME ["/var/lib/kowitodb"]
-ENV RUST_LOG=info
-EXPOSE 50051
-
-ENTRYPOINT ["kowitodb", "serve", \
-  "--addr", "0.0.0.0:50051", \
-  "--storage-path", "/var/lib/kowitodb/storage", \
-  "--index-path", "/var/lib/kowitodb/index"]
-```
+- builds the tuned release binary in a `rust:1-bookworm` stage, installing
+  `protobuf-compiler` (`protoc`) — which `tonic-build` requires to compile the
+  gRPC definitions;
+- ships the binary on `debian:bookworm-slim` with `ca-certificates`;
+- mounts a `/data` volume, exposes **50051** (gRPC) and **9090**
+  (Prometheus `/metrics` + `/healthz`), and its default `CMD` runs
+  `serve` with `--metrics-addr 0.0.0.0:9090` against `/data/storage` and
+  `/data/index`.
 
 Build and run:
 
 ```bash
 docker build -t kowitodb:0.1.0 .
-docker run --rm -p 50051:50051 \
-  -v kowitodb-data:/var/lib/kowitodb \
+docker run --rm \
+  -p 50051:50051 -p 9090:9090 \
+  -v kowitodb-data:/data \
   kowitodb:0.1.0
 ```
+
+Override the default `CMD` to add `--api-key`, `--tls-cert`/`--tls-key`, or
+embedding env vars (pass the latter with `-e`/`--env-file`). Because auth and
+TLS are off by default, do this before exposing the container beyond a trusted
+network — see [Security posture](#security-posture).
 
 For the Lance backend you would need a server entry point that calls
 `new_with_lance` and a build with `--features lance`; the stock `kowitodb serve`
 binary does not select Lance.
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on pushes to
+`main` and on pull requests:
+
+- **Rust:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings` (warnings are errors), and `cargo test --workspace`, with
+  `protoc` installed and the build cache warmed.
+- **SDKs:** builds and vets the Go SDK (`go build ./... && go vet ./...`) and
+  type-checks the TypeScript SDK (`npx tsc --noEmit`).
 
 ## Resource and sizing guidance
 
@@ -199,18 +237,21 @@ Two directories matter, both under the paths you pass to `serve`:
 
 What persists and what does not:
 
-- **Persistent:** the object store (sled, or a Lance dataset if used) and the
-  Tantivy full-text index.
-- **Not persistent (in-memory, rebuilt only by re-inserting objects):** the
-  HNSW vector index, the brute-force vector index, the metadata index, the time
-  index, and the graph index; plus the plan cache and agent memory.
+- **Persistent on disk:** the object store (sled, or a Lance dataset if used) —
+  including embeddings and version history — and the Tantivy full-text index.
+- **In-memory, rebuilt from storage on startup:** the HNSW vector index, the
+  metadata index, the time index, and the graph index. `serve` (and the
+  `ask`/`sql`/`stats` CLI commands) call `KowitoDBEngine::open()`, which runs a
+  reindex pass over the persisted object store before serving — so all search
+  modes work immediately after a restart, with no re-ingestion required.
+- **Not persistent and not rebuilt:** the plan cache and agent memory (both
+  ephemeral), and the brute-force vector index (not on the live `ask` path).
 
-This means that after a restart the object store still holds every object and
-full-text search still works, but vector/metadata/time/graph search return
-nothing until those objects are re-inserted. This is a real operational
-constraint, not a tuning knob — see
-[OPERATIONS.md → Index persistence](OPERATIONS.md#index-persistence-and-restarts)
-for how to handle it (e.g. a re-ingestion pass on startup).
+The reindex pass uses the persisted embeddings — it makes **no** embedding API
+calls — and skips the already-persisted full-text index. Its cost is
+O(stored objects) and is paid once at startup, so plan for a slightly longer
+warm-up on large corpora. See
+[OPERATIONS.md → Index persistence and restarts](OPERATIONS.md#index-persistence-and-restarts).
 
 Back up both directories together; do not snapshot one without the other. Backup
 and restore procedures are in [OPERATIONS.md](OPERATIONS.md).
@@ -224,36 +265,44 @@ and restore procedures are in [OPERATIONS.md](OPERATIONS.md).
   `json` feature, so structured JSON logging can be enabled in code if desired;
   the default binary uses the human-readable formatter.
 - **Metrics.** `MetricsCollector` tracks ask/remember/insert/sql/error counts,
-  cumulative ask latency, average ask latency, and uptime. These are **not**
-  exposed as a Prometheus endpoint; some counters leak into the `Stats` RPC's
-  `index_size_bytes` field (the server adds `snapshot.ask_count` to it). Treat
-  the `Stats` RPC and logs as the current observability surface.
-- **Health checks.** There is **no** gRPC health-checking service and **no**
-  gRPC reflection registered. For liveness, use a TCP connect check against
-  `--addr`, or have a sidecar issue a cheap `Stats` RPC.
+  cumulative and average ask latency, and uptime. When `--metrics-addr` is set,
+  they are exposed in Prometheus text format at `GET /metrics` on that address.
+  The `Stats` RPC additionally reports object/vector/graph counts, cache stats,
+  active agent sessions, and the estimated cost.
+- **Health checks.** Use any of:
+  - `GET /healthz` on the metrics address (returns `ok`) when `--metrics-addr`
+    is set;
+  - the always-on **gRPC health-checking service** (`grpc.health.v1.Health`) —
+    e.g. `grpc_health_probe -addr=host:50051`;
+  - the always-on **gRPC reflection** service for tooling like `grpcurl`.
+  Both gRPC services are unauthenticated, so probes work without the API key.
 
-See [OPERATIONS.md](OPERATIONS.md) for interpreting the metrics surfaced by
-`Stats`.
+See [OPERATIONS.md](OPERATIONS.md) for interpreting `Stats` and the metrics.
 
 ## Security posture
 
 Read this before binding to anything other than loopback.
 
-- **No authentication.** The gRPC server accepts any client that can reach the
-  port. There is no API key, token, or mTLS check anywhere in the request path.
-- **No TLS.** The server is configured for plaintext gRPC. SDK clients connect
-  with insecure channels by default. (The Go SDK lets you pass
-  `grpc.DialOption`s for credentials, but the server does not terminate TLS, so
-  you would need a TLS-terminating proxy in front.)
+- **Auth is off by default.** Set `--api-key` (env `KOWITODB_API_KEY`) to require
+  a Bearer / `x-api-key` token on every gRPC call. When unset, the server accepts
+  any client that can reach the port.
+- **TLS is off by default.** Set `--tls-cert` and `--tls-key` to terminate TLS in
+  the server itself. When unset, the server speaks plaintext gRPC and SDK clients
+  connect with insecure channels.
+- **The health-check and reflection gRPC services are always on and
+  unauthenticated by design**, so liveness probes and tooling work without
+  credentials. They expose service metadata (reflection) but not your data; keep
+  the endpoint off the public internet regardless.
 - **Default bind is loopback** (`127.0.0.1:50051`). Keep it that way unless you
   have a network boundary you trust.
 
-Recommended hardening until first-class auth/TLS land:
+Recommended hardening:
 
-1. Keep KowitoDB on a private network / inside the cluster; never expose the
-   port to the public internet.
-2. Terminate TLS and enforce authentication at a reverse proxy or service mesh
-   (e.g. Envoy/Linkerd) in front of the server.
+1. Turn on `--api-key` and TLS for any non-loopback deployment; rotate the key
+   out of band.
+2. Keep KowitoDB on a private network / inside the cluster; never expose the
+   port to the public internet. A reverse proxy or service mesh (Envoy/Linkerd)
+   can add mTLS and richer authz in front if you need more than a static key.
 3. Restrict ingress with security groups / network policies to known clients.
 4. Run the process as an unprivileged user with write access only to the data
-   directory.
+   directory, and keep TLS key files readable only by that user.
