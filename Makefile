@@ -2,7 +2,7 @@
 # (Targets are thin wrappers around cargo — no install required.)
 
 .DEFAULT_GOAL := help
-.PHONY: help build release run ask test lint fmt fmt-check ci example \
+.PHONY: help build release run ask test lint fmt fmt-check ci demo example \
         bench bench-compare docker docker-run gen-python clean
 
 help: ## Show this help
@@ -34,6 +34,9 @@ fmt-check: ## Check formatting (matches CI)
 	cargo fmt --all --check
 
 ci: fmt-check lint test ## Run the exact CI gate locally (fmt + clippy + test)
+
+demo: ## See it work in 2s — seed in-memory data + run sample queries
+	cargo run -p kowitodb -- demo
 
 example: ## Run the embedded-library example (no server)
 	cargo run -p kowitodb-server --example embedded

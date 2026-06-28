@@ -6,9 +6,11 @@ build in a couple of minutes.
 ## Prerequisites
 
 - **Rust** (stable, 2021 edition) — install via [rustup](https://rustup.rs).
-- **protoc** (Protocol Buffers compiler) — the server crate compiles `.proto`:
-  - macOS: `brew install protobuf`
-  - Debian/Ubuntu: `apt-get install -y protobuf-compiler`
+
+That's it — `protoc` is **vendored** (via `protoc-bin-vendored`), so a fresh
+clone builds with no extra install on macOS/Linux/Windows. Only if your platform
+has no prebuilt protoc do you need a system one (`brew install protobuf` /
+`apt-get install -y protobuf-compiler`); the build falls back to it automatically.
 
 ## Build & run
 

@@ -1,4 +1,14 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Use the vendored `protoc` so a fresh clone builds without anyone having to
+    // `brew install protobuf` / `apt-get install protobuf-compiler` first. Falls
+    // back to a system protoc (`PROTOC` env / `PATH`) if this platform has no
+    // prebuilt binary.
+    if std::env::var_os("PROTOC").is_none() {
+        if let Ok(protoc) = protoc_bin_vendored::protoc_bin_path() {
+            std::env::set_var("PROTOC", protoc);
+        }
+    }
+
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     tonic_build::configure()
         .build_server(true)

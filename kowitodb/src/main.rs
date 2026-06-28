@@ -17,6 +17,15 @@ use kowitodb_server::{serve_gateway, serve_with_config, KowitoDBEngine, ServerCo
 #[command(name = "kowitodb")]
 #[command(version)]
 #[command(about = "AI Knowledge Operating System", long_about = None)]
+#[command(after_help = "EXAMPLES:
+  kowitodb demo                       See it work in 2s (in-memory, no setup)
+  kowitodb serve                      Start the gRPC server on 127.0.0.1:50051
+  kowitodb insert \"Acme renewed\" -k acme,renewal   Add a fact
+  kowitodb ask \"who renewed?\"          Query across all indexes (embedded)
+  kowitodb sql \"SELECT content FROM knowledge LIMIT 5\"
+  kowitodb gateway --peers host1:50051,host2:50051  Distributed coordinator
+
+Configuration is via KOWITODB_* env vars — see the README.")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -173,17 +182,29 @@ enum Commands {
         #[arg(short, long, default_value = "./data/index")]
         index_path: PathBuf,
     },
+
+    /// Seed an in-memory database with sample data and run example queries —
+    /// the fastest way to see KowitoDB work (no server, no setup, no disk).
+    Demo,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // The `demo` command is a clean human-facing tour, so default it to quiet
+    // (warnings only) unless the user explicitly set RUST_LOG. Everything else
+    // defaults to info-level logs.
+    let default_filter = if matches!(cli.command, Commands::Demo) {
+        "warn"
+    } else {
+        "info"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Serve {
@@ -454,7 +475,87 @@ async fn main() -> anyhow::Result<()> {
 
             println!("  Total cost (est.):  ${:.6}", stats.total_cost_usd);
         }
+
+        Commands::Demo => run_demo().await?,
     }
 
+    Ok(())
+}
+
+/// Seed an in-memory engine with a few facts and run example `ask()`/SQL
+/// queries — a zero-setup tour of what KowitoDB does.
+async fn run_demo() -> anyhow::Result<()> {
+    println!("🚀 KowitoDB demo — in-memory, no server, no setup.\n");
+    let engine = KowitoDBEngine::new_in_memory().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let facts: &[(&str, &[&str], &str, f32)] = &[
+        (
+            "Acme Corp renewed their enterprise license in March 2024 after a $15M Series A.",
+            &["acme", "renewal", "series a"],
+            "Acme Corp",
+            0.9,
+        ),
+        (
+            "Globex shipped their v2 platform and onboarded three enterprise customers in Q2.",
+            &["globex", "launch"],
+            "Globex",
+            0.7,
+        ),
+        (
+            "Initech churned in February after budget cuts.",
+            &["initech", "churn"],
+            "Initech",
+            0.6,
+        ),
+        (
+            "Umbrella signed a multi-year enterprise contract worth $2M.",
+            &["umbrella", "contract"],
+            "Umbrella",
+            0.85,
+        ),
+    ];
+    for (text, kws, company, importance) in facts {
+        let obj = KnowledgeObject::new(*text)
+            .with_keywords(kws.iter().map(|s| s.to_string()).collect())
+            .with_metadata("company", *company)
+            .with_importance(*importance);
+        engine
+            .insert(obj)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    }
+    println!("Seeded {} knowledge objects.\n", facts.len());
+
+    for q in [
+        "Which enterprise customers had activity?",
+        "What happened with churn?",
+    ] {
+        println!("❯ ai.ask(\"{q}\")");
+        let resp = engine
+            .ask(q, 3)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("  intent: {}", resp.detected_intent);
+        for r in &resp.results {
+            println!(
+                "  [{:.2}] ({}) {}",
+                r.relevance_score, r.retrieval_source, r.content
+            );
+        }
+        println!();
+    }
+
+    println!("❯ sql: SELECT content FROM knowledge WHERE importance >= 0.8");
+    let rows = engine
+        .sql_select("SELECT content FROM knowledge WHERE importance >= 0.8")
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    for row in &rows {
+        if let Some(c) = row.get("content") {
+            println!("  • {c}");
+        }
+    }
+
+    println!("\n✅ Done. Next: `kowitodb serve` to run the server, or see the README.");
     Ok(())
 }

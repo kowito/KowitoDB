@@ -63,3 +63,6 @@ cross-encoder-rerank = [
 
 [build-dependencies]
 tonic-build = "0.12"
+# Bundled protoc binary — removes the system `protoc` prerequisite on the
+# common dev platforms so a fresh clone builds with no extra install.
+protoc-bin-vendored = "3"

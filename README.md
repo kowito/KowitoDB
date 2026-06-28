@@ -208,15 +208,21 @@ and read-repair.
 
 ## Quick Start
 
-### 1. Build (one command)
+### 0. See it work in 2 seconds
 
 ```bash
 git clone https://github.com/kowito/kowitodb && cd kowitodb
-cargo build --release
+cargo run -p kowitodb -- demo     # seeds in-memory data, runs ask() + SQL
 ```
 
-> Prerequisite: `protoc` (Protocol Buffers compiler) — `brew install protobuf`
-> or `apt-get install -y protobuf-compiler`.
+No `protoc` to install (it's vendored), no server, no config — just a tour of
+`ai.ask()` and SQL over sample data.
+
+### 1. Build
+
+```bash
+cargo build --release             # the single `kowitodb` binary
+```
 
 ### 2. Run the server
 
@@ -229,8 +235,9 @@ cargo build --release
 # ...or in dev mode, no release build needed:
 cargo run -p kowitodb -- serve
 
-# ...or skip the server entirely (embedded mode):
-cargo run -p kowitodb -- ask "what do you know?"
+# ...or use the binary directly, no SDK (embedded mode):
+kowitodb insert "Acme renewed their enterprise license" -k acme,renewal
+kowitodb ask "who renewed?"
 ```
 
 That's it. One binary. No Docker, no sidecars, no external services. Set
