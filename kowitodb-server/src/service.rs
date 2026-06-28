@@ -9,6 +9,19 @@ use crate::metrics::MetricsCollector;
 use crate::proto;
 use crate::proto::kowito_db_server::KowitoDb;
 
+/// Map a [`kowitodb_core::KowitoError`] to a [`tonic::Status`] with the correct
+/// gRPC status code so clients can distinguish not-found (5) from
+/// invalid-argument (3) from internal (13), instead of everything being
+/// opaque "Internal".
+fn map_err(e: kowitodb_core::KowitoError) -> Status {
+    match &e {
+        kowitodb_core::KowitoError::NotFound(_) => Status::not_found(e.to_string()),
+        kowitodb_core::KowitoError::AlreadyExists(_) => Status::already_exists(e.to_string()),
+        kowitodb_core::KowitoError::InvalidInput(_) => Status::invalid_argument(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
+}
+
 pub struct KowitoDBService {
     engine: Arc<KowitoDBEngine>,
     metrics: Arc<MetricsCollector>,
@@ -47,7 +60,7 @@ impl KowitoDb for KowitoDBService {
             }
             Err(e) => {
                 self.metrics.record_error();
-                Err(Status::internal(e.to_string()))
+                Err(map_err(e))
             }
         }
     }
@@ -62,7 +75,7 @@ impl KowitoDb for KowitoDBService {
 
         let obj = self.engine.get(id).await.map_err(|e| {
             self.metrics.record_error();
-            Status::internal(e.to_string())
+            map_err(e)
         })?;
 
         Ok(Response::new(proto::GetResponse {
@@ -80,7 +93,7 @@ impl KowitoDb for KowitoDBService {
 
         let ids = self.engine.batch_insert(objects).await.map_err(|e| {
             self.metrics.record_error();
-            Status::internal(e.to_string())
+            map_err(e)
         })?;
 
         for _ in 0..count {
@@ -109,7 +122,7 @@ impl KowitoDb for KowitoDBService {
             .await
             .map_err(|e| {
                 self.metrics.record_error();
-                Status::internal(e.to_string())
+                map_err(e)
             })?;
 
         Ok(Response::new(proto::ListResponse {
@@ -128,7 +141,7 @@ impl KowitoDb for KowitoDBService {
 
         let existed = self.engine.delete(id).await.map_err(|e| {
             self.metrics.record_error();
-            Status::internal(e.to_string())
+            map_err(e)
         })?;
 
         Ok(Response::new(proto::DeleteResponse { existed }))
@@ -148,7 +161,7 @@ impl KowitoDb for KowitoDBService {
             .await
             .map_err(|e| {
                 self.metrics.record_error();
-                Status::internal(e.to_string())
+                map_err(e)
             })?;
         self.metrics.record_ask(start.elapsed());
 
@@ -187,7 +200,7 @@ impl KowitoDb for KowitoDBService {
             .await
             .map_err(|e| {
                 self.metrics.record_error();
-                Status::internal(e.to_string())
+                map_err(e)
             })?;
         self.metrics.record_ask(start.elapsed());
 
@@ -223,7 +236,7 @@ impl KowitoDb for KowitoDBService {
 
         let id = self.engine.insert(obj).await.map_err(|e| {
             self.metrics.record_error();
-            Status::internal(e.to_string())
+            map_err(e)
         })?;
 
         self.metrics.record_remember();
@@ -239,7 +252,7 @@ impl KowitoDb for KowitoDBService {
     ) -> Result<Response<proto::StatsResponse>, Status> {
         let stats = self.engine.stats().await.map_err(|e| {
             self.metrics.record_error();
-            Status::internal(e.to_string())
+            map_err(e)
         })?;
 
         let (cache_entries, cache_hit_rate) = stats
@@ -282,7 +295,7 @@ impl KowitoDb for KowitoDBService {
             .await
             .map_err(|e| {
                 self.metrics.record_error();
-                Status::internal(e.to_string())
+                map_err(e)
             })?;
 
         Ok(Response::new(match version {
@@ -327,7 +340,7 @@ impl KowitoDb for KowitoDBService {
             .await
             .map_err(|e| {
                 self.metrics.record_error();
-                Status::internal(e.to_string())
+                map_err(e)
             })?;
 
         Ok(Response::new(proto::RecordTurnResponse { turn_count }))

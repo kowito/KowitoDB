@@ -50,6 +50,15 @@ import grpc
 from . import kowitodb_pb2 as pb
 from . import kowitodb_pb2_grpc as pb_grpc
 
+# ---- Dataclasses with helpful reprs ----
+
+
+def _truncate(s: str, n: int = 80) -> str:
+    """Truncate a string for repr display."""
+    if len(s) <= n:
+        return s
+    return s[:n] + "…"
+
 
 @dataclass
 class AskResult:
@@ -71,6 +80,13 @@ class AskResult:
             metadata=dict(p.metadata),
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"AskResult(id={self.id!r}, score={self.relevance_score:.3f}, "
+            f"source={self.retrieval_source!r}, "
+            f"content={_truncate(self.content)!r})"
+        )
+
 
 @dataclass
 class AskResponse:
@@ -88,6 +104,11 @@ class AskResponse:
             detected_intent=p.detected_intent,
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"AskResponse(intent={self.detected_intent!r}, results={len(self.results)})"
+        )
+
 
 @dataclass
 class SearchResult:
@@ -101,6 +122,9 @@ class SearchResult:
     @classmethod
     def from_proto(cls, p: pb.SearchResult) -> "SearchResult":
         return cls(id=p.id, content=p.content, score=p.score, metadata=dict(p.metadata))
+
+    def __repr__(self) -> str:
+        return f"SearchResult(id={self.id!r}, score={self.score:.3f})"
 
 
 @dataclass
@@ -131,6 +155,13 @@ class Stats:
             cache_hit_rate=p.cache_hit_rate,
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"Stats(objects={self.total_objects}, vectors={self.vector_count}, "
+            f"graph=({self.graph_nodes}n/{self.graph_edges}e), "
+            f"sessions={self.active_agent_sessions})"
+        )
+
 
 @dataclass
 class UpdateResult:
@@ -142,6 +173,9 @@ class UpdateResult:
     @classmethod
     def from_proto(cls, p: pb.UpdateResponse) -> "UpdateResult":
         return cls(updated=p.updated, version=p.version)
+
+    def __repr__(self) -> str:
+        return f"UpdateResult(updated={self.updated}, version={self.version})"
 
 
 @dataclass
@@ -168,6 +202,9 @@ class KnowledgeObject:
             updated_at=p.updated_at,
         )
 
+    def __repr__(self) -> str:
+        return f"KnowledgeObject(id={self.id!r}, importance={self.importance:.2f})"
+
 
 @dataclass
 class ListResult:
@@ -183,6 +220,9 @@ class ListResult:
             total=p.total,
         )
 
+    def __repr__(self) -> str:
+        return f"ListResult(page={len(self.objects)}, total={self.total})"
+
 
 @dataclass
 class ConversationTurn:
@@ -195,6 +235,11 @@ class ConversationTurn:
     @classmethod
     def from_proto(cls, p: pb.ConversationTurnProto) -> "ConversationTurn":
         return cls(role=p.role, content=p.content, timestamp=p.timestamp)
+
+    def __repr__(self) -> str:
+        return (
+            f"ConversationTurn(role={self.role!r}, content={_truncate(self.content)!r})"
+        )
 
 
 class KowitoDBClient:
@@ -484,3 +529,236 @@ class KowitoDBClient:
     def _ensure_connected(self):
         if self._stub is None:
             self.connect()
+
+
+class AsyncKowitoDBClient:
+    """Async Python gRPC client for KowitoDB.
+
+    Use this with asyncio-based applications (FastAPI, LangChain async, etc.).
+    Supports ``async with`` for automatic connection lifecycle management.
+
+    Usage:
+        async with AsyncKowitoDBClient("localhost:50051") as db:
+            resp = await db.ask("What do you know about X?")
+    """
+
+    def __init__(self, address: str = "localhost:50051"):
+        self.address = address
+        self._channel: Optional[grpc.aio.Channel] = None
+        self._stub: Optional[pb_grpc.KowitoDBStub] = None
+
+    # ---- Async context manager ----
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *args):
+        await self.close()
+
+    # ---- Connection ----
+
+    async def connect(self):
+        """Establish the gRPC connection."""
+        if self._channel is not None:
+            return
+        self._channel = grpc.aio.insecure_channel(self.address)
+        self._stub = pb_grpc.KowitoDBStub(self._channel)
+
+    async def close(self):
+        """Close the gRPC connection."""
+        if self._channel is not None:
+            await self._channel.close()
+            self._channel = None
+            self._stub = None
+
+    # ---- High-level AI API ----
+
+    async def ask(
+        self,
+        question: str,
+        max_results: int = 10,
+        metadata_filter: Optional[Dict[str, str]] = None,
+    ) -> AskResponse:
+        """ai.ask() — natural-language query with automatic retrieval."""
+        self._ensure_connected()
+        req = pb.AskRequest(
+            question=question,
+            max_results=max_results,
+            metadata_filter=metadata_filter or {},
+        )
+        resp = await self._stub.Ask(req)
+        return AskResponse.from_proto(resp)
+
+    async def remember(
+        self,
+        content: str,
+        keywords: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        importance: float = 0.5,
+    ) -> str:
+        """ai.remember() — store knowledge for future retrieval."""
+        self._ensure_connected()
+        req = pb.RememberRequest(
+            content=content,
+            keywords=keywords or [],
+            metadata=metadata or {},
+            importance=importance,
+        )
+        resp = await self._stub.Remember(req)
+        return resp.id
+
+    async def forget(self, object_id: str) -> bool:
+        """Remove a knowledge object by ID."""
+        self._ensure_connected()
+        req = pb.DeleteRequest(id=object_id)
+        resp = await self._stub.Delete(req)
+        return resp.existed
+
+    # ---- SQL API ----
+
+    async def sql(self, query: str) -> List[Dict[str, str]]:
+        """Execute a SQL query against the DataFusion engine."""
+        self._ensure_connected()
+        req = pb.SqlRequest(query=query)
+        resp = await self._stub.Sql(req)
+        return [dict(row.columns) for row in resp.rows]
+
+    # ---- Low-level API ----
+
+    async def insert(
+        self,
+        content: str,
+        keywords: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        relationships: Optional[List[tuple]] = None,
+        importance: float = 0.5,
+    ) -> str:
+        """Insert a knowledge object explicitly."""
+        self._ensure_connected()
+        rels = [
+            pb.RelationshipInput(relation_type=r[0], target_id=r[1])
+            for r in (relationships or [])
+        ]
+        req = pb.InsertRequest(
+            content=content,
+            keywords=keywords or [],
+            metadata=metadata or {},
+            relationships=rels,
+            importance=importance,
+        )
+        resp = await self._stub.Insert(req)
+        return resp.id
+
+    async def batch_insert(self, items: List[dict]) -> List[str]:
+        """Insert multiple knowledge objects in a single request."""
+        self._ensure_connected()
+        proto_items = []
+        for item in items:
+            rels = [
+                pb.RelationshipInput(relation_type=r[0], target_id=r[1])
+                for r in (item.get("relationships") or [])
+            ]
+            proto_items.append(
+                pb.InsertRequest(
+                    content=item["content"],
+                    keywords=item.get("keywords") or [],
+                    metadata=item.get("metadata") or {},
+                    relationships=rels,
+                    importance=item.get("importance", 0.5),
+                )
+            )
+        req = pb.BatchInsertRequest(items=proto_items)
+        resp = await self._stub.BatchInsert(req)
+        return list(resp.ids)
+
+    async def get(self, object_id: str) -> Optional[dict]:
+        """Retrieve a knowledge object by ID."""
+        self._ensure_connected()
+        req = pb.GetRequest(id=object_id)
+        resp = await self._stub.Get(req)
+        if resp.HasField("object"):
+            o = resp.object
+            return {
+                "id": o.id,
+                "content": o.content,
+                "keywords": list(o.keywords),
+                "metadata": dict(o.metadata),
+                "importance": o.importance,
+                "created_at": o.created_at,
+            }
+        return None
+
+    async def update(
+        self,
+        id: str,
+        content: Optional[str] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        keywords: Optional[List[str]] = None,
+        importance: Optional[float] = None,
+        change_description: Optional[str] = None,
+    ) -> UpdateResult:
+        """Update an existing knowledge object."""
+        self._ensure_connected()
+        req = pb.UpdateRequest(id=id, metadata=metadata or {}, keywords=keywords or [])
+        if content is not None:
+            req.content = content
+        if importance is not None:
+            req.importance = importance
+        if change_description is not None:
+            req.change_description = change_description
+        resp = await self._stub.Update(req)
+        return UpdateResult.from_proto(resp)
+
+    async def search(
+        self,
+        query: str,
+        top_k: int = 20,
+        metadata_filter: Optional[Dict[str, str]] = None,
+    ) -> List[SearchResult]:
+        """Direct search (bypasses the AI planner)."""
+        self._ensure_connected()
+        req = pb.SearchRequest(
+            query=query, top_k=top_k, metadata_filter=metadata_filter or {}
+        )
+        resp = await self._stub.Search(req)
+        return [SearchResult.from_proto(r) for r in resp.results]
+
+    async def list(self, offset: int = 0, limit: int = 0) -> ListResult:
+        """List stored knowledge objects (paginated scroll)."""
+        self._ensure_connected()
+        req = pb.ListRequest(offset=offset, limit=limit)
+        resp = await self._stub.List(req)
+        return ListResult.from_proto(resp)
+
+    # ---- Agent conversation memory ----
+
+    async def record_turn(self, session_id: str, role: str, content: str) -> int:
+        """Record a conversation turn for an agent session."""
+        self._ensure_connected()
+        req = pb.RecordTurnRequest(session_id=session_id, role=role, content=content)
+        resp = await self._stub.RecordTurn(req)
+        return resp.turn_count
+
+    async def get_session(self, session_id: str) -> Optional[List[ConversationTurn]]:
+        """Retrieve all turns for an agent session."""
+        self._ensure_connected()
+        req = pb.GetSessionRequest(session_id=session_id)
+        resp = await self._stub.GetSession(req)
+        if not resp.found:
+            return None
+        return [ConversationTurn.from_proto(t) for t in resp.turns]
+
+    async def stats(self) -> Stats:
+        """Return database statistics."""
+        self._ensure_connected()
+        req = pb.StatsRequest()
+        resp = await self._stub.Stats(req)
+        return Stats.from_proto(resp)
+
+    def _ensure_connected(self):
+        if self._stub is None:
+            raise RuntimeError(
+                "Client is not connected. Use `await client.connect()` or "
+                "`async with AsyncKowitoDBClient(...) as client:`."
+            )

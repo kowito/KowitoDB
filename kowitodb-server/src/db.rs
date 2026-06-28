@@ -489,10 +489,19 @@ impl KowitoDBEngine {
         let objects = self.storage.search(StorageFilter::default()).await?;
         let count = objects.len();
 
+        if count > 0 {
+            info!(
+                "Reindexing {} object(s) from storage… (this may take a moment)",
+                count
+            );
+        }
+
         // Collect vectors so the sharded index can build them in parallel.
         let mut vectors: Vec<(ObjectId, Embedding)> = Vec::new();
+        // Log progress every 10% (or at least once for small datasets).
+        let report_every = (count / 10).max(1);
 
-        for stored in &objects {
+        for (i, stored) in objects.iter().enumerate() {
             let obj = stored_to_obj(stored)?;
             self.content_cache.insert(obj.id, obj.content.clone());
 
@@ -514,15 +523,25 @@ impl KowitoDBEngine {
                 self.graph_index
                     .insert_relationships(obj.id, &obj.relationships);
             }
+
+            if (i + 1) % report_every == 0 || i + 1 == count {
+                info!(
+                    "Reindex progress: {}/{} objects ({:.0}%)",
+                    i + 1,
+                    count,
+                    (i + 1) as f64 / count as f64 * 100.0
+                );
+            }
         }
 
         if !vectors.is_empty() {
+            info!("Building vector index from {} embedding(s)…", vectors.len());
             self.hnsw_index.build_parallel(vectors);
         }
 
         if count > 0 {
             info!(
-                "Reindexed {} objects from storage into in-memory indexes",
+                "Reindex complete: {} object(s) loaded into in-memory indexes",
                 count
             );
         }

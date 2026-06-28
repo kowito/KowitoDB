@@ -362,6 +362,9 @@ async fn main() -> anyhow::Result<()> {
                 meta
             };
 
+            let keywords_len = all_keywords.len();
+            let metadata_len = all_metadata.len();
+
             let mut obj = KnowledgeObject::new(text)
                 .with_keywords(all_keywords)
                 .with_importance(importance);
@@ -376,8 +379,8 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
             println!("✅ Inserted knowledge object: {}", id);
-            println!("   Keywords: {}", all_metadata.len());
-            println!("   Metadata keys: {}", all_metadata.len());
+            println!("   Keywords: {}", keywords_len);
+            println!("   Metadata keys: {}", metadata_len);
         }
 
         Commands::Sql {

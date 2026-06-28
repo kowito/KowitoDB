@@ -31,5 +31,23 @@ pub enum KowitoError {
     Io(#[from] std::io::Error),
 }
 
+impl KowitoError {
+    /// A human-readable code string suitable for logging and client-side
+    /// dispatching. Mirrors the gRPC status code intent without pulling in tonic.
+    pub fn code(&self) -> &'static str {
+        match self {
+            KowitoError::NotFound(_) => "NOT_FOUND",
+            KowitoError::AlreadyExists(_) => "ALREADY_EXISTS",
+            KowitoError::InvalidInput(_) => "INVALID_ARGUMENT",
+            KowitoError::Storage(_)
+            | KowitoError::Index(_)
+            | KowitoError::Planner(_)
+            | KowitoError::Serialization(_)
+            | KowitoError::Internal(_)
+            | KowitoError::Io(_) => "INTERNAL",
+        }
+    }
+}
+
 /// Convenience result type.
 pub type Result<T> = std::result::Result<T, KowitoError>;

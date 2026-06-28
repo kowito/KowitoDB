@@ -9,8 +9,36 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
+# Cache dependency builds: copy manifests first, then build dependencies with a
+# dummy lib.rs so they're cached across source-only changes.
+COPY Cargo.toml Cargo.lock ./
+COPY kowitodb/Cargo.toml kowitodb/
+COPY kowitodb-core/Cargo.toml kowitodb-core/
+COPY kowitodb-storage/Cargo.toml kowitodb-storage/
+COPY kowitodb-index/Cargo.toml kowitodb-index/
+COPY kowitodb-planner/Cargo.toml kowitodb-planner/
+COPY kowitodb-sql/Cargo.toml kowitodb-sql/
+COPY kowitodb-server/Cargo.toml kowitodb-server/
+
+# Create dummy source files so `cargo build` can compile just the dependencies.
+RUN mkdir -p kowitodb/src kowitodb-core/src kowitodb-storage/src \
+    kowitodb-index/src kowitodb-planner/src kowitodb-sql/src \
+    kowitodb-server/src
+RUN for crate in kowitodb kowitodb-core kowitodb-storage kowitodb-index \
+    kowitodb-planner kowitodb-sql kowitodb-server; do \
+      echo 'fn main() {}' > "$crate/src/main.rs"; \
+      touch "$crate/src/lib.rs"; \
+    done
+COPY proto proto/
+COPY kowitodb-server/build.rs kowitodb-server/
+
+# Build only the dependencies (this layer is cached until Cargo.toml or proto changes).
+RUN cargo build --release -p kowitodb && rm -rf target/release/deps/kowitodb*
+
+# Now copy the real source and build the binary. Only this layer rebuilds on
+# source changes.
 COPY . .
-# Build the optimized release binary (uses the tuned [profile.release]).
+RUN touch kowitodb-server/src/lib.rs kowitodb/src/main.rs
 RUN cargo build --release -p kowitodb
 
 # ---- Runtime stage ----
