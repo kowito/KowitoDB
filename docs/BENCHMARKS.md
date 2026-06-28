@@ -147,10 +147,19 @@ The hot path (graph traversal + distance) was tuned without changing recall:
   access, no `ObjectId` hashing), neighbor lists are contiguous `Vec<u32>`, and
   the beam's visited set is a **generation-stamped array** indexed by node id
   (no hashing, O(1) reset). ~**+20% single-thread QPS** on its own, recall-neutral.
+- **Software prefetch** — during beam expansion the next neighbor's vector is
+  prefetched (`prfm`/`_mm_prefetch`) while the current one is scored, hiding the
+  cache-miss latency of the random node access that dominates the loop. ~**+15%
+  single-thread QPS** (median; noisy on heterogeneous P/E cores), recall-neutral.
 
-Net effect at `ef_search=200`: single-thread query throughput **~+46%** over the
-original brute-force-replacement (≈351 → ≈512 q/s on 20k×384), ~27% higher build
-throughput, recall unchanged (~94%).
+Net effect at `ef_search=200`: single-thread query throughput **~+50%** over the
+original brute-force-replacement (≈351 → ≈530 q/s median on 20k×384), ~27% higher
+build throughput, recall unchanged (~94%).
+
+A further **~+10%** is available at deployment time by building for the host CPU
+(enables FMA + wider vectors the portable build can't assume):
+`RUSTFLAGS="-C target-cpu=native" cargo build --release`. Off by default because
+it produces CPU-specific binaries.
 
 ## Maximizing QPS
 

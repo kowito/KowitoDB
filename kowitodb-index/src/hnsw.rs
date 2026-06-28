@@ -174,6 +174,16 @@ impl NodeVector {
         }
     }
 
+    /// Pointer to the start of the vector's backing data, for prefetch hints.
+    #[inline]
+    fn data_ptr(&self) -> *const u8 {
+        match self {
+            NodeVector::Full(v) => v.as_ptr() as *const u8,
+            NodeVector::Quantized(v) => v.as_ptr() as *const u8,
+            NodeVector::Binary { code, .. } => code.as_ptr() as *const u8,
+        }
+    }
+
     /// Hamming distance (as `f32`) between this node's sign code and a query's
     /// sign `code` — the popcount fast path for binary navigation. Only valid
     /// for `Binary` nodes (the only kind present under binary quantization).
@@ -251,6 +261,31 @@ impl NodeVector {
             }
             NodeVector::Binary { .. } => self.dist_sq(query),
         }
+    }
+}
+
+/// Best-effort hint to prefetch the cache line at `ptr` into L1 for reading.
+/// A no-op on architectures without a stable prefetch path. `prfm`/`_mm_prefetch`
+/// are pure hints, so any address is safe.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `_mm_prefetch` is a hint; any pointer value is valid.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` is a hint instruction with no memory effects.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) ptr,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = ptr;
     }
 }
 
@@ -986,7 +1021,14 @@ impl HnswIndex {
 
                 // Expand neighbors; `visit` returns false when already seen.
                 if let Some(neighbors) = nodes[current.id as usize].neighbors.get(layer) {
-                    for &nb in neighbors {
+                    for i in 0..neighbors.len() {
+                        // Prefetch the *next* neighbor's vector while we score
+                        // this one — hides the cache-miss latency of the random
+                        // node access that dominates the hot loop.
+                        if let Some(&next) = neighbors.get(i + 1) {
+                            prefetch_read(nodes[next as usize].vector.data_ptr());
+                        }
+                        let nb = neighbors[i];
                         if !s.visit(nb) {
                             continue;
                         }
