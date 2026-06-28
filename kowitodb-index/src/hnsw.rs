@@ -1639,7 +1639,9 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..120u32 {
             let id = uuid::Uuid::from_u128(i as u128 + 1);
-            let v: Vec<f32> = (0..24).map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin()).collect();
+            let v: Vec<f32> = (0..24)
+                .map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin())
+                .collect();
             idx.insert(id, v.clone());
             items.push((id, v));
         }
