@@ -57,15 +57,22 @@ directly comparable):
     and the gap **closes at high `ef`** (0.919 vs 0.930 at ef=256).
   - **KowitoDB sits between Qdrant and Milvus** at matched `ef`, and clearly
     above Milvus's default configuration here.
-  - **Diversity heuristic (opt-in):** KowitoDB defaults to fast "keep closest M"
-    neighbor selection; the full HNSW diversity heuristic (Malkov & Yashunin
-    Alg. 4) is available via `HnswParams::diversify_neighbors` /
-    `CMP_DIVERSIFY=1`. A/B (clustered data, this harness): it raises low-`ef`
-    recall (ef=32: **0.988 → 0.9997**) at a modest QPS cost and ~15% more build
-    time; it's a **no-op on the structureless random set above** (no clusters to
-    diversify around), so it does *not* move the random-data column. Off by
-    default because KowitoDB favors the QPS-tuned path; turn it on when
-    optimizing recall at low `ef` on real (clustered) embeddings.
+  - **Standard-HNSW mode (opt-in):** KowitoDB defaults to fast "keep closest M"
+    selection with **unbounded degree** (no pruning). The full standard recipe —
+    diversity heuristic (Alg. 4) **+ degree pruning** — is available via
+    `HnswParams::diversify_neighbors` / `CMP_DIVERSIFY=1`. Measured A/B with this
+    harness:
+    - **Clustered data (real-embedding-like): a Pareto win at low `ef`.** ef=16
+      recall **0.923 → 0.955 at the same ~36k QPS**; ef=32 0.985 → 0.994.
+      Pruning bounds degree (keeps queries fast) while diversity keeps the graph
+      navigable.
+    - **Uniform random data: it *hurts*.** Pruning to M removes edges that the
+      denser unbounded graph was using for recall (ef=32: 0.43 → 0.23). So the
+      default leaves degrees unbounded — better on structureless data — and the
+      standard recipe is opt-in for real clustered embeddings.
+    - Neither standard technique closes the random-data gap to Qdrant on its own;
+      that gap is down to implementation maturity / `ef_construction` tuning, not
+      a single missing algorithm. This is an honest negative result.
   - **Milvus's lower recall is most likely a configuration/segmentation artifact**
     (segment sizing, default index params on a small set), not a fundamental
     limit — treat it as "default-config" rather than "best Milvus can do."

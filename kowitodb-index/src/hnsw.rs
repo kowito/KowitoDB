@@ -544,13 +544,14 @@ pub struct HnswParams {
     /// effect unless `binary_quantize` is also set. Off by default.
     #[serde(default)]
     pub binary_rerank: bool,
-    /// Use the HNSW **diversity heuristic** (Malkov & Yashunin Alg. 4) for
-    /// neighbor selection instead of plain "keep closest M". Spreads edges across
-    /// directions, which raises recall at low `ef_search` on *clustered* (real
-    /// embedding) data — but costs ~15% more build time and, at a fixed
-    /// high-recall operating point, is roughly speed-neutral. No effect on
-    /// structureless data. Off by default (KowitoDB favors the QPS-tuned path);
-    /// enable when optimizing recall at low `ef`.
+    /// Build with the **full standard-HNSW recipe** (Malkov & Yashunin): the
+    /// neighbor-selection **diversity heuristic** (Alg. 4) *and* **degree
+    /// pruning** of over-full neighbor lists. On *clustered* (real-embedding)
+    /// data this is a Pareto win at low `ef_search` — e.g. recall 0.92 → 0.95 at
+    /// the same QPS — because pruning bounds degree (keeping queries fast) while
+    /// diversity keeps the graph navigable. On uniform/high-dim data the default
+    /// (no pruning, unbounded degree) gives higher recall, so this is **off by
+    /// default**; enable for real embeddings, especially when targeting low `ef`.
     #[serde(default)]
     pub diversify_neighbors: bool,
 }
@@ -685,23 +686,25 @@ impl HnswIndex {
             None
         };
 
-        // The new node lands at the end of the dense node vector.
+        // The new node lands at the end of the dense node vector. It is pushed
+        // *now*, with empty neighbor lists: with no inbound edges yet it is
+        // unreachable during this insert's own searches, but its index is valid
+        // so neighbor pruning (which may reference it) never goes out of bounds.
         let idx = graph.nodes.len() as NodeIdx;
-        let mut neighbors: Vec<Vec<NodeIdx>> = vec![Vec::new(); node_layer + 1];
+        graph.nodes.push(HnswNode {
+            id,
+            vector: node_vector,
+            max_layer: node_layer,
+            neighbors: vec![Vec::new(); node_layer + 1],
+            rerank,
+        });
+        graph.id_to_idx.insert(id, idx);
 
-        // If this is the first node, just store it as the entry point.
+        // If this is the first node, it becomes the entry point.
         let ep = match *entry_point {
             Some(ep) => ep,
             None => {
                 *max_layer = node_layer;
-                graph.nodes.push(HnswNode {
-                    id,
-                    vector: node_vector,
-                    max_layer: node_layer,
-                    neighbors,
-                    rerank,
-                });
-                graph.id_to_idx.insert(id, idx);
                 *entry_point = Some(idx);
                 debug!("HNSW: inserted first node {} at layer {}", id, node_layer);
                 return;
@@ -729,25 +732,39 @@ impl HnswIndex {
                 &graph.nodes,
             );
 
-            let m = if lc == 0 {
+            let max_deg = if lc == 0 {
                 self.params.m0
             } else {
                 self.params.m
             };
-            let selected = self.select_neighbors_heuristic(&scorer, &candidates, m, &graph.nodes);
+            let selected =
+                self.select_neighbors_heuristic(&scorer, &candidates, max_deg, &graph.nodes);
 
             // Add bidirectional edges (the immutable search borrow has ended).
             for &nb in &selected {
                 if nb == idx {
                     continue; // never link to self
                 }
-                neighbors[lc].push(nb);
-                let neighbor = &mut graph.nodes[nb as usize];
-                if neighbor.neighbors.len() <= lc {
-                    neighbor.neighbors.resize(lc + 1, Vec::new());
+                graph.nodes[idx as usize].neighbors[lc].push(nb);
+                let nbu = nb as usize;
+                if graph.nodes[nbu].neighbors.len() <= lc {
+                    graph.nodes[nbu].neighbors.resize(lc + 1, Vec::new());
                 }
-                if !neighbor.neighbors[lc].contains(&idx) {
-                    neighbor.neighbors[lc].push(idx);
+                if graph.nodes[nbu].neighbors[lc].contains(&idx) {
+                    continue;
+                }
+                graph.nodes[nbu].neighbors[lc].push(idx);
+                // Standard-HNSW neighbor pruning (bound `nb`'s degree to
+                // `max_deg`) — only in the `diversify_neighbors` "standard HNSW"
+                // mode. The default deliberately leaves degrees unbounded: on
+                // uniform/high-dim data the denser graph gives higher recall at a
+                // given ef (measured), and KowitoDB favors recall there.
+                if self.params.diversify_neighbors
+                    && graph.nodes[nbu].neighbors[lc].len() > max_deg
+                {
+                    let cands = graph.nodes[nbu].neighbors[lc].clone();
+                    let kept = self.prune_neighbors(nb, &cands, max_deg, &graph.nodes, &scorer);
+                    graph.nodes[nbu].neighbors[lc] = kept;
                 }
             }
 
@@ -759,15 +776,6 @@ impl HnswIndex {
             *entry_point = Some(idx);
             *max_layer = node_layer;
         }
-
-        graph.nodes.push(HnswNode {
-            id,
-            vector: node_vector,
-            max_layer: node_layer,
-            neighbors,
-            rerank,
-        });
-        graph.id_to_idx.insert(id, idx);
         debug!(
             "HNSW: inserted node {} at layer {} (global_max={})",
             id, node_layer, *max_layer
@@ -1167,6 +1175,51 @@ impl HnswIndex {
                 break;
             }
             selected.push(e);
+        }
+        selected
+    }
+
+    /// Prune `center`'s over-full neighbor list back to the best `m`, centered on
+    /// `center` itself (node-to-node distances). Mirrors `select_neighbors_*`:
+    /// plain closest-`m` by default, the diversity heuristic when enabled.
+    fn prune_neighbors(
+        &self,
+        center: NodeIdx,
+        candidates: &[NodeIdx],
+        m: usize,
+        nodes: &[HnswNode],
+        scorer: &Scorer,
+    ) -> Vec<NodeIdx> {
+        let center_vec = &nodes[center as usize].vector;
+        let mut sorted: Vec<(NodeIdx, f32)> = candidates
+            .iter()
+            .map(|&c| (c, scorer.node_dist(center_vec, &nodes[c as usize].vector)))
+            .collect();
+        sorted.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        if !self.params.diversify_neighbors {
+            return sorted.into_iter().take(m).map(|(c, _)| c).collect();
+        }
+        let mut selected: Vec<NodeIdx> = Vec::with_capacity(m);
+        let mut pruned: Vec<NodeIdx> = Vec::new();
+        for (c, dist_c) in sorted {
+            if selected.len() >= m {
+                break;
+            }
+            let diverse = selected.iter().all(|&r| {
+                scorer.node_dist(&nodes[c as usize].vector, &nodes[r as usize].vector) >= dist_c
+            });
+            if diverse {
+                selected.push(c);
+            } else {
+                pruned.push(c);
+            }
+        }
+        for c in pruned {
+            if selected.len() >= m {
+                break;
+            }
+            selected.push(c);
         }
         selected
     }
