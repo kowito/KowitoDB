@@ -28,35 +28,51 @@ Each prints CSV rows `system,ef_search,recall@k,qps_1thread,p50_us,p95_us`.
 
 ## Results (measured)
 
-Dataset: **50 000 × 128** random unit vectors, 1 000 queries, k=10, cosine,
-HNSW `M=16`, `ef_construction=128`. Single machine (Apple Silicon, 4P+6E).
+50 000 × 128, 1 000 queries, k=10, cosine, HNSW `M=16`, `ef_construction=128`,
+single machine (Apple Silicon, 4P+6E). `kowitodb` = default (unbounded degree);
+`kowitodb-std` = standard-HNSW mode (`diversify_neighbors`).
 
-| ef_search | KowitoDB recall | Qdrant recall | Milvus recall |
-|-----------|----------------:|--------------:|--------------:|
-| 32        | 0.429           | **0.594**     | 0.200         |
-| 64        | 0.602           | **0.698**     | 0.330         |
-| 128       | 0.786           | **0.820**     | 0.495         |
-| 256       | 0.919           | **0.930**     | 0.695         |
+**Recall@10 — uniform random vectors** (a deliberately hard, structure-free case):
 
-Throughput (single-thread queries/s — **see the caveat below**, these are not
-directly comparable):
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus |
+|-----|---------:|-------------:|---------:|-------:|
+| 32  | 0.431    | 0.234        | **0.700**| 0.196  |
+| 64  | 0.602    | 0.380        | **0.786**| 0.337  |
+| 128 | 0.788    | 0.564        | **0.881**| 0.497  |
+| 256 | 0.921    | 0.763        | **0.963**| 0.692  |
 
-| ef_search | KowitoDB (embedded) | Qdrant (service) | Milvus (service) |
-|-----------|--------------------:|-----------------:|-----------------:|
-| 32        | ~6700               | ~370             | ~850             |
-| 64        | ~3300               | ~390             | ~1150            |
-| 128       | ~2100               | ~430             | ~730             |
-| 256       | ~850                | ~330             | ~430             |
+**Recall@10 — clustered vectors** (200 clusters; representative of real
+embeddings):
+
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus |
+|-----|---------:|-------------:|---------:|-------:|
+| 16  | 0.915    | 0.957        | **0.976**| 0.908  |
+| 32  | 0.994    | 0.994        | **0.997**| 0.986  |
+| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  |
+| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 |
+
+On **clustered (real-like) data the systems converge** (~0.99+ by ef=32);
+KowitoDB is competitive with Qdrant and **ahead of Milvus's default config**, and
+`kowitodb-std` closes most of the low-ef gap (ef=16: 0.915 → 0.957 vs Qdrant
+0.976). On **uniform random data Qdrant leads clearly** — implementation maturity,
+not one missing algorithm (see below).
+
+Throughput (single-thread q/s — **NOT directly comparable**, see caveats):
+KowitoDB is measured **embedded** (~6–40k q/s, no network); Qdrant and Milvus as
+**localhost services** (~0.4–1.4k q/s, dominated by a ~1–2.5 ms HTTP/gRPC
+round-trip floor). This reflects deployment mode (library vs service), not raw
+ANN speed.
 
 ## How to read this — honest caveats
 
 - **Recall is the fair, apples-to-apples column.** It's network-independent and
   computed against identical ground truth. Takeaways:
-  - **Qdrant has the best graph quality** at a given `ef` — its HNSW neighbor
-    selection keeps the diversity heuristic from the paper. KowitoDB is close,
-    and the gap **closes at high `ef`** (0.919 vs 0.930 at ef=256).
-  - **KowitoDB sits between Qdrant and Milvus** at matched `ef`, and clearly
-    above Milvus's default configuration here.
+  - **Qdrant has the best graph quality** at a given `ef`, most visibly on the
+    hard uniform-random set. **On clustered (real-like) data the gap is small and
+    everyone converges** by ef≈32 (~0.99+) — which is the regime real embeddings
+    live in.
+  - **KowitoDB is competitive with Qdrant on clustered data and ahead of Milvus's
+    default config**; on uniform random data it trails Qdrant but leads Milvus.
   - **Standard-HNSW mode (opt-in):** KowitoDB defaults to fast "keep closest M"
     selection with **unbounded degree** (no pruning). The full standard recipe —
     diversity heuristic (Alg. 4) **+ degree pruning** — is available via
