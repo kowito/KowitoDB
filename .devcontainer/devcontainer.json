@@ -1,0 +1,26 @@
+{
+  "name": "KowitoDB (Rust)",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "vadimcn.vscode-lldb"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "forwardPorts": [50051, 9090],
+  "portsAttributes": {
+    "50051": { "label": "gRPC" },
+    "9090": { "label": "metrics / health" }
+  },
+  "postCreateCommand": "cargo build --workspace",
+  "remoteUser": "vscode"
+}

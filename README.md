@@ -470,6 +470,11 @@ make example    # embedded library demo — ingest + ask, no server
 make ci         # the exact CI gate: fmt-check + clippy + test
 ```
 
+One-click dev environment: open in **GitHub Codespaces** or VS Code Dev
+Containers (a [`.devcontainer`](.devcontainer/devcontainer.json) is included) —
+Rust + rust-analyzer + clippy preconfigured, zero local setup. Shell completions:
+`kowitodb completions zsh|bash|fish`.
+
 Using KowitoDB as an **embedded Rust library** (no gRPC server)? See
 [`kowitodb-server/examples/embedded.rs`](kowitodb-server/examples/embedded.rs).
 

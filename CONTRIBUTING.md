@@ -33,6 +33,24 @@ cargo run -p kowitodb -- ask "what do you know?"
 cargo run -p kowitodb-server --example embedded
 ```
 
+## One-click dev environment
+
+This repo ships a [dev container](.devcontainer/devcontainer.json): open it in
+**GitHub Codespaces** ("Code ▸ Create codespace") or VS Code's *Dev Containers:
+Reopen in Container* and you get Rust + rust-analyzer + clippy preconfigured, the
+workspace pre-built, and ports 50051/9090 forwarded — zero local setup.
+
+## Shell completions
+
+```bash
+# zsh
+kowitodb completions zsh > "${fpath[1]}/_kowitodb"
+# bash
+kowitodb completions bash > /etc/bash_completion.d/kowitodb
+# fish
+kowitodb completions fish > ~/.config/fish/completions/kowitodb.fish
+```
+
 ## Before you open a PR — run exactly what CI runs
 
 CI (`.github/workflows/ci.yml`) gates on fmt + clippy + test. Run the same gate

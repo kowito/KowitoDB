@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -186,16 +187,24 @@ enum Commands {
     /// Seed an in-memory database with sample data and run example queries —
     /// the fastest way to see KowitoDB work (no server, no setup, no disk).
     Demo,
+
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
+    ///
+    /// e.g.  kowitodb completions zsh > ~/.zsh/completions/_kowitodb
+    Completions {
+        /// Target shell
+        shell: Shell,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // The `demo` command is a clean human-facing tour, so default it to quiet
-    // (warnings only) unless the user explicitly set RUST_LOG. Everything else
+    // `demo` (a human-facing tour) and `completions` (prints a script) default
+    // to quiet — warnings only — unless the user set RUST_LOG. Everything else
     // defaults to info-level logs.
-    let default_filter = if matches!(cli.command, Commands::Demo) {
+    let default_filter = if matches!(cli.command, Commands::Demo | Commands::Completions { .. }) {
         "warn"
     } else {
         "info"
@@ -477,6 +486,12 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Demo => run_demo().await?,
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        }
     }
 
     Ok(())
