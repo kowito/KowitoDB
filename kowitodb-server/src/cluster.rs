@@ -73,22 +73,49 @@ pub trait ClusterNode: Send + Sync {
     ) -> Result<proto::GetSessionResponse, Status>;
 }
 
+/// Injects the gateway's API key as a Bearer token on every outbound call to a
+/// data node, so the gateway can authenticate to nodes that require a key.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
+        if let Some(t) = &self.token {
+            req.metadata_mut().insert("authorization", t.clone());
+        }
+        Ok(req)
+    }
+}
+
 /// A remote data node reached over gRPC.
 pub struct RemoteNode {
     addr: String,
-    client: KowitoDbClient<Channel>,
+    client:
+        KowitoDbClient<tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>>,
 }
 
 impl RemoteNode {
-    /// Connect to a peer address (`host:port` or a full URL).
-    pub async fn connect(addr: impl Into<String>) -> anyhow::Result<Self> {
+    /// Connect to a peer address (`host:port` or a full URL), presenting
+    /// `api_key` (if set) as a Bearer token on every call.
+    pub async fn connect(addr: impl Into<String>, api_key: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.into();
         let endpoint = if addr.starts_with("http") {
             addr.clone()
         } else {
             format!("http://{addr}")
         };
-        let client = KowitoDbClient::connect(endpoint).await?;
+        let channel = Channel::from_shared(endpoint)?.connect().await?;
+        let token = match api_key {
+            Some(k) => Some(
+                format!("Bearer {k}")
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("API key contains invalid header characters"))?,
+            ),
+            None => None,
+        };
+        let client = KowitoDbClient::with_interceptor(channel, AuthInterceptor { token });
         Ok(Self { addr, client })
     }
 
@@ -253,13 +280,14 @@ impl Cluster {
         peers: &[String],
         replication_factor: usize,
         write_quorum: usize,
+        api_key: Option<String>,
     ) -> anyhow::Result<Self> {
         if peers.is_empty() {
             anyhow::bail!("a cluster needs at least one peer node");
         }
         let mut nodes: Vec<Arc<dyn ClusterNode>> = Vec::with_capacity(peers.len());
         for peer in peers {
-            let node = RemoteNode::connect(peer.clone()).await?;
+            let node = RemoteNode::connect(peer.clone(), api_key.as_deref()).await?;
             info!("Cluster: connected to data node {}", node.addr());
             nodes.push(Arc::new(node));
         }
@@ -599,10 +627,22 @@ impl Cluster {
                 if owners.contains(&i) {
                     continue; // correctly placed on this node
                 }
-                // Relocate: write to the correct owners, drop from this node.
+                // Relocate: write to the correct owners, then drop from this node
+                // — but ONLY if at least one owner write succeeded, so a transient
+                // owner failure can never delete the last copy (data loss).
                 let insert = knowledge_to_insert_req(&obj);
+                let mut acks = 0usize;
                 for &o in &owners {
-                    let _ = self.nodes[o].insert(insert.clone()).await;
+                    if self.nodes[o].insert(insert.clone()).await.is_ok() {
+                        acks += 1;
+                    }
+                }
+                if acks == 0 {
+                    debug!(
+                        "rebalance: no owner accepted {}; keeping source copy",
+                        obj.id
+                    );
+                    continue;
                 }
                 if self.nodes[i]
                     .delete(proto::DeleteRequest { id: obj.id.clone() })

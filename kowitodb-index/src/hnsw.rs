@@ -289,7 +289,10 @@ impl NodeVector {
     fn hamming_to(&self, other: &NodeVector) -> f32 {
         match (self, other) {
             (NodeVector::Binary { code: a, .. }, NodeVector::Binary { code: b, .. }) => {
-                a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() as f32
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x ^ y).count_ones())
+                    .sum::<u32>() as f32
             }
             _ => f32::MAX,
         }
@@ -639,7 +642,7 @@ impl HnswIndex {
         // Re-insert (update) = remove the old copy first, so neighbor search
         // can't find the node itself and indices stay dense.
         if graph.id_to_idx.contains_key(&id) {
-            Self::remove_locked(&mut graph, &mut entry_point, id);
+            Self::remove_locked(&mut graph, &mut entry_point, &mut max_layer, id);
         }
 
         // Compute random layer using exponential distribution
@@ -759,8 +762,7 @@ impl HnswIndex {
                 // mode. The default deliberately leaves degrees unbounded: on
                 // uniform/high-dim data the denser graph gives higher recall at a
                 // given ef (measured), and KowitoDB favors recall there.
-                if self.params.diversify_neighbors
-                    && graph.nodes[nbu].neighbors[lc].len() > max_deg
+                if self.params.diversify_neighbors && graph.nodes[nbu].neighbors[lc].len() > max_deg
                 {
                     let cands = graph.nodes[nbu].neighbors[lc].clone();
                     let kept = self.prune_neighbors(nb, &cands, max_deg, &graph.nodes, &scorer);
@@ -786,14 +788,20 @@ impl HnswIndex {
     pub fn remove(&self, id: ObjectId) {
         let mut graph = self.graph.write();
         let mut entry_point = self.entry_point.write();
-        Self::remove_locked(&mut graph, &mut entry_point, id);
+        let mut max_layer = self.max_layer.write();
+        Self::remove_locked(&mut graph, &mut entry_point, &mut max_layer, id);
     }
 
     /// Remove `id` from an already-locked graph. Uses `swap_remove` to keep the
     /// node vector dense, then fixes every edge: references to the removed slot
     /// are dropped and references to the moved (formerly-last) node are remapped.
     /// O(N) in the node count, but removals are rare relative to queries.
-    fn remove_locked(graph: &mut Graph, entry_point: &mut Option<NodeIdx>, id: ObjectId) {
+    fn remove_locked(
+        graph: &mut Graph,
+        entry_point: &mut Option<NodeIdx>,
+        max_layer: &mut usize,
+        id: ObjectId,
+    ) {
         let Some(r) = graph.id_to_idx.remove(&id) else {
             return;
         };
@@ -819,15 +827,24 @@ impl HnswIndex {
                 layer.truncate(w);
             }
         }
-        // Fix the entry point.
+        // Restore the HNSW invariant: the entry point must be a top-layer node,
+        // and `max_layer` must match. Removing the old entry point (e.g. on every
+        // re-insert of the current top node) otherwise silently collapses recall —
+        // descent would start from an arbitrary low-layer node. Recompute both
+        // from the remaining nodes (O(N), but removals are rare vs queries).
         if graph.nodes.is_empty() {
             *entry_point = None;
+            *max_layer = 0;
         } else {
-            match *entry_point {
-                Some(e) if e == r => *entry_point = Some(0),
-                Some(e) if e == last => *entry_point = Some(r),
-                _ => {}
-            }
+            let (top_idx, top_layer) = graph
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (i as NodeIdx, n.max_layer))
+                .max_by_key(|&(_, l)| l)
+                .unwrap();
+            *entry_point = Some(top_idx);
+            *max_layer = top_layer;
         }
     }
 
@@ -1001,8 +1018,10 @@ impl HnswIndex {
 
     /// Generate a random layer using exponential decay.
     fn random_layer(&self) -> usize {
+        // `m == 1` would make `ln(m) == 0` → division by zero (every node at the
+        // cap layer, a degenerate graph); clamp the level multiplier's base to ≥2.
         let mut rng = rand::thread_rng();
-        let ml: f64 = 1.0 / (self.params.m as f64).ln();
+        let ml: f64 = 1.0 / (self.params.m.max(2) as f64).ln();
         let r: f64 = rng.gen();
         ((-r.ln() * ml).floor() as usize).min(10) // Cap at layer 10
     }
@@ -1515,7 +1534,9 @@ mod tests {
         let mut items = Vec::new();
         for i in 0..150u32 {
             let id = uuid::Uuid::from_u128(i as u128 + 1);
-            let v: Vec<f32> = (0..32).map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin()).collect();
+            let v: Vec<f32> = (0..32)
+                .map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin())
+                .collect();
             idx.insert(id, v.clone());
             items.push((id, v));
         }
@@ -1602,6 +1623,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_reinsert_preserves_search() {
+        // Re-inserting existing ids triggers `remove_locked` (including on the
+        // current entry point). Regression: removing the entry point used to
+        // leave it at a low layer with `max_layer` stale, collapsing recall.
+        let idx = HnswIndex::new(HnswParams {
+            m: 8,
+            ef_construction: 64,
+            ef_search: 64,
+            ..Default::default()
+        });
+        let mut items = Vec::new();
+        for i in 0..120u32 {
+            let id = uuid::Uuid::from_u128(i as u128 + 1);
+            let v: Vec<f32> = (0..24).map(|j| (((i * 13 + j * 7) as f32) * 0.1).sin()).collect();
+            idx.insert(id, v.clone());
+            items.push((id, v));
+        }
+        // Re-insert every item (each is an update → remove + re-add churn).
+        for (id, v) in &items {
+            idx.insert(*id, v.clone());
+        }
+        assert_eq!(idx.len(), 120, "updates must not change node count");
+        let (qid, qv) = &items[42];
+        assert_eq!(
+            idx.search(qv, 1)[0].0,
+            *qid,
+            "exact match must stay top-1 after entry-point churn"
+        );
     }
 
     #[test]

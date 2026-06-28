@@ -215,6 +215,9 @@ git clone https://github.com/kowito/kowitodb && cd kowitodb
 cargo build --release
 ```
 
+> Prerequisite: `protoc` (Protocol Buffers compiler) — `brew install protobuf`
+> or `apt-get install -y protobuf-compiler`.
+
 ### 2. Run the server
 
 ```bash
@@ -222,9 +225,16 @@ cargo build --release
   --addr 127.0.0.1:50051 \
   --storage-path ./data/storage \
   --index-path ./data/index
+
+# ...or in dev mode, no release build needed:
+cargo run -p kowitodb -- serve
+
+# ...or skip the server entirely (embedded mode):
+cargo run -p kowitodb -- ask "what do you know?"
 ```
 
-That's it. One binary. No Docker, no sidecars, no external services.
+That's it. One binary. No Docker, no sidecars, no external services. Set
+`--api-key` (or `KOWITODB_API_KEY`) to require authentication on every request.
 
 ### 3. Use it
 
@@ -274,12 +284,34 @@ KowitoDB works with any embedding model. Three clients ship in the box:
 | Provider | Setup | Best for |
 |---|---|---|
 | **On-device Candle** | `--features local-embeddings` + `KOWITODB_EMBEDDING_PROVIDER=local` | Zero-latency, air-gapped |
-| **OpenAI / compatible** | `KOWITODB_EMBEDDING_PROVIDER=openai` + API key | Production quality |
-| **Ollama** | `KOWITODB_EMBEDDING_PROVIDER=ollama` | Local, self-hosted |
+| **OpenAI / compatible** | `KOWITODB_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (opt. `KOWITODB_OPENAI_BASE_URL`, `KOWITODB_EMBEDDING_MODEL`) | Production quality |
+| **Ollama** | `KOWITODB_EMBEDDING_PROVIDER=ollama` (opt. `KOWITODB_OLLAMA_URL`) | Local, self-hosted |
 | **Dev proxy** (default) | None | Deterministic hashes for testing |
 
 No embedding provider? No problem — the dev proxy gives you deterministic vectors
 for development. Switch to a real model in production with one env var.
+
+---
+
+## Configuration
+
+KowitoDB is configured with `KOWITODB_*` environment variables (CLI flags take
+precedence where both exist). The most common:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `KOWITODB_API_KEY` | _(none)_ | Require this key (Bearer / `x-api-key`) on every request |
+| `KOWITODB_TLS_CERT` / `KOWITODB_TLS_KEY` | _(none)_ | Enable TLS with a PEM cert/key |
+| `KOWITODB_EMBEDDING_PROVIDER` | dev proxy | `local` \| `openai` \| `ollama` |
+| `KOWITODB_LLM_PROVIDER` | _(off)_ | `openai` \| `ollama` — enables NL→SQL, contextual retrieval, Mem0 distillation |
+| `KOWITODB_VECTOR_QUANTIZE` | `0` | int8 quantization (~4× less vector memory) |
+| `KOWITODB_VECTOR_BINARY_QUANTIZE` | `0` | RaBitQ 1-bit quantization (~32× less memory) |
+| `KOWITODB_VECTOR_BINARY_RERANK` | `0` | Retain int8 to rescore binary candidates (higher recall) |
+| `KOWITODB_VECTOR_COARSE_DIM` | _(off)_ | Matryoshka adaptive-dimension retrieval |
+| `KOWITODB_RERANKER_PROVIDER` | _(off)_ | `local` → on-device cross-encoder reranker |
+| `KOWITODB_AUTO_GRAPH` | `1` | Auto-build `co_mentions` graph edges at ingest |
+| `KOWITODB_CONTEXTUAL_RETRIEVAL` | `1` | Contextual Retrieval augmentation |
+| `KOWITODB_CORRECTIVE_RETRIEVAL` | `1` | CRAG-style corrective gate |
 
 ---
 
@@ -420,6 +452,19 @@ Every product has them. Ours are documented, not hidden:
 
 ---
 
+## Contributing
+
+Contributions welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the build +
+test cheatsheet (it's the exact set of commands CI runs). The short version:
+
+```bash
+cargo fmt --all --check && \
+cargo clippy --workspace --all-targets -- -D warnings && \
+cargo test --workspace
+```
+
+---
+
 ## License
 
-MIT. Open source, forever.
+[MIT](LICENSE). Open source, forever.

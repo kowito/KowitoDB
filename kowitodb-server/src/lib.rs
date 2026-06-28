@@ -148,13 +148,18 @@ pub async fn serve_with_config(
 /// Start a cluster **gateway**: a coordinator that fronts `peers` data nodes and
 /// speaks the exact same `KowitoDB` gRPC API, so clients/SDKs are unchanged.
 /// Writes are partitioned (and optionally replicated); reads scatter-gather.
+// The interceptor closure inherits `check_auth`'s large `Result<_, Status>`.
+#[allow(clippy::result_large_err)]
 pub async fn serve_gateway(
     addr: SocketAddr,
     peers: Vec<String>,
     replication_factor: usize,
     write_quorum: usize,
+    api_key: Option<String>,
 ) -> anyhow::Result<()> {
-    let cluster = Arc::new(Cluster::connect(&peers, replication_factor, write_quorum).await?);
+    let cluster = Arc::new(
+        Cluster::connect(&peers, replication_factor, write_quorum, api_key.clone()).await?,
+    );
     info!(
         "KowitoDB gateway: {} data node(s), replication_factor={}, write_quorum={}",
         cluster.node_count(),
@@ -186,11 +191,22 @@ pub async fn serve_gateway(
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build_v1alpha()?;
 
+    // Require the API key on every client request (same scheme as the data
+    // nodes); the gateway re-presents this key when calling the data nodes.
+    if api_key.is_some() {
+        info!("Gateway API-key authentication enabled");
+    } else {
+        warn!("No API key set — gateway endpoint is unauthenticated (set --api-key / KOWITODB_API_KEY)");
+    }
+    let main_service = KowitoDbServer::with_interceptor(service, move |req: Request<()>| {
+        check_auth(&api_key, req)
+    });
+
     info!("KowitoDB gateway listening on {}", addr);
     Server::builder()
         .add_service(health_service)
         .add_service(reflection)
-        .add_service(KowitoDbServer::new(service))
+        .add_service(main_service)
         .serve(addr)
         .await?;
     Ok(())
@@ -212,9 +228,20 @@ fn check_auth(api_key: &Option<String>, req: Request<()>) -> Result<Request<()>,
         .or_else(|| md.get("x-api-key").and_then(|v| v.to_str().ok()));
 
     match presented {
-        Some(key) if key == expected => Ok(req),
+        Some(key) if ct_eq(key.as_bytes(), expected.as_bytes()) => Ok(req),
         _ => Err(Status::unauthenticated("invalid or missing API key")),
     }
+}
+
+/// Constant-time byte-slice equality, so API-key validation does not leak the
+/// key prefix/length via response timing (`==` short-circuits on first mismatch).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() != b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
 }
 
 /// Spawn the HTTP server exposing `/metrics` (Prometheus) and `/healthz`.

@@ -158,6 +158,42 @@ fn extract_entities(obj: &KnowledgeObject) -> Vec<String> {
     set.into_iter().collect()
 }
 
+/// Whether `sql` is a single read-only query (`SELECT`/`WITH`) safe to execute
+/// against DataFusion. Rejects multiple statements and any write/DDL/filesystem
+/// keyword. Conservative by design — it gates client- and LLM-generated SQL.
+fn is_read_only_sql(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    // Disallow statement chaining (`SELECT ...; DROP ...`).
+    if trimmed.contains(';') {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    if !(lower.starts_with("select ") || lower.starts_with("with ")) {
+        return false;
+    }
+    // Reject embedded write/DDL/filesystem verbs even inside a leading SELECT
+    // (e.g. CTEs or sub-statements). Matched with surrounding spaces to avoid
+    // tripping on column names like `created_at`.
+    const FORBIDDEN: &[&str] = &[
+        " insert ",
+        " update ",
+        " delete ",
+        " drop ",
+        " create ",
+        " alter ",
+        " copy ",
+        " attach ",
+        " grant ",
+        " truncate ",
+        " replace ",
+        " merge ",
+        " call ",
+        " execute ",
+    ];
+    let padded = format!(" {lower} ");
+    !FORBIDDEN.iter().any(|kw| padded.contains(kw))
+}
+
 /// Strip Markdown code fences and a leading `sql` tag from an LLM SQL reply.
 fn strip_sql_fence(s: &str) -> String {
     let mut t = s.trim();
@@ -1282,6 +1318,16 @@ impl KowitoDBEngine {
     /// `GROUP BY`, aggregates, and complex predicates. Rows are returned as
     /// ordered column-name → stringified-value maps.
     pub async fn sql_select(&self, sql: &str) -> KResult<Vec<HashMap<String, String>>> {
+        // Read-only guard: this runs client- and LLM-generated SQL (the NL→SQL
+        // feature) against DataFusion, which can otherwise CREATE tables,
+        // `COPY ... TO` the filesystem, or read external files. Since the engine
+        // ingests untrusted documents (RAG), reject anything that isn't a single
+        // read-only SELECT/WITH statement before executing it.
+        if !is_read_only_sql(sql) {
+            return Err(kowitodb_core::KowitoError::Planner(
+                "only a single read-only SELECT/WITH query is permitted".into(),
+            ));
+        }
         let ctx = kowitodb_sql::SqlContext::new(self.storage.clone())
             .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))?;
         ctx.query_rows(sql)
@@ -2282,6 +2328,20 @@ mod tests {
             strip_sql_fence("SELECT * FROM knowledge"),
             "SELECT * FROM knowledge"
         );
+    }
+
+    #[test]
+    fn test_is_read_only_sql() {
+        assert!(is_read_only_sql("SELECT content FROM knowledge"));
+        assert!(is_read_only_sql("  with x as (select 1) select * from x  "));
+        assert!(is_read_only_sql(
+            "SELECT count(*) FROM knowledge WHERE created_at > '2020'"
+        ));
+        // Writes / DDL / chaining / filesystem are rejected.
+        assert!(!is_read_only_sql("DROP TABLE knowledge"));
+        assert!(!is_read_only_sql("SELECT 1; DROP TABLE knowledge"));
+        assert!(!is_read_only_sql("COPY knowledge TO '/tmp/x.csv'"));
+        assert!(!is_read_only_sql("CREATE TABLE t AS SELECT 1"));
     }
 
     #[tokio::test]

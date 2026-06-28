@@ -42,7 +42,9 @@ fn random_unit_vec(rng: &mut StdRng, dim: usize) -> Vec<f32> {
 }
 
 fn main() {
-    let out_path = std::env::args().nth(1).unwrap_or_else(|| "dataset.bin".into());
+    let out_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "dataset.bin".into());
     let n = env_usize("CMP_N", 50_000);
     let dim = env_usize("CMP_DIM", 128);
     let q = env_usize("CMP_Q", 1_000);
@@ -67,9 +69,14 @@ fn main() {
     let clusters = env_usize("CMP_CLUSTERS", 0);
     let mut rng = StdRng::seed_from_u64(1234);
     let (vectors, queries) = if clusters > 0 {
-        let centers: Vec<Vec<f32>> = (0..clusters).map(|_| random_unit_vec(&mut rng, dim)).collect();
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| random_unit_vec(&mut rng, dim))
+            .collect();
         let perturb = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
-            let mut v: Vec<f32> = c.iter().map(|x| x + 0.20 * rng.gen_range(-1.0f32..1.0)).collect();
+            let mut v: Vec<f32> = c
+                .iter()
+                .map(|x| x + 0.20 * rng.gen_range(-1.0f32..1.0))
+                .collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
                 for x in &mut v {
@@ -78,10 +85,12 @@ fn main() {
             }
             v
         };
-        let vectors: Vec<Vec<f32>> =
-            (0..n).map(|i| perturb(&mut rng, &centers[i % clusters])).collect();
-        let queries: Vec<Vec<f32>> =
-            (0..q).map(|i| perturb(&mut rng, &centers[i % clusters])).collect();
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|i| perturb(&mut rng, &centers[i % clusters]))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..q)
+            .map(|i| perturb(&mut rng, &centers[i % clusters]))
+            .collect();
         (vectors, queries)
     } else {
         let vectors: Vec<Vec<f32>> = (0..n).map(|_| random_unit_vec(&mut rng, dim)).collect();
@@ -151,8 +160,7 @@ fn main() {
             let t = Instant::now();
             let res = idx.search(query, k);
             lat.push(t.elapsed().as_micros());
-            let truth: std::collections::HashSet<u32> =
-                ground_truth[qi].iter().copied().collect();
+            let truth: std::collections::HashSet<u32> = ground_truth[qi].iter().copied().collect();
             hits += res
                 .iter()
                 .filter(|(id, _)| truth.contains(&(id.as_u128() as u32)))
@@ -168,7 +176,13 @@ fn main() {
     }
 }
 
-fn write_dataset(path: &str, vectors: &[Vec<f32>], queries: &[Vec<f32>], gt: &[Vec<u32>], k: usize) {
+fn write_dataset(
+    path: &str,
+    vectors: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    gt: &[Vec<u32>],
+    k: usize,
+) {
     let n = vectors.len();
     let dim = vectors[0].len();
     let q = queries.len();
