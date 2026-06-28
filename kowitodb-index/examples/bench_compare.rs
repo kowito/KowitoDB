@@ -49,6 +49,7 @@ fn main() {
     let k = env_usize("CMP_K", 10);
     let m = env_usize("CMP_M", 16);
     let efc = env_usize("CMP_EFC", 128);
+    let diversify = env_usize("CMP_DIVERSIFY", 0) != 0;
     let ef_list: Vec<usize> = std::env::var("CMP_EFS")
         .unwrap_or_else(|_| "32,64,128,256".into())
         .split(',')
@@ -61,9 +62,32 @@ fn main() {
         println!("# WARNING: debug build — use --release for representative numbers.");
     }
 
+    // CMP_CLUSTERS>0 generates clustered data (representative of real
+    // embeddings); 0 (default) is uniform random (a harder, structure-free case).
+    let clusters = env_usize("CMP_CLUSTERS", 0);
     let mut rng = StdRng::seed_from_u64(1234);
-    let vectors: Vec<Vec<f32>> = (0..n).map(|_| random_unit_vec(&mut rng, dim)).collect();
-    let queries: Vec<Vec<f32>> = (0..q).map(|_| random_unit_vec(&mut rng, dim)).collect();
+    let (vectors, queries) = if clusters > 0 {
+        let centers: Vec<Vec<f32>> = (0..clusters).map(|_| random_unit_vec(&mut rng, dim)).collect();
+        let perturb = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
+            let mut v: Vec<f32> = c.iter().map(|x| x + 0.20 * rng.gen_range(-1.0f32..1.0)).collect();
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in &mut v {
+                    *x /= norm;
+                }
+            }
+            v
+        };
+        let vectors: Vec<Vec<f32>> =
+            (0..n).map(|i| perturb(&mut rng, &centers[i % clusters])).collect();
+        let queries: Vec<Vec<f32>> =
+            (0..q).map(|i| perturb(&mut rng, &centers[i % clusters])).collect();
+        (vectors, queries)
+    } else {
+        let vectors: Vec<Vec<f32>> = (0..n).map(|_| random_unit_vec(&mut rng, dim)).collect();
+        let queries: Vec<Vec<f32>> = (0..q).map(|_| random_unit_vec(&mut rng, dim)).collect();
+        (vectors, queries)
+    };
 
     // Brute-force ground truth (top-k by cosine = dot on unit vectors).
     let ground_truth: Vec<Vec<u32>> = queries
@@ -93,6 +117,7 @@ fn main() {
         m,
         ef_construction: efc,
         ef_search: *ef_list.iter().max().unwrap_or(&64),
+        diversify_neighbors: diversify,
         ..Default::default()
     });
     let t = Instant::now();
@@ -113,6 +138,7 @@ fn main() {
             m,
             ef_construction: efc,
             ef_search: ef,
+            diversify_neighbors: diversify,
             ..Default::default()
         });
         for (i, v) in vectors.iter().enumerate() {

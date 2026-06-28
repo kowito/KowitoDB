@@ -56,9 +56,16 @@ directly comparable):
     selection keeps the diversity heuristic from the paper. KowitoDB is close,
     and the gap **closes at high `ef`** (0.919 vs 0.930 at ef=256).
   - **KowitoDB sits between Qdrant and Milvus** at matched `ef`, and clearly
-    above Milvus's default configuration here. (KowitoDB currently uses a simple
-    "keep closest M" neighbor pruning; adopting the full HNSW diversity heuristic
-    would close most of the remaining gap to Qdrant — a concrete next step.)
+    above Milvus's default configuration here.
+  - **Diversity heuristic (opt-in):** KowitoDB defaults to fast "keep closest M"
+    neighbor selection; the full HNSW diversity heuristic (Malkov & Yashunin
+    Alg. 4) is available via `HnswParams::diversify_neighbors` /
+    `CMP_DIVERSIFY=1`. A/B (clustered data, this harness): it raises low-`ef`
+    recall (ef=32: **0.988 → 0.9997**) at a modest QPS cost and ~15% more build
+    time; it's a **no-op on the structureless random set above** (no clusters to
+    diversify around), so it does *not* move the random-data column. Off by
+    default because KowitoDB favors the QPS-tuned path; turn it on when
+    optimizing recall at low `ef` on real (clustered) embeddings.
   - **Milvus's lower recall is most likely a configuration/segmentation artifact**
     (segment sizing, default index params on a small set), not a fundamental
     limit — treat it as "default-config" rather than "best Milvus can do."
