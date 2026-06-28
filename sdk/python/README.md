@@ -61,11 +61,12 @@ nodes = retriever.retrieve("which customers renewed after Series A?")
 
 ## Regenerating the gRPC stubs
 
+One command (regenerates from `proto/` and fixes the relative import
+automatically):
+
 ```bash
-python -m grpc_tools.protoc -I ../../proto \
-  --python_out=kowitodb --grpc_python_out=kowitodb \
-  ../../proto/kowitodb.proto
+make gen-python            # from the repo root
+# or:  bash sdk/python/scripts/gen.sh
 ```
 
-Then patch the grpc stub's `import kowitodb_pb2` to `from . import kowitodb_pb2`
-so the package import works.
+Requires `pip install grpcio-tools`. See [`scripts/gen.sh`](scripts/gen.sh).

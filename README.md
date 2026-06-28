@@ -454,14 +454,17 @@ Every product has them. Ours are documented, not hidden:
 
 ## Contributing
 
-Contributions welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the build +
-test cheatsheet (it's the exact set of commands CI runs). The short version:
+Contributions welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full
+guide. A `Makefile` wraps the common tasks — run `make` for the list:
 
 ```bash
-cargo fmt --all --check && \
-cargo clippy --workspace --all-targets -- -D warnings && \
-cargo test --workspace
+make run        # run the server (dev mode)
+make example    # embedded library demo — ingest + ask, no server
+make ci         # the exact CI gate: fmt-check + clippy + test
 ```
+
+Using KowitoDB as an **embedded Rust library** (no gRPC server)? See
+[`kowitodb-server/examples/embedded.rs`](kowitodb-server/examples/embedded.rs).
 
 ---
 

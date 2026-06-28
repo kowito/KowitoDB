@@ -12,29 +12,35 @@ build in a couple of minutes.
 
 ## Build & run
 
+A `Makefile` wraps the common tasks — run `make` (or `make help`) for the full
+list. The essentials:
+
 ```bash
-# Build everything
+make build        # build the workspace
+make run          # run the gRPC server (dev mode, no release build)
+make example      # run the embedded-library example (no server)
+make ci           # the exact CI gate: fmt-check + clippy + test
+```
+
+The raw cargo equivalents (if you prefer not to use `make`):
+
+```bash
 cargo build --workspace
-
-# Run the server (dev mode — no release build needed)
 cargo run -p kowitodb -- serve
-
-# Or query in embedded mode (no server)
 cargo run -p kowitodb -- ask "what do you know?"
+cargo run -p kowitodb-server --example embedded
 ```
 
 ## Before you open a PR — run exactly what CI runs
 
-CI (`.github/workflows/ci.yml`) gates on these three commands. Run them locally
-and make sure they're green:
+CI (`.github/workflows/ci.yml`) gates on fmt + clippy + test. Run the same gate
+locally with one command:
 
 ```bash
-cargo fmt --all                                      # format (use --check in CI)
-cargo clippy --workspace --all-targets -- -D warnings  # lint (warnings = errors)
-cargo test --workspace                                # tests
+make ci
 ```
 
-A one-liner for the full gate:
+…which is equivalent to:
 
 ```bash
 cargo fmt --all --check && \
