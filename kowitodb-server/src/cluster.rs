@@ -350,21 +350,45 @@ impl Cluster {
         &self,
         req: proto::BatchInsertRequest,
     ) -> Result<proto::BatchInsertResponse, Status> {
-        // Assign ids, then group each item into every replica node's sub-batch.
+        // Assign ids and record each id's replica set, then group items into
+        // each node's sub-batch.
         let mut ids = Vec::with_capacity(req.items.len());
+        let mut replica_sets: Vec<(String, Vec<usize>)> = Vec::with_capacity(req.items.len());
         let mut groups: HashMap<usize, Vec<proto::InsertRequest>> = HashMap::new();
         for mut item in req.items {
             let id = parse_or_new_id(item.id.as_deref());
             item.id = Some(id.to_string());
-            ids.push(id.to_string());
-            for &node in &self.replicas_for_id(id) {
+            let replicas = self.replicas_for_id(id);
+            for &node in &replicas {
                 groups.entry(node).or_default().push(item.clone());
             }
+            ids.push(id.to_string());
+            replica_sets.push((id.to_string(), replicas));
         }
+
+        // Send each node's sub-batch and track which nodes acked.
+        let mut failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for (node, items) in groups {
             let req = proto::BatchInsertRequest { items };
-            if let Err(e) = self.nodes[node].batch_insert(req).await {
-                warn!("batch_insert on node {node} failed: {e}");
+            match self.nodes[node].batch_insert(req).await {
+                Ok(_) => self.set_health(node, true),
+                Err(e) => {
+                    self.set_health(node, false);
+                    warn!("batch_insert on node {node} failed: {e}");
+                    failed.insert(node);
+                }
+            }
+        }
+
+        // Enforce the write quorum per object (same durability contract as the
+        // single `insert`): every item must have reached `write_quorum` replicas.
+        for (id, replicas) in &replica_sets {
+            let quorum = self.write_quorum.clamp(1, replicas.len().max(1));
+            let acks = replicas.iter().filter(|r| !failed.contains(r)).count();
+            if acks < quorum {
+                return Err(Status::unavailable(format!(
+                    "batch_insert: write quorum not met for {id} ({acks}/{quorum} acks)"
+                )));
             }
         }
         Ok(proto::BatchInsertResponse { ids })

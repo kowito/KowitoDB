@@ -26,3 +26,6 @@ rayon = "1"
 [dependencies.tantivy]
 version = "0.22"
 features = ["mmap", "lz4-compression"]
+
+[dev-dependencies]
+proptest = "1"

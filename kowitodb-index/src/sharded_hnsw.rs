@@ -39,6 +39,11 @@ impl ShardedHnswIndex {
         self.shards.len()
     }
 
+    /// The established vector dimension across shards (set by the first insert).
+    pub fn dimension(&self) -> Option<usize> {
+        self.shards.iter().find_map(|s| s.dimension())
+    }
+
     #[inline]
     fn shard_of(&self, id: ObjectId) -> usize {
         (id.as_u128() % self.shards.len() as u128) as usize

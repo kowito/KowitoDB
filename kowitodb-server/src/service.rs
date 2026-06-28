@@ -9,6 +9,10 @@ use crate::metrics::MetricsCollector;
 use crate::proto;
 use crate::proto::kowito_db_server::KowitoDb;
 
+/// Upper bound on `batch_insert` items per request — bounds the per-request work
+/// (and memory) so a single call can't be used to exhaust the server.
+const MAX_BATCH_ITEMS: usize = 10_000;
+
 /// Map a [`kowitodb_core::KowitoError`] to a [`tonic::Status`] with the correct
 /// gRPC status code so clients can distinguish not-found (5) from
 /// invalid-argument (3) from internal (13), instead of everything being
@@ -88,6 +92,12 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::BatchInsertRequest>,
     ) -> Result<Response<proto::BatchInsertResponse>, Status> {
         let req = request.into_inner();
+        if req.items.len() > MAX_BATCH_ITEMS {
+            return Err(Status::invalid_argument(format!(
+                "batch_insert accepts at most {MAX_BATCH_ITEMS} items ({} given)",
+                req.items.len()
+            )));
+        }
         let objects: Vec<_> = req.items.into_iter().map(insert_req_to_obj).collect();
         let count = objects.len();
 

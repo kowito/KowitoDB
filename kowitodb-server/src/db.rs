@@ -2291,6 +2291,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_persistence_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("kowitodb-durab-{}", uuid::Uuid::new_v4()));
+        let storage = dir.join("storage");
+        let index = dir.join("index");
+
+        // Session 1: ingest, checkpoint the vector index, then drop the engine
+        // (the `{}` scope releases sled's file lock — a clean "shutdown").
+        {
+            let engine = KowitoDBEngine::open(&storage, &index).await.unwrap();
+            for c in ["Acme renewed their enterprise license", "Globex shipped v2"] {
+                engine.insert(KnowledgeObject::new(c)).await.unwrap();
+            }
+            engine.checkpoint().unwrap();
+        }
+
+        // Session 2: reopen from the same paths and verify the data recovered
+        // and is searchable (the vector index rebuilds from storage on open).
+        let engine = KowitoDBEngine::open(&storage, &index).await.unwrap();
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.total_objects, 2, "objects must survive a restart");
+        let resp = engine.ask("Acme enterprise", 5).await.unwrap();
+        assert!(
+            resp.results.iter().any(|r| r.content.contains("Acme")),
+            "recovered data must be searchable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_auto_graph_links_co_mentions() {
         let engine = KowitoDBEngine::new_in_memory().unwrap();
         let a = engine

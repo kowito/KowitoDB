@@ -181,7 +181,8 @@ db.ask("What's the status of the Acme deal?")
 Turns are promoted to searchable knowledge objects, linked to existing knowledge
 via graph edges, and distilled by an LLM into clean durable facts. Your agent
 remembers — not in a separate cache, but in the same database that stores your
-documents.
+documents. Runnable demo (embedded, no server):
+[`examples/agent_memory.rs`](kowitodb-server/examples/agent_memory.rs).
 
 ### SQL: analytics on your knowledge
 

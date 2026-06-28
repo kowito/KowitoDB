@@ -594,6 +594,10 @@ pub struct HnswIndex {
     /// the first insert once the dimensionality is known). `None` unless
     /// `params.binary_quantize` is set.
     rotation: Arc<RwLock<Option<Rotation>>>,
+    /// Established vector dimension (set on the first insert). Mismatched inserts
+    /// are skipped and mismatched queries return empty — otherwise the distance
+    /// loops silently truncate to the shorter vector and return wrong results.
+    dim: Arc<RwLock<Option<usize>>>,
     /// Configuration.
     params: HnswParams,
 }
@@ -607,6 +611,8 @@ struct HnswSnapshotRef<'a> {
     max_layer: usize,
     #[serde(default)]
     rotation: Option<Rotation>,
+    #[serde(default)]
+    dim: Option<usize>,
 }
 
 /// Owned snapshot for deserialization on `load`.
@@ -618,6 +624,8 @@ struct HnswSnapshot {
     max_layer: usize,
     #[serde(default)]
     rotation: Option<Rotation>,
+    #[serde(default)]
+    dim: Option<usize>,
 }
 
 impl HnswIndex {
@@ -627,14 +635,41 @@ impl HnswIndex {
             entry_point: Arc::new(RwLock::new(None)),
             max_layer: Arc::new(RwLock::new(0)),
             rotation: Arc::new(RwLock::new(None)),
+            dim: Arc::new(RwLock::new(None)),
             params,
         }
+    }
+
+    /// The established vector dimension (set by the first insert), or `None` if
+    /// the index is empty.
+    pub fn dimension(&self) -> Option<usize> {
+        *self.dim.read()
     }
 
     /// Insert a vector for an object.
     ///
     /// If the object already exists, it is re-inserted (updated).
     pub fn insert(&self, id: ObjectId, vector: Embedding) {
+        // Enforce a single vector dimension. The first insert sets it; a later
+        // mismatch is skipped (with a warning) rather than silently corrupting
+        // the index — distance over differing lengths returns wrong results.
+        {
+            let mut dim = self.dim.write();
+            match *dim {
+                None => *dim = Some(vector.len()),
+                Some(d) if d != vector.len() => {
+                    debug!(
+                        "HNSW: skipping insert of {}-dim vector into a {}-dim index ({})",
+                        vector.len(),
+                        d,
+                        id
+                    );
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut graph = self.graph.write();
         let mut entry_point = self.entry_point.write();
         let mut max_layer = self.max_layer.write();
@@ -850,6 +885,18 @@ impl HnswIndex {
 
     /// Search for the k-nearest neighbors.
     pub fn search(&self, query: &Embedding, k: usize) -> Vec<(ObjectId, f32)> {
+        // A wrong-dimension query would silently produce garbage distances.
+        if let Some(d) = *self.dim.read() {
+            if query.len() != d {
+                debug!(
+                    "HNSW: {}-dim query against a {}-dim index — returning no results",
+                    query.len(),
+                    d
+                );
+                return Vec::new();
+            }
+        }
+
         let graph = self.graph.read();
         let entry_point = self.entry_point.read();
         let max_layer = self.max_layer.read();
@@ -969,6 +1016,7 @@ impl HnswIndex {
             entry_point: *self.entry_point.read(),
             max_layer: *self.max_layer.read(),
             rotation: self.rotation.read().clone(),
+            dim: *self.dim.read(),
         };
         bincode::serialize(&snapshot).map_err(std::io::Error::other)
     }
@@ -990,6 +1038,7 @@ impl HnswIndex {
             entry_point: Arc::new(RwLock::new(snapshot.entry_point)),
             max_layer: Arc::new(RwLock::new(snapshot.max_layer)),
             rotation: Arc::new(RwLock::new(snapshot.rotation)),
+            dim: Arc::new(RwLock::new(snapshot.dim)),
             params: snapshot.params,
         })
     }
@@ -1656,6 +1705,20 @@ mod tests {
             *qid,
             "exact match must stay top-1 after entry-point churn"
         );
+    }
+
+    #[test]
+    fn test_dimension_mismatch_is_rejected() {
+        let idx = HnswIndex::new(HnswParams::default());
+        idx.insert(uuid::Uuid::from_u128(1), vec![1.0, 0.0, 0.0]);
+        assert_eq!(idx.dimension(), Some(3));
+        // A wrong-dimension insert is skipped (not added).
+        idx.insert(uuid::Uuid::from_u128(2), vec![1.0, 0.0]);
+        idx.insert(uuid::Uuid::from_u128(3), vec![0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(idx.len(), 1, "mismatched-dim inserts must be skipped");
+        // A wrong-dimension query returns nothing rather than garbage.
+        assert!(idx.search(&vec![1.0, 0.0], 5).is_empty());
+        assert_eq!(idx.search(&vec![1.0, 0.0, 0.0], 5).len(), 1);
     }
 
     #[test]
