@@ -3,6 +3,11 @@ name = "kowitodb-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "KowitoDB engine + gRPC server: vector, full-text, graph, SQL and agent memory behind one ai.ask()."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 kowitodb-core.workspace = true

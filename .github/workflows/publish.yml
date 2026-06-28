@@ -1,0 +1,77 @@
+name: publish
+
+# Auto-publish all workspace crates to crates.io.
+#   - Push a tag `vX.Y.Z` (matching the workspace version) → real publish.
+#   - Run manually (workflow_dispatch) → dry run by default (validates packaging,
+#     no upload).
+#
+# One-time setup: add a crates.io API token as the repo secret
+# CARGO_REGISTRY_TOKEN (Settings ▸ Secrets ▸ Actions). No protoc install is
+# needed — it's vendored via the build script.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (package only, no upload)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify the tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag v$tag does not match workspace version $version"
+            exit 1
+          fi
+          echo "Releasing v$version"
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -u
+          # Topological order: a crate is published only after its deps.
+          crates="kowitodb-core kowitodb-storage kowitodb-index kowitodb-planner kowitodb-sql kowitodb-server kowitodb"
+          if [ "${DRY_RUN:-}" = "true" ]; then
+            extra="--dry-run --no-verify"
+            echo "DRY RUN — packaging only, nothing is uploaded"
+          else
+            extra="--locked"
+          fi
+          for c in $crates; do
+            echo "::group::publish $c"
+            if out=$(cargo publish -p "$c" $extra 2>&1); then
+              echo "$out"
+            else
+              echo "$out"
+              if echo "$out" | grep -qiE "already (exists|uploaded)"; then
+                # Idempotent: a crate already at this version is a no-op.
+                echo "→ $c already published at this version — skipping"
+              elif [ "${DRY_RUN:-}" = "true" ] && echo "$out" | grep -qi "no matching package named .kowitodb"; then
+                # In dry run, internal deps aren't on crates.io yet — packaging
+                # got far enough to validate this crate's own metadata/files.
+                echo "→ $c packaged OK (internal deps resolve at real-publish time)"
+              else
+                echo "::error::failed to publish $c"
+                exit 1
+              fi
+            fi
+            echo "::endgroup::"
+          done

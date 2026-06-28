@@ -3,6 +3,11 @@ name = "kowitodb-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Vector (HNSW), full-text, graph, metadata and time indexes for KowitoDB."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 kowitodb-core.workspace = true

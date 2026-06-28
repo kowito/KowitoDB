@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 .PHONY: help build release run ask test lint fmt fmt-check ci demo example \
-        bench bench-compare docker docker-run gen-python clean
+        bench bench-compare docker docker-run gen-python bump clean
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -55,6 +55,14 @@ docker-run: ## Run the server image, persisting to ./data
 
 gen-python: ## Regenerate the Python SDK gRPC stubs from proto/
 	bash sdk/python/scripts/gen.sh
+
+bump: ## Bump + tag a release: make bump V=0.41.0  (needs cargo-edit)
+	@test -n "$(V)" || { echo "usage: make bump V=X.Y.Z"; exit 1; }
+	cargo set-version --workspace $(V)
+	$(MAKE) ci
+	git commit -am "Release v$(V)"
+	git tag "v$(V)"
+	@echo "Now: git push origin main --tags   (triggers crates.io publish)"
 
 clean: ## Remove build artifacts
 	cargo clean

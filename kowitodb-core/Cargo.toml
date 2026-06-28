@@ -3,6 +3,11 @@ name = "kowitodb-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Core types and primitives for KowitoDB — the database built for AI agents."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde.workspace = true

@@ -26,6 +26,10 @@ version = "0.40.0"
 edition = "2021"
 license = "MIT"
 authors = ["KowitoDB Contributors"]
+repository = "https://github.com/kowito/KowitoDB"
+homepage = "https://github.com/kowito/KowitoDB"
+keywords = ["vector-database", "rag", "ai", "search", "embeddings"]
+categories = ["database", "data-structures"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -52,10 +56,12 @@ async-trait = "0.1"
 hex = "0.4"
 sha2 = "0.10"
 
-# Internal crates
-kowitodb-core = { path = "kowitodb-core" }
-kowitodb-storage = { path = "kowitodb-storage" }
-kowitodb-index = { path = "kowitodb-index" }
-kowitodb-planner = { path = "kowitodb-planner" }
-kowitodb-sql = { path = "kowitodb-sql" }
-kowitodb-server = { path = "kowitodb-server" }
+# Internal crates. The `version` is required for publishing to crates.io (the
+# path is stripped on publish). Keep these in lockstep with the workspace
+# version — `cargo set-version --workspace <v>` (cargo-edit) updates all of them.
+kowitodb-core = { path = "kowitodb-core", version = "0.40.0" }
+kowitodb-storage = { path = "kowitodb-storage", version = "0.40.0" }
+kowitodb-index = { path = "kowitodb-index", version = "0.40.0" }
+kowitodb-planner = { path = "kowitodb-planner", version = "0.40.0" }
+kowitodb-sql = { path = "kowitodb-sql", version = "0.40.0" }
+kowitodb-server = { path = "kowitodb-server", version = "0.40.0" }

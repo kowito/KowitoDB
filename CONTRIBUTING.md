@@ -97,6 +97,12 @@ cross-engine comparison.
 - Configuration is via `KOWITODB_*` environment variables — see the
   "Configuration" section of the root [README](README.md).
 
+## Releasing
+
+Maintainers: see [`RELEASING.md`](RELEASING.md). In short, `make bump V=X.Y.Z`
+then push the `vX.Y.Z` tag — CI publishes all crates to crates.io in dependency
+order.
+
 ## License
 
 By contributing you agree your contributions are licensed under the project's

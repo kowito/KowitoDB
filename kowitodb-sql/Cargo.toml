@@ -3,6 +3,11 @@ name = "kowitodb-sql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "DataFusion-backed SQL over KowitoDB knowledge objects."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 kowitodb-core.workspace = true
