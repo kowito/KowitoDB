@@ -3,6 +3,7 @@ name = "kowitodb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
 description = "KowitoDB — the database built for AI agents. Single-binary CLI + gRPC server."
 repository.workspace = true
 homepage.workspace = true

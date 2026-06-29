@@ -1,0 +1,38 @@
+name: bump-version
+
+# Auto-bump the workspace patch version on every push to main. The bump commit
+# is made with the default GITHUB_TOKEN, which by design does NOT trigger further
+# workflows — so this can't loop. (`[skip ci]` and the `if` guard below are
+# belt-and-suspenders.)
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Don't bump in response to a bump commit (or any [skip ci] commit).
+    if: >-
+      ${{ !contains(github.event.head_commit.message, '[skip ci]')
+          && !startsWith(github.event.head_commit.message, 'chore: bump') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Bump patch version
+        run: |
+          set -e
+          new=$(python3 scripts/bump-version.py)
+          echo "Bumped workspace to $new"
+          git config user.name "kowito"
+          git config user.email "hi@kowito.com"
+          git commit -am "chore: bump version to $new [skip ci]"
+          # Re-base onto any concurrent pushes, then push.
+          git push || (git pull --rebase --autostash origin main && git push)

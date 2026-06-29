@@ -3,6 +3,7 @@ name = "kowitodb-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme.workspace = true
 description = "Pluggable storage backends (sled, Lance) for KowitoDB."
 repository.workspace = true
 homepage.workspace = true

@@ -28,6 +28,7 @@ license = "MIT"
 authors = ["KowitoDB Contributors"]
 repository = "https://github.com/kowito/KowitoDB"
 homepage = "https://github.com/kowito/KowitoDB"
+readme = "README.md"
 keywords = ["vector-database", "rag", "ai", "search", "embeddings"]
 categories = ["database", "data-structures"]
 
