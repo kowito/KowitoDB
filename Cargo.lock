@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-core"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "arrow",
  "chrono",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-index"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-planner"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3431,7 +3431,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-server"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-sql"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3490,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "kowitodb-storage"
-version = "0.40.3"
+version = "0.40.4"
 dependencies = [
  "anyhow",
  "arrow",
