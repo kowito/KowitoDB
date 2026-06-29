@@ -29,7 +29,7 @@ RUN for crate in kowitodb kowitodb-core kowitodb-storage kowitodb-index \
       echo 'fn main() {}' > "$crate/src/main.rs"; \
       touch "$crate/src/lib.rs"; \
     done
-COPY proto proto/
+COPY kowitodb-server/proto kowitodb-server/proto/
 COPY kowitodb-server/build.rs kowitodb-server/
 
 # Build only the dependencies (this layer is cached until Cargo.toml or proto changes).

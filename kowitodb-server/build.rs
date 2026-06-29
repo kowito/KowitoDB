@@ -16,6 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit the encoded file descriptor set so the server can expose gRPC
         // reflection (grpcurl, gRPC UIs, some load balancers).
         .file_descriptor_set_path(out_dir.join("kowitodb_descriptor.bin"))
-        .compile_protos(&["../proto/kowitodb.proto"], &["../proto"])?;
+        .compile_protos(&["proto/kowitodb.proto"], &["proto"])?;
     Ok(())
 }

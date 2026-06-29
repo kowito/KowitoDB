@@ -1,7 +1,7 @@
 # Makefile for the KowitoDB Go SDK.
 
 # Path to the proto file (relative to this directory).
-PROTO_DIR := ../../proto
+PROTO_DIR := ../../kowitodb-server/proto
 PROTO     := kowitodb.proto
 PB_DIR    := kowitodbpb
 GO_MODULE := github.com/kowito/kowitodb/sdk/go

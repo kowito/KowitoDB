@@ -16,7 +16,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PACKAGE_DIR = path.resolve(__dirname, "..");
-const CANONICAL_PROTO = path.resolve(PACKAGE_DIR, "..", "..", "proto", "kowitodb.proto");
+const CANONICAL_PROTO = path.resolve(PACKAGE_DIR, "..", "..", "kowitodb-server", "proto", "kowitodb.proto");
 const BUNDLED_PROTO = path.resolve(PACKAGE_DIR, "proto", "kowitodb.proto");
 
 function main() {

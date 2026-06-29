@@ -8,9 +8,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # sdk/python
 
-python -m grpc_tools.protoc -I ../../proto \
+python -m grpc_tools.protoc -I ../../kowitodb-server/proto \
   --python_out=kowitodb --grpc_python_out=kowitodb \
-  ../../proto/kowitodb.proto
+  ../../kowitodb-server/proto/kowitodb.proto
 
 # protoc emits `import kowitodb_pb2` (absolute); rewrite to a relative import so
 # `from kowitodb import ...` works as an installed package.

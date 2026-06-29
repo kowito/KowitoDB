@@ -148,7 +148,7 @@ type InsertItem struct {
 ## Regenerating protobuf code
 
 The generated code lives in [`kowitodbpb/`](./kowitodbpb). Regenerate it from
-[`../../proto/kowitodb.proto`](../../proto/kowitodb.proto) with:
+[`../../kowitodb-server/proto/kowitodb.proto`](../../kowitodb-server/proto/kowitodb.proto) with:
 
 ```sh
 make generate
