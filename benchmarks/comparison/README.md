@@ -32,6 +32,18 @@ A reproducible, apples-to-apples ANN benchmark. All three systems index the
    CMP_M=16 CMP_EFC=128 CMP_EFS=32,64,128,256 cargo run --release -- ../dataset.bin
    ```
 
+4. [velesdb](https://crates.io/crates/velesdb-core) is benchmarked the same way
+   but is **not bundled here** — its VelesDB Core License 1.0
+   (Elastic-License-2.0-style) prohibits competitive use, so we publish only its
+   numbers (as with Qdrant/Milvus). To reproduce, in a throwaway crate *outside*
+   this repo with `velesdb-core = "3.4"`, read the same `dataset.bin` and:
+   ```rust
+   db.create_vector_collection_with_hnsw("c", dim, DistanceMetric::Cosine,
+       StorageMode::Full, Some(m), Some(efc))?;          // matched M / ef_construction
+   col.upsert_bulk(&points)?;                            // Point::without_payload(id, vec)
+   let hits = col.search_with_ef(query, k, ef_search)?;  // hits[i].point.id, hits[i].score
+   ```
+
 Each prints CSV rows `system,ef_search,recall@k,qps_1thread,p50_us,p95_us`.
 
 ## Results (measured)
@@ -42,22 +54,37 @@ single machine (Apple Silicon, 4P+6E). `kowitodb` = default (unbounded degree);
 
 **Recall@10 — uniform random vectors** (a deliberately hard, structure-free case):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec |
-|-----|---------:|-------------:|---------:|-------:|---------:|
-| 32  | 0.431    | 0.234        | **0.700**| 0.196  | 0.086    |
-| 64  | 0.602    | 0.380        | **0.786**| 0.337  | 0.172    |
-| 128 | 0.788    | 0.564        | **0.881**| 0.497  | 0.289    |
-| 256 | 0.921    | 0.763        | **0.963**| 0.692  | 0.406    |
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec | velesdb |
+|-----|---------:|-------------:|---------:|-------:|---------:|--------:|
+| 32  | 0.431    | 0.234        | **0.700**| 0.196  | 0.086    | 0.353   |
+| 64  | 0.602    | 0.380        | **0.786**| 0.337  | 0.172    | 0.529   |
+| 128 | 0.788    | 0.564        | **0.881**| 0.497  | 0.289    | 0.727   |
+| 256 | 0.921    | 0.763        | **0.963**| 0.692  | 0.406    | 0.889   |
 
 **Recall@10 — clustered vectors** (200 clusters; representative of real
 embeddings):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec |
-|-----|---------:|-------------:|---------:|-------:|---------:|
-| 16  | 0.915    | 0.957        | **0.976**| 0.908  | 0.187    |
-| 32  | 0.994    | 0.994        | **0.997**| 0.986  | 0.190    |
-| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  | 0.207    |
-| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 | 0.230    |
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec | velesdb |
+|-----|---------:|-------------:|---------:|-------:|---------:|--------:|
+| 16  | 0.915    | 0.957        | **0.976**| 0.908  | 0.187    | 0.293   |
+| 32  | 0.994    | 0.994        | **0.997**| 0.986  | 0.190    | 0.303   |
+| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  | 0.207    | 0.316   |
+| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 | 0.230    | 0.336   |
+
+> **velesdb (v3.4.0) — competent, but `ef_construction`-sensitive on clustered
+> data.** Unlike embedvec, velesdb is a real, capable HNSW engine: on uniform
+> random data at matched params it's the strongest non-Qdrant column (0.35 → 0.89),
+> and a query for a stored vector correctly returns that vector at cosine 1.0. Its
+> *low clustered numbers above are a parameter effect, not a ceiling* — at the
+> matched `M=16, ef_construction=128` its graph is too sparse for 200 tight
+> clusters, but with a **richer graph (`M=32, ef_construction=256`) it recovers to
+> 0.82 @ ef=128 and 0.93 @ ef=512**, with self-query back to 1.0. So read velesdb's
+> clustered row as "needs more build effort here," whereas KowitoDB reaches 0.99+
+> at the lean matched params (more robust graph construction at low
+> `ef_construction`). Measured **out-of-repo** (not bundled): velesdb-core is under
+> a VelesDB Core License 1.0 (Elastic-License-2.0-style) that prohibits competitive
+> use, so only its numbers are reproduced here — like Qdrant/Milvus, run it
+> yourself with the harness sketch below.
 
 > **embedvec (v0.8.0) at this scale.** embedvec is a young, single-file-friendly
 > HNSW crate. At matched params on 50 000 vectors its recall is low and — tellingly
@@ -72,10 +99,13 @@ embeddings):
 > crate, not yet tuned for tens of thousands of vectors," not a tuned bake-off.
 > Harness: [`embedvec-bench/`](embedvec-bench/).
 
-On **clustered (real-like) data the systems converge** (~0.99+ by ef=32);
-KowitoDB is competitive with Qdrant and **ahead of Milvus's default config**, and
-`kowitodb-std` closes most of the low-ef gap (ef=16: 0.915 → 0.957 vs Qdrant
-0.976). On **uniform random data Qdrant leads clearly** — implementation maturity,
+On **clustered (real-like) data the mature engines converge** (KowitoDB, Qdrant,
+Milvus all ~0.99+ by ef=32); KowitoDB is competitive with Qdrant and **ahead of
+Milvus's default config**, and `kowitodb-std` closes most of the low-ef gap
+(ef=16: 0.915 → 0.957 vs Qdrant 0.976). The two embedded Rust crates trail at the
+lean matched params — **velesdb for tuning reasons (it recovers with more
+`ef_construction`), embedvec for structural ones (it doesn't)** — see the notes
+above. On **uniform random data Qdrant leads clearly** — implementation maturity,
 not one missing algorithm (see below).
 
 Throughput (single-thread q/s — **NOT directly comparable**, see caveats):
