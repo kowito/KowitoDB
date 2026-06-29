@@ -54,22 +54,66 @@ single machine (Apple Silicon, 4P+6E). `kowitodb` = default (unbounded degree);
 
 **Recall@10 — uniform random vectors** (a deliberately hard, structure-free case):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec | velesdb |
+| ef  | kowitodb | kowitodb-std | Qdrant\* | Milvus\*| embedvec | velesdb |
 |-----|---------:|-------------:|---------:|-------:|---------:|--------:|
-| 32  | 0.431    | 0.234        | **0.700**| 0.196  | 0.086    | 0.353   |
-| 64  | 0.602    | 0.380        | **0.786**| 0.337  | 0.172    | 0.529   |
-| 128 | 0.788    | 0.564        | **0.881**| 0.497  | 0.289    | 0.727   |
-| 256 | 0.921    | 0.763        | **0.963**| 0.692  | 0.406    | 0.889   |
+| 32  | 0.424    | 0.239        | **0.700**| 0.196  | 0.081    | 0.352   |
+| 64  | 0.604    | 0.382        | **0.786**| 0.337  | 0.170    | 0.527   |
+| 128 | 0.789    | 0.559        | **0.881**| 0.497  | 0.291    | 0.728   |
+| 256 | 0.921    | 0.768        | **0.963**| 0.692  | 0.393    | 0.892   |
 
 **Recall@10 — clustered vectors** (200 clusters; representative of real
 embeddings):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec | velesdb |
+| ef  | kowitodb | kowitodb-std | Qdrant\* | Milvus\*| embedvec | velesdb |
 |-----|---------:|-------------:|---------:|-------:|---------:|--------:|
-| 16  | 0.915    | 0.957        | **0.976**| 0.908  | 0.187    | 0.293   |
-| 32  | 0.994    | 0.994        | **0.997**| 0.986  | 0.190    | 0.303   |
-| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  | 0.207    | 0.316   |
-| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 | 0.230    | 0.336   |
+| 16  | 0.912    | 0.953        | **0.976**| 0.908  | 0.201    | 0.294   |
+| 32  | 0.989    | 0.995        | **0.997**| 0.986  | 0.206    | 0.301   |
+| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  | 0.232    | 0.311   |
+| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 | 0.253    | 0.332   |
+
+\* Qdrant/Milvus carried from prior measured runs against the **same** seeded
+`dataset.bin` (their Docker services were not re-run for this refresh). KowitoDB's
+parallel graph build is non-deterministic run-to-run, so its recall has ~±1%
+single-run noise; numbers above are one fresh run.
+
+### Visual (recall@10)
+
+```
+RANDOM 50k×128, M=16, efc=128          0    0.25  0.5   0.75   1.0
+                                       +-----+-----+-----+-----+
+ef=128  qdrant*       0.881  ███████████████████████████████████····
+        kowitodb      0.789  ███████████████████████████████········
+        velesdb       0.728  ████████████████████████████████········
+        kowitodb-std  0.559  █████████████████████████···············
+        milvus*       0.497  ██████████████████████··················
+        embedvec      0.291  █████████████···························
+ef=256  qdrant*       0.963  ██████████████████████████████████████··
+        kowitodb      0.921  █████████████████████████████████████···
+        velesdb       0.892  ███████████████████████████████████████·
+        kowitodb-std  0.768  ██████████████████████████████████······
+        milvus*       0.692  ██████████████████████████████·········
+        embedvec      0.393  █████████████████·······················
+
+CLUSTERED 50k×128 (200 clusters), M=16, efc=128
+ef=16   qdrant*       0.976  ███████████████████████████████████████████·
+        kowitodb-std  0.953  ██████████████████████████████████████████··
+        kowitodb      0.912  ████████████████████████████████████████····
+        milvus*       0.908  ████████████████████████████████████████····
+        velesdb       0.294  █████████████·······························
+        embedvec      0.201  █████████···································
+ef=32   qdrant*       0.997  ████████████████████████████████████████████
+        kowitodb-std  0.995  ████████████████████████████████████████████
+        kowitodb      0.989  ███████████████████████████████████████████·
+        milvus*       0.986  ███████████████████████████████████████████·
+        velesdb       0.301  █████████████·······························
+        embedvec      0.206  █████████···································
+```
+
+On **clustered (real-like) data the mature engines saturate by ef≈32** (KowitoDB,
+Qdrant, Milvus all ~0.99); the two embedded crates flatline far below — velesdb
+for tuning reasons (recovers with more `ef_construction`), embedvec structurally
+(does not). On **random data** the order is Qdrant > kowitodb > velesdb >
+kowitodb-std > milvus > embedvec, converging as `ef` rises.
 
 > **velesdb (v3.4.0) — competent, but `ef_construction`-sensitive on clustered
 > data.** Unlike embedvec, velesdb is a real, capable HNSW engine: on uniform
@@ -88,7 +132,7 @@ embeddings):
 
 > **embedvec (v0.8.0) at this scale.** embedvec is a young, single-file-friendly
 > HNSW crate. At matched params on 50 000 vectors its recall is low and — tellingly
-> — **flat in `ef`** on clustered data (0.19 → 0.23 from ef=16 to 128), the
+> — **flat in `ef`** on clustered data (0.20 → 0.25 from ef=16 to 128), the
 > signature of a graph-connectivity ceiling rather than under-search. This is
 > **not** a harness artifact: re-running **embedvec's own recall test** (its data
 > generator + its brute-force ground truth) scaled from its shipped 500 vectors up
@@ -99,14 +143,10 @@ embeddings):
 > crate, not yet tuned for tens of thousands of vectors," not a tuned bake-off.
 > Harness: [`embedvec-bench/`](embedvec-bench/).
 
-On **clustered (real-like) data the mature engines converge** (KowitoDB, Qdrant,
-Milvus all ~0.99+ by ef=32); KowitoDB is competitive with Qdrant and **ahead of
-Milvus's default config**, and `kowitodb-std` closes most of the low-ef gap
-(ef=16: 0.915 → 0.957 vs Qdrant 0.976). The two embedded Rust crates trail at the
-lean matched params — **velesdb for tuning reasons (it recovers with more
-`ef_construction`), embedvec for structural ones (it doesn't)** — see the notes
-above. On **uniform random data Qdrant leads clearly** — implementation maturity,
-not one missing algorithm (see below).
+Among the mature engines, KowitoDB is competitive with Qdrant and **ahead of
+Milvus's default config** on clustered data, and `kowitodb-std` closes most of the
+low-ef gap (ef=16: 0.912 → 0.953 vs Qdrant 0.976). On **uniform random data Qdrant
+leads clearly** — implementation maturity, not one missing algorithm (see below).
 
 Throughput (single-thread q/s — **NOT directly comparable**, see caveats):
 KowitoDB is measured **embedded** (~6–40k q/s, no network); Qdrant and Milvus as
