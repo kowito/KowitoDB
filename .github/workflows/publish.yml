@@ -41,6 +41,17 @@ jobs:
           fi
           echo "Releasing v$version"
 
+      - name: Check the crates.io token is present
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is empty. Add it under Settings ▸ Secrets and variables ▸ Actions ▸ *Repository secrets* (not Environment secrets), named exactly CARGO_REGISTRY_TOKEN, on this repo."
+            exit 1
+          fi
+          echo "crates.io token present (${#CARGO_REGISTRY_TOKEN} chars)."
+
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
