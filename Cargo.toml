@@ -25,7 +25,7 @@ panic = "unwind"
 incremental = false
 
 [workspace.package]
-version = "0.40.1"
+version = "0.40.2"
 edition = "2021"
 license = "MIT"
 authors = ["KowitoDB Contributors"]
@@ -63,9 +63,9 @@ sha2 = "0.10"
 # Internal crates. The `version` is required for publishing to crates.io (the
 # path is stripped on publish). Keep these in lockstep with the workspace
 # version — `cargo set-version --workspace <v>` (cargo-edit) updates all of them.
-kowitodb-core = { path = "kowitodb-core", version = "0.40.1" }
-kowitodb-storage = { path = "kowitodb-storage", version = "0.40.1" }
-kowitodb-index = { path = "kowitodb-index", version = "0.40.1" }
-kowitodb-planner = { path = "kowitodb-planner", version = "0.40.1" }
-kowitodb-sql = { path = "kowitodb-sql", version = "0.40.1" }
-kowitodb-server = { path = "kowitodb-server", version = "0.40.1" }
+kowitodb-core = { path = "kowitodb-core", version = "0.40.2" }
+kowitodb-storage = { path = "kowitodb-storage", version = "0.40.2" }
+kowitodb-index = { path = "kowitodb-index", version = "0.40.2" }
+kowitodb-planner = { path = "kowitodb-planner", version = "0.40.2" }
+kowitodb-sql = { path = "kowitodb-sql", version = "0.40.2" }
+kowitodb-server = { path = "kowitodb-server", version = "0.40.2" }
