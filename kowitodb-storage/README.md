@@ -1,11 +1,31 @@
 # kowitodb-storage
 
-Pluggable storage backends (sled, Lance) for KowitoDB.
+Pluggable persistence for **[KowitoDB](https://github.com/kowito/KowitoDB)** — the
+database built for AI agents.
 
-A crate of **[KowitoDB](https://github.com/kowito/KowitoDB)** — the database built
-for AI agents: vector + full-text + graph + SQL + agent memory behind one
-`ai.ask()`. See the [project README](https://github.com/kowito/KowitoDB#readme)
-for the full picture and quickstart.
+Defines the storage abstraction that the KowitoDB engine writes
+[`KnowledgeObject`](https://crates.io/crates/kowitodb-core)s through, with
+swappable backends.
+
+## What's inside
+
+- **`StorageEngine`** — the backend trait (get / put / scan / delete) the engine
+  is written against, so storage is a swap, not a rewrite.
+- **sled backend** — the pure-Rust embedded default; zero external services.
+- **`LanceStorage`** — optional columnar [Lance](https://lancedb.github.io/lance/)
+  backend for analytics-friendly, disk-efficient storage.
+- **`schema`** — the on-disk record layout shared by the backends.
+
+## Where it fits
+
+```
+kowitodb-core (types)
+  └─ kowitodb-storage  ← you are here (persistence)
+       └─ kowitodb-server (engine + gRPC)  →  kowitodb (CLI)
+```
+
+For the full feature tour, quickstart, and SDKs, see the
+**[project README](https://github.com/kowito/KowitoDB#readme)**.
 
 ## License
 
