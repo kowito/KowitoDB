@@ -8,6 +8,9 @@ members = [
     "kowitodb-server",
     "kowitodb",
 ]
+# External-engine benchmark crates live outside the workspace so their heavy
+# third-party deps never touch the published crates or CI.
+exclude = ["benchmarks/comparison/embedvec-bench"]
 resolver = "2"
 
 # Optimized profile for production binaries: maximize runtime performance and

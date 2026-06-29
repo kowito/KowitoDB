@@ -24,6 +24,14 @@ A reproducible, apples-to-apples ANN benchmark. All three systems index the
    python bench_milvus.py dataset.bin --m 16 --efc 128 --efs 32,64,128,256
    ```
 
+3. Benchmark the embedded Rust competitor [embedvec](https://crates.io/crates/embedvec)
+   on the **same** `dataset.bin` (it's an excluded crate so its heavy deps never
+   touch the workspace):
+   ```
+   cd embedvec-bench
+   CMP_M=16 CMP_EFC=128 CMP_EFS=32,64,128,256 cargo run --release -- ../dataset.bin
+   ```
+
 Each prints CSV rows `system,ef_search,recall@k,qps_1thread,p50_us,p95_us`.
 
 ## Results (measured)
@@ -34,22 +42,35 @@ single machine (Apple Silicon, 4P+6E). `kowitodb` = default (unbounded degree);
 
 **Recall@10 — uniform random vectors** (a deliberately hard, structure-free case):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus |
-|-----|---------:|-------------:|---------:|-------:|
-| 32  | 0.431    | 0.234        | **0.700**| 0.196  |
-| 64  | 0.602    | 0.380        | **0.786**| 0.337  |
-| 128 | 0.788    | 0.564        | **0.881**| 0.497  |
-| 256 | 0.921    | 0.763        | **0.963**| 0.692  |
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec |
+|-----|---------:|-------------:|---------:|-------:|---------:|
+| 32  | 0.431    | 0.234        | **0.700**| 0.196  | 0.086    |
+| 64  | 0.602    | 0.380        | **0.786**| 0.337  | 0.172    |
+| 128 | 0.788    | 0.564        | **0.881**| 0.497  | 0.289    |
+| 256 | 0.921    | 0.763        | **0.963**| 0.692  | 0.406    |
 
 **Recall@10 — clustered vectors** (200 clusters; representative of real
 embeddings):
 
-| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus |
-|-----|---------:|-------------:|---------:|-------:|
-| 16  | 0.915    | 0.957        | **0.976**| 0.908  |
-| 32  | 0.994    | 0.994        | **0.997**| 0.986  |
-| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  |
-| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 |
+| ef  | kowitodb | kowitodb-std | Qdrant   | Milvus | embedvec |
+|-----|---------:|-------------:|---------:|-------:|---------:|
+| 16  | 0.915    | 0.957        | **0.976**| 0.908  | 0.187    |
+| 32  | 0.994    | 0.994        | **0.997**| 0.986  | 0.190    |
+| 64  | 0.9997   | 0.9996       | 0.9998   | 0.999  | 0.207    |
+| 128 | 0.9999   | 0.9999       | **1.000**| 0.9999 | 0.230    |
+
+> **embedvec (v0.8.0) at this scale.** embedvec is a young, single-file-friendly
+> HNSW crate. At matched params on 50 000 vectors its recall is low and — tellingly
+> — **flat in `ef`** on clustered data (0.19 → 0.23 from ef=16 to 128), the
+> signature of a graph-connectivity ceiling rather than under-search. This is
+> **not** a harness artifact: re-running **embedvec's own recall test** (its data
+> generator + its brute-force ground truth) scaled from its shipped 500 vectors up
+> to 50 000 reproduces it — recall@10 falls 0.94 (2k) → 0.79 (10k) → 0.69 (50k),
+> and a query for a *stored* vector fails to return that vector (it's unreachable
+> in the graph), even at `ef_search=1000` and `M=32, ef_construction=200`.
+> embedvec's test suite only validates at ~500 vectors. Treat this as "early-stage
+> crate, not yet tuned for tens of thousands of vectors," not a tuned bake-off.
+> Harness: [`embedvec-bench/`](embedvec-bench/).
 
 On **clustered (real-like) data the systems converge** (~0.99+ by ef=32);
 KowitoDB is competitive with Qdrant and **ahead of Milvus's default config**, and
