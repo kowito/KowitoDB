@@ -235,7 +235,7 @@ impl OpenAiEmbeddingClient {
                         continue;
                     }
 
-                    return Err(EmbeddingError::Api(format!("HTTP {}: {}", status, body)));
+                    return Err(EmbeddingError::Api(format!("HTTP {status}: {body}")));
                 }
                 Err(e) => {
                     if e.is_timeout() {

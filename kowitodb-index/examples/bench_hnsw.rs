@@ -138,7 +138,7 @@ fn main() {
         percentile(&latencies_us, 95.0),
         percentile(&latencies_us, 99.0),
     );
-    println!("  throughput ~{:.0} queries/s (single-threaded)", qps);
+    println!("  throughput ~{qps:.0} queries/s (single-threaded)");
 
     // Compression variants (binary, Matryoshka) are evaluated on a *clustered*
     // dataset, which is representative of real embeddings (true neighbors are

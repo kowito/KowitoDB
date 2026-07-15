@@ -79,13 +79,13 @@ impl ExecutionPlan {
         for (i, step) in self.steps.iter().enumerate() {
             out.push_str(&format!("  {}. {:?}", i + 1, step.step_type));
             if let Some(ref idx) = step.index {
-                out.push_str(&format!(" [index={}]", idx));
+                out.push_str(&format!(" [index={idx}]"));
             }
             if let Some(ref q) = step.query {
-                out.push_str(&format!(" \"{}\"", q));
+                out.push_str(&format!(" \"{q}\""));
             }
             if let Some(limit) = step.limit {
-                out.push_str(&format!(" limit={}", limit));
+                out.push_str(&format!(" limit={limit}"));
             }
             out.push('\n');
         }

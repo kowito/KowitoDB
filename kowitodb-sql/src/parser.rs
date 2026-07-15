@@ -19,8 +19,7 @@ pub fn parse(sql: &str) -> Result<SqlStatement, SqlError> {
     if !table_name.eq_ignore_ascii_case("knowledge") && !table_name.eq_ignore_ascii_case("objects")
     {
         return Err(SqlError::Parse(format!(
-            "Unknown table '{}'. Use 'knowledge' or 'objects'.",
-            table_name
+            "Unknown table '{table_name}'. Use 'knowledge' or 'objects'."
         )));
     }
 
@@ -62,7 +61,7 @@ fn split_keyword<'a>(s: &'a str, keyword: &str) -> Result<(&'a str, &'a str), Sq
         i += 1;
     }
 
-    Err(SqlError::Parse(format!("Expected keyword '{}'", keyword)))
+    Err(SqlError::Parse(format!("Expected keyword '{keyword}'")))
 }
 
 fn parse_columns(s: &str) -> Result<Vec<SelectColumn>, SqlError> {
@@ -102,7 +101,7 @@ fn parse_rest(s: &str) -> Result<(&str, Option<&str>, Option<usize>), SqlError> 
         Some(
             limit_val
                 .parse::<usize>()
-                .map_err(|_| SqlError::Parse(format!("Invalid LIMIT: {}", limit_val)))?,
+                .map_err(|_| SqlError::Parse(format!("Invalid LIMIT: {limit_val}")))?,
         )
     } else {
         None
@@ -203,7 +202,7 @@ fn parse_single_where(s: &str) -> Result<WhereClause, SqlError> {
         return parse_created_clause(s[10..].trim());
     }
 
-    Err(SqlError::Parse(format!("Unsupported WHERE: {}", s)))
+    Err(SqlError::Parse(format!("Unsupported WHERE: {s}")))
 }
 
 fn parse_metadata_clause(s: &str) -> Result<WhereClause, SqlError> {
@@ -222,7 +221,7 @@ fn parse_metadata_clause(s: &str) -> Result<WhereClause, SqlError> {
             substring: clean,
         });
     }
-    Err(SqlError::Parse(format!("Invalid metadata clause: {}", s)))
+    Err(SqlError::Parse(format!("Invalid metadata clause: {s}")))
 }
 
 fn parse_keyword_clause(s: &str) -> Result<WhereClause, SqlError> {
@@ -236,7 +235,7 @@ fn parse_keyword_clause(s: &str) -> Result<WhereClause, SqlError> {
         let clean = value.trim_matches('%').to_string();
         return Ok(WhereClause::KeywordContains { substring: clean });
     }
-    Err(SqlError::Parse(format!("Invalid keyword clause: {}", s)))
+    Err(SqlError::Parse(format!("Invalid keyword clause: {s}")))
 }
 
 fn parse_content_clause(s: &str) -> Result<WhereClause, SqlError> {
@@ -246,7 +245,7 @@ fn parse_content_clause(s: &str) -> Result<WhereClause, SqlError> {
         let clean = value.trim_matches('%').to_string();
         return Ok(WhereClause::ContentContains { substring: clean });
     }
-    Err(SqlError::Parse(format!("Invalid content clause: {}", s)))
+    Err(SqlError::Parse(format!("Invalid content clause: {s}")))
 }
 
 fn parse_importance_clause(s: &str) -> Result<WhereClause, SqlError> {
@@ -276,7 +275,7 @@ fn parse_importance_clause(s: &str) -> Result<WhereClause, SqlError> {
             value: parse(rest)?,
         });
     }
-    Err(SqlError::Parse(format!("Invalid importance clause: {}", s)))
+    Err(SqlError::Parse(format!("Invalid importance clause: {s}")))
 }
 
 fn parse_created_clause(s: &str) -> Result<WhereClause, SqlError> {
@@ -288,7 +287,7 @@ fn parse_created_clause(s: &str) -> Result<WhereClause, SqlError> {
         let value = extract_string_value(rest)?;
         return Ok(WhereClause::CreatedBefore { timestamp: value });
     }
-    Err(SqlError::Parse(format!("Invalid created_at clause: {}", s)))
+    Err(SqlError::Parse(format!("Invalid created_at clause: {s}")))
 }
 
 fn find_operator(s: &str, op: &str) -> Option<usize> {

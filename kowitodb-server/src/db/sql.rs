@@ -107,7 +107,7 @@ impl KowitoDBEngine {
                 self.content_cache.insert(*id, val.clone());
                 val
             } else {
-                format!("<Object {}>", id)
+                format!("<Object {id}>")
             };
 
             loaded.push(LoadedResult {

@@ -256,7 +256,7 @@ impl KowitoDBEngine {
             let sources: Vec<String> = r
                 .sources
                 .iter()
-                .map(|s| format!("{:?}", s).to_lowercase())
+                .map(|s| format!("{s:?}").to_lowercase())
                 .collect();
 
             let mut metadata = HashMap::new();

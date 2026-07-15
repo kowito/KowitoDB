@@ -43,10 +43,10 @@ impl FullTextIndex {
 
         let index = if index_path.join("meta.json").exists() {
             Index::open_in_dir(&index_path)
-                .map_err(|e| KowitoError::Index(format!("Failed to open Tantivy index: {}", e)))?
+                .map_err(|e| KowitoError::Index(format!("Failed to open Tantivy index: {e}")))?
         } else {
             Index::create_in_dir(&index_path, schema.clone())
-                .map_err(|e| KowitoError::Index(format!("Failed to create Tantivy index: {}", e)))?
+                .map_err(|e| KowitoError::Index(format!("Failed to create Tantivy index: {e}")))?
         };
 
         let writer = index
@@ -131,7 +131,7 @@ impl FullTextIndex {
 
         let query = query_parser
             .parse_query(query_str)
-            .map_err(|e| KowitoError::Index(format!("Query parse error: {}", e)))?;
+            .map_err(|e| KowitoError::Index(format!("Query parse error: {e}")))?;
 
         let top_docs = reader
             .search(&query, &TopDocs::with_limit(limit))

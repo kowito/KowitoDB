@@ -35,8 +35,7 @@ impl VectorIndex {
             if let Some(existing) = dims.get(model) {
                 if *existing != dim {
                     return Err(KowitoError::InvalidInput(format!(
-                        "Embedding dimensionality mismatch for model '{}': expected {}, got {}",
-                        model, existing, dim
+                        "Embedding dimensionality mismatch for model '{model}': expected {existing}, got {dim}"
                     )));
                 }
             } else {

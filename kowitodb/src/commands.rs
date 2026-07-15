@@ -95,7 +95,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             let question = question.join(" ");
             let engine = open_engine(&storage_path, &index_path).await?;
 
-            println!("🤖 Asking: \"{}\"\n", question);
+            println!("🤖 Asking: \"{question}\"\n");
 
             let response = engine.ask(&question, max_results.clamp(1, 20)).await?;
 
@@ -121,7 +121,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                     );
                     println!("  ID: {}", r.id);
                     let preview: String = r.content.chars().take(200).collect();
-                    println!("  {}", preview);
+                    println!("  {preview}");
                     if r.content.len() > 200 {
                         println!("  ... ({} more chars)", r.content.len() - 200);
                     }
@@ -210,9 +210,9 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
 
             let id = engine.insert(obj).await?;
 
-            println!("✅ Inserted knowledge object: {}", id);
-            println!("   Keywords: {}", keywords_len);
-            println!("   Metadata keys: {}", metadata_len);
+            println!("✅ Inserted knowledge object: {id}");
+            println!("   Keywords: {keywords_len}");
+            println!("   Metadata keys: {metadata_len}");
         }
 
         Commands::Sql {
@@ -223,7 +223,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             let sql = query.join(" ");
             let engine = open_engine(&storage_path, &index_path).await?;
 
-            println!("📊 SQL: {}\n", sql);
+            println!("📊 SQL: {sql}\n");
 
             let results = engine.sql_query(&sql).await?;
 
@@ -234,7 +234,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                 for (i, r) in results.iter().enumerate() {
                     println!("  {}. {}", i + 1, r.id);
                     let preview: String = r.content.chars().take(150).collect();
-                    println!("     {}", preview);
+                    println!("     {preview}");
                     if r.content.len() > 150 {
                         println!("     ... ({} more chars)", r.content.len() - 150);
                     }
