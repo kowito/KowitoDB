@@ -45,6 +45,12 @@ impl KowitoDBService {
             max_results: max_results.clamp(1, i32::MAX as usize) as i32,
         }
     }
+
+    /// Record an error metric and translate a `KowitoError` into a gRPC `Status`.
+    fn err(&self, e: kowitodb_core::KowitoError) -> Status {
+        self.metrics.record_error();
+        map_err(e)
+    }
 }
 
 #[tonic::async_trait]
@@ -77,10 +83,7 @@ impl KowitoDb for KowitoDBService {
         let id =
             uuid::Uuid::parse_str(&req.id).map_err(|_| Status::invalid_argument("Invalid UUID"))?;
 
-        let obj = self.engine.get(id).await.map_err(|e| {
-            self.metrics.record_error();
-            map_err(e)
-        })?;
+        let obj = self.engine.get(id).await.map_err(|e| self.err(e))?;
 
         Ok(Response::new(proto::GetResponse {
             object: obj.map(knowledge_to_proto),
@@ -101,10 +104,11 @@ impl KowitoDb for KowitoDBService {
         let objects: Vec<_> = req.items.into_iter().map(insert_req_to_obj).collect();
         let count = objects.len();
 
-        let ids = self.engine.batch_insert(objects).await.map_err(|e| {
-            self.metrics.record_error();
-            map_err(e)
-        })?;
+        let ids = self
+            .engine
+            .batch_insert(objects)
+            .await
+            .map_err(|e| self.err(e))?;
 
         for _ in 0..count {
             self.metrics.record_insert();
@@ -130,10 +134,7 @@ impl KowitoDb for KowitoDBService {
             .engine
             .list(req.offset as usize, limit)
             .await
-            .map_err(|e| {
-                self.metrics.record_error();
-                map_err(e)
-            })?;
+            .map_err(|e| self.err(e))?;
 
         Ok(Response::new(proto::ListResponse {
             objects: objects.into_iter().map(knowledge_to_proto).collect(),
@@ -149,10 +150,7 @@ impl KowitoDb for KowitoDBService {
         let id =
             uuid::Uuid::parse_str(&req.id).map_err(|_| Status::invalid_argument("Invalid UUID"))?;
 
-        let existed = self.engine.delete(id).await.map_err(|e| {
-            self.metrics.record_error();
-            map_err(e)
-        })?;
+        let existed = self.engine.delete(id).await.map_err(|e| self.err(e))?;
 
         Ok(Response::new(proto::DeleteResponse { existed }))
     }
@@ -169,10 +167,7 @@ impl KowitoDb for KowitoDBService {
             .engine
             .ask_filtered(&req.query, max_results, None, &req.metadata_filter)
             .await
-            .map_err(|e| {
-                self.metrics.record_error();
-                map_err(e)
-            })?;
+            .map_err(|e| self.err(e))?;
         self.metrics.record_ask(start.elapsed());
 
         let results: Vec<proto::SearchResult> = response
@@ -208,10 +203,7 @@ impl KowitoDb for KowitoDBService {
             .engine
             .ask_filtered(&req.question, max_results, budget, &req.metadata_filter)
             .await
-            .map_err(|e| {
-                self.metrics.record_error();
-                map_err(e)
-            })?;
+            .map_err(|e| self.err(e))?;
         self.metrics.record_ask(start.elapsed());
 
         Ok(Response::new(proto::AskResponse {
@@ -244,10 +236,7 @@ impl KowitoDb for KowitoDBService {
         obj.keywords = req.keywords;
         obj.importance = req.importance.clamp(0.0, 1.0);
 
-        let id = self.engine.insert(obj).await.map_err(|e| {
-            self.metrics.record_error();
-            map_err(e)
-        })?;
+        let id = self.engine.insert(obj).await.map_err(|e| self.err(e))?;
 
         self.metrics.record_remember();
         info!("ai.remember(): stored {}", id);
@@ -260,10 +249,7 @@ impl KowitoDb for KowitoDBService {
         &self,
         _request: Request<proto::StatsRequest>,
     ) -> Result<Response<proto::StatsResponse>, Status> {
-        let stats = self.engine.stats().await.map_err(|e| {
-            self.metrics.record_error();
-            map_err(e)
-        })?;
+        let stats = self.engine.stats().await.map_err(|e| self.err(e))?;
 
         let (cache_entries, cache_hit_rate) = stats
             .cache_stats
@@ -303,10 +289,7 @@ impl KowitoDb for KowitoDBService {
                 req.change_description,
             )
             .await
-            .map_err(|e| {
-                self.metrics.record_error();
-                map_err(e)
-            })?;
+            .map_err(|e| self.err(e))?;
 
         Ok(Response::new(match version {
             Some(v) => proto::UpdateResponse {
@@ -348,10 +331,7 @@ impl KowitoDb for KowitoDBService {
             .engine
             .remember_turn(&req.session_id, &req.role, req.content)
             .await
-            .map_err(|e| {
-                self.metrics.record_error();
-                map_err(e)
-            })?;
+            .map_err(|e| self.err(e))?;
 
         Ok(Response::new(proto::RecordTurnResponse { turn_count }))
     }
