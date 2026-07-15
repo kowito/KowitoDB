@@ -1,5 +1,8 @@
 //! Subcommand dispatch for the kowitodb binary.
 
+use std::path::Path;
+
+use anyhow::Context;
 use clap::CommandFactory;
 use tracing::info;
 
@@ -7,6 +10,13 @@ use kowitodb_core::KnowledgeObject;
 use kowitodb_server::{serve_gateway, serve_with_config, KowitoDBEngine, ServerConfig};
 
 use crate::cli::{Cli, Commands, StorageKind};
+
+/// Open the on-disk engine (open + reindex), adding CLI-friendly error context.
+async fn open_engine(storage_path: &Path, index_path: &Path) -> anyhow::Result<KowitoDBEngine> {
+    KowitoDBEngine::open(storage_path, index_path)
+        .await
+        .context("Failed to open database")
+}
 
 /// Execute the parsed subcommand.
 pub async fn run(command: Commands) -> anyhow::Result<()> {
@@ -48,7 +58,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                     }
                 }
             }
-            .map_err(|e| anyhow::anyhow!("Failed to initialize engine: {}", e))?;
+            .context("Failed to initialize engine")?;
 
             let config = ServerConfig {
                 api_key,
@@ -83,16 +93,11 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             index_path,
         } => {
             let question = question.join(" ");
-            let engine = KowitoDBEngine::open(&storage_path, &index_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+            let engine = open_engine(&storage_path, &index_path).await?;
 
             println!("🤖 Asking: \"{}\"\n", question);
 
-            let response = engine
-                .ask(&question, max_results.clamp(1, 20))
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let response = engine.ask(&question, max_results.clamp(1, 20)).await?;
 
             println!("Detected intent: {}", response.detected_intent);
             println!(
@@ -138,7 +143,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             index_path,
         } => {
             let engine = KowitoDBEngine::new(&storage_path, &index_path)
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+                .context("Failed to open database")?;
 
             let (text, file_kws, file_meta) = if let Some(path) = file {
                 let raw = std::fs::read_to_string(&path)?;
@@ -203,10 +208,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                 obj = obj.with_metadata(k.clone(), v.clone());
             }
 
-            let id = engine
-                .insert(obj)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let id = engine.insert(obj).await?;
 
             println!("✅ Inserted knowledge object: {}", id);
             println!("   Keywords: {}", keywords_len);
@@ -219,16 +221,11 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             index_path,
         } => {
             let sql = query.join(" ");
-            let engine = KowitoDBEngine::open(&storage_path, &index_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+            let engine = open_engine(&storage_path, &index_path).await?;
 
             println!("📊 SQL: {}\n", sql);
 
-            let results = engine
-                .sql_query(&sql)
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let results = engine.sql_query(&sql).await?;
 
             if results.is_empty() {
                 println!("  (no results)");
@@ -250,14 +247,9 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             storage_path,
             index_path,
         } => {
-            let engine = KowitoDBEngine::open(&storage_path, &index_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+            let engine = open_engine(&storage_path, &index_path).await?;
 
-            let stats = engine
-                .stats()
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let stats = engine.stats().await?;
 
             println!("📊 KowitoDB Statistics");
             println!("======================");
@@ -295,7 +287,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
 /// queries — a zero-setup tour of what KowitoDB does.
 async fn run_demo() -> anyhow::Result<()> {
     println!("🚀 KowitoDB demo — in-memory, no server, no setup.\n");
-    let engine = KowitoDBEngine::new_in_memory().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let engine = KowitoDBEngine::new_in_memory()?;
 
     let facts: &[(&str, &[&str], &str, f32)] = &[
         (
@@ -328,10 +320,7 @@ async fn run_demo() -> anyhow::Result<()> {
             .with_keywords(kws.iter().map(|s| s.to_string()).collect())
             .with_metadata("company", *company)
             .with_importance(*importance);
-        engine
-            .insert(obj)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        engine.insert(obj).await?;
     }
     println!("Seeded {} knowledge objects.\n", facts.len());
 
@@ -340,10 +329,7 @@ async fn run_demo() -> anyhow::Result<()> {
         "What happened with churn?",
     ] {
         println!("❯ ai.ask(\"{q}\")");
-        let resp = engine
-            .ask(q, 3)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let resp = engine.ask(q, 3).await?;
         println!("  intent: {}", resp.detected_intent);
         for r in &resp.results {
             println!(
@@ -357,8 +343,7 @@ async fn run_demo() -> anyhow::Result<()> {
     println!("❯ sql: SELECT content FROM knowledge WHERE importance >= 0.8");
     let rows = engine
         .sql_select("SELECT content FROM knowledge WHERE importance >= 0.8")
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        .await?;
     for row in &rows {
         if let Some(c) = row.get("content") {
             println!("  • {c}");

@@ -55,6 +55,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read a boolean env flag that defaults to ON — disabled only by `0`/`false`.
+fn env_flag_on(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
+        .unwrap_or(true)
+}
+
 /// Matryoshka adaptive-retrieval coarse dimension, via
 /// `KOWITODB_VECTOR_COARSE_DIM=<n>`. When set, the index navigates on the first
 /// `n` dimensions and refines top-k at full precision. Requires MRL embeddings.
@@ -83,9 +90,7 @@ const CONFIDENCE_THRESHOLD: f32 = 0.35;
 /// Whether the CRAG-style corrective gate is enabled (default on; disable with
 /// `KOWITODB_CORRECTIVE_RETRIEVAL=0`).
 fn corrective_retrieval_enabled() -> bool {
-    std::env::var("KOWITODB_CORRECTIVE_RETRIEVAL")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
-        .unwrap_or(true)
+    env_flag_on("KOWITODB_CORRECTIVE_RETRIEVAL")
 }
 
 /// Estimate retrieval confidence in [0, 1] from the ranked results.
@@ -112,26 +117,20 @@ fn retrieval_confidence(ranked: &[RankedResult], requested: usize) -> f32 {
 /// Whether Contextual Retrieval augmentation is enabled (default on; disable
 /// with `KOWITODB_CONTEXTUAL_RETRIEVAL=0`).
 fn contextual_retrieval_enabled() -> bool {
-    std::env::var("KOWITODB_CONTEXTUAL_RETRIEVAL")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
-        .unwrap_or(true)
+    env_flag_on("KOWITODB_CONTEXTUAL_RETRIEVAL")
 }
 
 /// Whether to use the LLM to generate per-object context at ingest (the
 /// faithful Contextual Retrieval; opt-in via `KOWITODB_LLM_CONTEXTUAL=1` since
 /// it issues one LLM call per insert). Off by default.
 fn llm_contextual_enabled() -> bool {
-    std::env::var("KOWITODB_LLM_CONTEXTUAL")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
-        .unwrap_or(false)
+    env_flag("KOWITODB_LLM_CONTEXTUAL")
 }
 
 /// Whether to auto-enrich the graph with `co_mentions` edges at ingest
 /// (LazyGraphRAG-style; default on, disable with `KOWITODB_AUTO_GRAPH=0`).
 fn auto_graph_enabled() -> bool {
-    std::env::var("KOWITODB_AUTO_GRAPH")
-        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE"))
-        .unwrap_or(true)
+    env_flag_on("KOWITODB_AUTO_GRAPH")
 }
 
 /// Max prior objects linked per shared entity at ingest (bounds fan-out).
