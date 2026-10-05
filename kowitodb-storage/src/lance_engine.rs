@@ -6,7 +6,7 @@
 //! dataset, implementing the same [`StorageBackend`] contract as the default
 //! sled engine so it is a drop-in alternative.
 //!
-//! `put` uses delete-then-append upsert semantics keyed on `id`; reads use Lance
+//! `put` is an atomic merge-insert (upsert) keyed on `id`; reads use Lance
 //! scans. The dataset is created lazily on first write.
 
 use std::sync::Arc;
@@ -14,7 +14,9 @@ use std::sync::Arc;
 use arrow::array::{Array, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use kowitodb_core::{KowitoError, ObjectId, Result};
-use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance::dataset::{
+    Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
@@ -34,7 +36,14 @@ impl LanceStorage {
     pub async fn open(uri: impl Into<String>) -> Result<Self> {
         let uri = uri.into();
         let schema = Self::arrow_schema();
-        let existing = Dataset::open(&uri).await.ok();
+        // Only a missing dataset means "create on first write"; any other error
+        // (permissions, a corrupt manifest, an unreachable object store) is
+        // surfaced instead of silently presenting an empty database.
+        let existing = match Dataset::open(&uri).await {
+            Ok(ds) => Some(ds),
+            Err(lance::Error::DatasetNotFound { .. }) | Err(lance::Error::NotFound { .. }) => None,
+            Err(e) => return Err(map_lance(e)),
+        };
         if existing.is_some() {
             info!("Opened existing Lance dataset at {}", uri);
         } else {
@@ -138,13 +147,22 @@ impl StorageBackend for LanceStorage {
         let mut guard = self.dataset.write().await;
 
         match guard.as_mut() {
-            // Dataset exists: upsert via delete-then-append.
+            // Dataset exists: upsert keyed on `id` as a single commit, so a crash
+            // or failed write can never leave the object deleted.
             Some(ds) => {
-                ds.delete(&format!("id = '{id}'"))
+                let reader = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
+                let mut builder =
+                    MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["id".to_string()])
+                        .map_err(map_lance)?;
+                let (updated, _stats) = builder
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .map_err(map_lance)?
+                    .execute_reader(reader)
                     .await
                     .map_err(map_lance)?;
-                let reader = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
-                ds.append(reader, None).await.map_err(map_lance)?;
+                *ds = Arc::unwrap_or_clone(updated);
             }
             // First write: create the dataset.
             None => {

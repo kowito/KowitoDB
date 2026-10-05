@@ -9,6 +9,9 @@ use crate::metrics::MetricsCollector;
 use crate::proto;
 use crate::proto::kowito_db_server::KowitoDb;
 
+/// Most objects one `List` call returns.
+const MAX_LIST_LIMIT: usize = 1_000;
+
 /// Upper bound on `batch_insert` items per request — bounds the per-request work
 /// (and memory) so a single call can't be used to exhaust the server.
 const MAX_BATCH_ITEMS: usize = 10_000;
@@ -120,10 +123,11 @@ impl KowitoDb for KowitoDBService {
         request: Request<proto::ListRequest>,
     ) -> Result<Response<proto::ListResponse>, Status> {
         let req = request.into_inner();
+        // Bounded so one request can't load (and serialize) the whole database.
         let limit = if req.limit == 0 {
             self.max_results as usize
         } else {
-            req.limit as usize
+            (req.limit as usize).min(MAX_LIST_LIMIT)
         };
 
         let (objects, total) = self
@@ -420,7 +424,7 @@ fn insert_req_to_obj(req: proto::InsertRequest) -> kowitodb_core::KnowledgeObjec
 }
 
 /// Convert a `KnowledgeObject` to its proto form (shared by Get/List).
-fn knowledge_to_proto(o: kowitodb_core::KnowledgeObject) -> proto::KnowledgeObject {
+pub(crate) fn knowledge_to_proto(o: kowitodb_core::KnowledgeObject) -> proto::KnowledgeObject {
     proto::KnowledgeObject {
         id: o.id.to_string(),
         content: o.content,
@@ -429,10 +433,19 @@ fn knowledge_to_proto(o: kowitodb_core::KnowledgeObject) -> proto::KnowledgeObje
             .into_iter()
             .map(|(k, v)| (k, proto::EmbeddingVector { values: v }))
             .collect(),
+        // String values go out as-is; `Value::to_string` would JSON-quote them
+        // ("acme" → "\"acme\""), and the quotes would compound on every
+        // cluster read-repair that writes the value back.
         metadata: o
             .metadata
             .into_iter()
-            .map(|(k, v)| (k, v.to_string()))
+            .map(|(k, v)| {
+                let v = match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                (k, v)
+            })
             .collect(),
         keywords: o.keywords,
         relationships: o

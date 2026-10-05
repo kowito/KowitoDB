@@ -7,7 +7,7 @@ and runs natural-language queries.
 
 Usage:
     # Terminal 1: Start the server
-    cargo run -- serve
+    cargo run -p kowitodb -- serve
 
     # Terminal 2: Run the demo
     source .venv/bin/activate
@@ -20,7 +20,11 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sdk", "python"))
 
-from kowitodb import KowitoDBClient
+import grpc  # noqa: E402
+
+from kowitodb import KowitoDBClient  # noqa: E402
+
+ADDRESS = os.environ.get("KOWITODB_ADDRESS", "localhost:50051")
 
 
 def main():
@@ -29,32 +33,32 @@ def main():
     print("=" * 60)
     print()
 
-    # Connect
-    print("Connecting to KowitoDB server at localhost:50051...")
-    db = KowitoDBClient("localhost:50051")
+    # Connect. gRPC channels connect lazily, so make a real (cheap) RPC to find
+    # out whether the server is reachable.
+    print(f"Connecting to KowitoDB server at {ADDRESS}...")
+    db = KowitoDBClient(
+        ADDRESS, api_key=os.environ.get("KOWITODB_API_KEY"), timeout=10.0
+    )
 
     try:
-        db.connect()
-    except Exception as e:
-        print(f"⚠️  Could not connect to server: {e}")
+        stats = db.stats()
+    except grpc.RpcError as e:
+        print(f"⚠️  Could not connect to server: {e.code().name}: {e.details()}")
         print()
-        print("Start the server first:")
-        print("  cargo run -- serve")
+        if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+            print("The server requires an API key: set KOWITODB_API_KEY.")
+        else:
+            print("Start the server first:")
+            print("  cargo run -p kowitodb -- serve")
         print()
         print("Then run this demo again.")
+        db.close()
         return
 
     print("✅ Connected.")
-    print()
-
-    # Check existing stats
-    try:
-        stats = db.stats()
-        print(
-            f"📊 Current state: {stats.total_objects} objects, {stats.vector_count} vectors"
-        )
-    except Exception:
-        pass
+    print(
+        f"📊 Current state: {stats.total_objects} objects, {stats.vector_count} vectors"
+    )
     print()
 
     # Insert sample knowledge
@@ -182,24 +186,28 @@ def main():
             print(f"  ❌ Error: {e}")
         print()
 
-    # Step 3: SQL query
+    # Step 3: SQL query (DataFusion). `metadata` is a JSON-encoded string column,
+    # so match keys/values with LIKE. Rows come back as {column: value} dicts.
     print("Step 3: SQL query...")
     print()
-    print(
-        "  SELECT * FROM knowledge WHERE metadata.stage = 'series_a' AND metadata.renewed = 'true'"
+    query = (
+        "SELECT id, content, importance FROM knowledge "
+        "WHERE metadata LIKE '%\"stage\":\"series_a\"%' "
+        "AND metadata LIKE '%\"renewed\":\"true\"%' "
+        "ORDER BY importance DESC"
     )
+    print(f"  {query}")
     try:
-        results = db.sql(
-            "SELECT * FROM knowledge WHERE metadata.stage = 'series_a' AND metadata.renewed = 'true'"
-        )
-        for r in results:
-            print(f"  {r.id[:8]}... [{r.relevance_score:.2f}] {r.content[:80]}...")
-        if not results:
+        rows = db.sql(query)
+        for row in rows:
             print(
-                "  (no results — SQL routes through search; use metadata index directly)"
+                f"  {row['id'][:8]}... [importance {float(row['importance']):.2f}] "
+                f"{row['content'][:80]}..."
             )
-    except Exception as e:
-        print(f"  ❌ Error: {e}")
+        if not rows:
+            print("  (no results)")
+    except grpc.RpcError as e:
+        print(f"  ❌ Error: {e.details()}")
     print()
 
     # Step 4: Stats
@@ -218,9 +226,10 @@ def main():
     print("  Demo complete. 🎉")
     print()
     print("  Try your own queries:")
-    print('    cargo run -- ask "<your question>"')
-    print('    cargo run -- sql "SELECT * FROM knowledge WHERE ..."')
+    print('    cargo run -p kowitodb -- ask "<your question>"')
+    print('    cargo run -p kowitodb -- sql "SELECT * FROM knowledge WHERE ..."')
     print("=" * 60)
+    db.close()
 
 
 if __name__ == "__main__":

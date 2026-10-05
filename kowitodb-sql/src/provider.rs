@@ -16,7 +16,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::execution::context::SessionContext;
+use datafusion::execution::context::{SQLOptions, SessionContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
@@ -169,13 +169,21 @@ impl SqlContext {
         Ok(Self { ctx })
     }
 
-    /// Run a SQL query and collect the resulting record batches.
+    /// Run a read-only SQL query and collect the resulting record batches.
+    ///
+    /// DDL (`CREATE EXTERNAL TABLE`, ...), DML (`INSERT`, `COPY ... TO`) and
+    /// statements (`SET`, ...) are rejected, so a query can't read or write
+    /// arbitrary files or change the session.
     pub async fn sql(&self, query: &str) -> DfResult<Vec<RecordBatch>> {
-        let df = self.ctx.sql(query).await?;
+        let read_only = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let df = self.ctx.sql_with_options(query, read_only).await?;
         df.collect().await
     }
 
-    /// Run a SQL query and return rows as ordered column-name → value maps.
+    /// Run a SQL query and return rows as column-name → value maps.
     ///
     /// All values are stringified for transport-agnostic consumption; numeric
     /// and other typed columns are rendered via their Arrow display formatting.
@@ -296,5 +304,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn writes_and_ddl_are_rejected() {
+        let ctx = ctx_with_objects().await;
+        for q in [
+            "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/etc/passwd'",
+            "COPY (SELECT 1) TO '/tmp/kowitodb-should-not-exist.csv'",
+            "INSERT INTO knowledge SELECT * FROM knowledge",
+            "SET datafusion.execution.batch_size = 1",
+        ] {
+            assert!(ctx.sql(q).await.is_err(), "{q} should be rejected");
+        }
+        assert!(ctx.sql("SELECT COUNT(*) FROM knowledge").await.is_ok());
     }
 }

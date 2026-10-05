@@ -53,6 +53,25 @@ pub fn filter_matches(obj: &StoredObject, filter: &StorageFilter) -> bool {
             return false;
         }
     }
+    if let Some(ref key) = filter.metadata_key {
+        let metadata: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&obj.metadata_json).unwrap_or_default();
+        let Some(value) = metadata.get(key) else {
+            return false;
+        };
+        if let Some(ref expected) = filter.metadata_value {
+            let matches = match value {
+                serde_json::Value::String(s) => s == expected,
+                other => {
+                    let rendered = other.to_string();
+                    rendered == *expected
+                }
+            };
+            if !matches {
+                return false;
+            }
+        }
+    }
     if let Some(min_imp) = filter.min_importance {
         if obj.importance < min_imp {
             return false;
@@ -76,6 +95,8 @@ pub fn filter_matches(obj: &StoredObject, filter: &StorageFilter) -> bool {
 }
 
 /// Defines operations the storage engine must support.
+// `async_trait` marks its boxed futures `#[must_use]`, which newer clippy flags.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Insert or update a stored object.

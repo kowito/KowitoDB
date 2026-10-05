@@ -17,6 +17,7 @@
 use std::path::Path;
 
 use kowitodb_core::{Embedding, ObjectId};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::hnsw::{HnswIndex, HnswParams};
@@ -24,6 +25,9 @@ use crate::hnsw::{HnswIndex, HnswParams};
 /// An HNSW index partitioned into independent shards.
 pub struct ShardedHnswIndex {
     shards: Vec<HnswIndex>,
+    /// Dimension shared by every shard (set by the first insert). Checked
+    /// here because each shard only sees its own vectors.
+    dim: Mutex<Option<usize>>,
 }
 
 impl ShardedHnswIndex {
@@ -31,7 +35,10 @@ impl ShardedHnswIndex {
     pub fn new(num_shards: usize, params: HnswParams) -> Self {
         let n = num_shards.max(1);
         let shards = (0..n).map(|_| HnswIndex::new(params.clone())).collect();
-        Self { shards }
+        Self {
+            shards,
+            dim: Mutex::new(None),
+        }
     }
 
     /// Number of shards.
@@ -41,7 +48,26 @@ impl ShardedHnswIndex {
 
     /// The established vector dimension across shards (set by the first insert).
     pub fn dimension(&self) -> Option<usize> {
-        self.shards.iter().find_map(|s| s.dimension())
+        *self.dim.lock()
+    }
+
+    /// Claim `len` as the index dimension, or check it matches the established
+    /// one. Returns false (and logs) on a mismatch.
+    fn accept_dimension(&self, len: usize, id: ObjectId) -> bool {
+        let mut dim = self.dim.lock();
+        match *dim {
+            None => {
+                *dim = Some(len);
+                true
+            }
+            Some(d) if d == len => true,
+            Some(d) => {
+                tracing::warn!(
+                    "vector index: skipping {len}-dim vector for {id} (index is {d}-dim)"
+                );
+                false
+            }
+        }
     }
 
     #[inline]
@@ -51,7 +77,9 @@ impl ShardedHnswIndex {
 
     /// Insert a single vector (routed to its shard).
     pub fn insert(&self, id: ObjectId, vector: Embedding) {
-        self.shards[self.shard_of(id)].insert(id, vector);
+        if self.accept_dimension(vector.len(), id) {
+            self.shards[self.shard_of(id)].insert(id, vector);
+        }
     }
 
     /// Remove a vector by id.
@@ -64,6 +92,9 @@ impl ShardedHnswIndex {
         let n = self.shards.len();
         let mut groups: Vec<Vec<(ObjectId, Embedding)>> = (0..n).map(|_| Vec::new()).collect();
         for (id, vector) in items {
+            if !self.accept_dimension(vector.len(), id) {
+                continue;
+            }
             let shard = (id.as_u128() % n as u128) as usize;
             groups[shard].push((id, vector));
         }
@@ -80,12 +111,15 @@ impl ShardedHnswIndex {
     /// Query all shards in parallel and merge their local top-k into a global
     /// top-k. Higher score = closer.
     pub fn search(&self, query: &Embedding, k: usize) -> Vec<(ObjectId, f32)> {
+        if self.dimension().is_some_and(|d| d != query.len()) {
+            return Vec::new();
+        }
         let mut merged: Vec<(ObjectId, f32)> = self
             .shards
             .par_iter()
             .flat_map_iter(|shard| shard.search(query, k))
             .collect();
-        merged.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         merged.truncate(k);
         merged
     }
@@ -108,11 +142,7 @@ impl ShardedHnswIndex {
             .map(|s| s.to_bytes())
             .collect::<std::io::Result<_>>()?;
         let bytes = bincode::serialize(&shard_bytes).map_err(std::io::Error::other)?;
-        let path = path.as_ref();
-        let tmp = path.with_extension("bin.tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::write_atomic(path.as_ref(), &bytes)
     }
 
     /// Load a sharded index from `path`, or `Ok(None)` if it does not exist.
@@ -127,8 +157,25 @@ impl ShardedHnswIndex {
         let shards = shard_bytes
             .iter()
             .map(|b| HnswIndex::from_bytes(b))
-            .collect::<std::io::Result<_>>()?;
-        Ok(Some(Self { shards }))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if shards.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vector index snapshot has no shards",
+            ));
+        }
+        let mut dims = shards.iter().filter_map(|s| s.dimension());
+        let dim = dims.next();
+        if dims.any(|d| Some(d) != dim) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vector index snapshot shards disagree on dimension",
+            ));
+        }
+        Ok(Some(Self {
+            shards,
+            dim: Mutex::new(dim),
+        }))
     }
 }
 

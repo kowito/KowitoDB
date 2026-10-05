@@ -6,6 +6,9 @@ PROTO     := kowitodb.proto
 PB_DIR    := kowitodbpb
 GO_MODULE := github.com/kowito/kowitodb/sdk/go
 GO_PKG    := $(GO_MODULE)/$(PB_DIR)
+# Any protoc works, e.g. `make generate PROTOC="python -m grpc_tools.protoc"`
+# (the plugins are found on $PATH / $GOBIN).
+PROTOC    ?= protoc
 
 .PHONY: all generate tools build test fmt vet tidy clean
 
@@ -19,7 +22,7 @@ tools:
 ## generate: regenerate the protobuf + gRPC Go code from the proto.
 generate:
 	mkdir -p $(PB_DIR)
-	protoc \
+	$(PROTOC) \
 		--proto_path=$(PROTO_DIR) \
 		--go_out=$(PB_DIR) \
 		--go_opt=paths=source_relative \

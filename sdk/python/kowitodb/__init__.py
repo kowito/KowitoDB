@@ -29,8 +29,12 @@ Usage:
     results = db.ask("funding rounds", metadata_filter={"company": "Anthropic"})
     hits = db.search("funding", top_k=10, metadata_filter={"company": "Anthropic"})
 
-    # SQL queries (returns a list of {column: value} dicts)
-    rows = db.sql("SELECT * FROM knowledge WHERE metadata.company = 'OpenAI'")
+    # SQL queries (DataFusion; returns a list of {column: value} dicts).
+    # `metadata`/`keywords` are JSON-encoded string columns — match with LIKE.
+    rows = db.sql('''
+        SELECT id, content FROM knowledge
+        WHERE metadata LIKE '%"company":"OpenAI"%'
+    ''')
     for row in rows:
         print(row)
 
@@ -40,15 +44,213 @@ Usage:
     # Agent conversation memory
     db.record_turn("session-1", "user", "What is KowitoDB?")
     turns = db.get_session("session-1")
+
+Authentication, deadlines and TLS:
+
+    db = KowitoDBClient(
+        "db.example.com:50051",
+        api_key="...",      # sent as `authorization: Bearer <key>` on every RPC
+        timeout=30.0,       # default per-RPC deadline in seconds (None = no deadline)
+        secure=True,        # TLS using the system roots (or pass root_certificates=
+                            # / credentials=grpc.ssl_channel_credentials(...))
+    )
 """
 
+import collections
+import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import grpc
+import grpc.aio
 
 from . import kowitodb_pb2 as pb
 from . import kowitodb_pb2_grpc as pb_grpc
+
+DEFAULT_TIMEOUT: Optional[float] = 30.0
+"""Default per-RPC deadline (seconds) applied when a client is created without
+an explicit ``timeout``."""
+
+
+# ---- Channel construction: auth metadata + default deadline ----
+
+
+class _CallDetails(
+    collections.namedtuple(
+        "_CallDetails",
+        ("method", "timeout", "metadata", "credentials", "wait_for_ready", "compression"),
+    ),
+    grpc.ClientCallDetails,
+):
+    """Mutable-by-copy ``grpc.ClientCallDetails`` used by the sync interceptor."""
+
+
+def _merge_metadata(existing, extra: Sequence[Tuple[str, str]]):
+    """Return ``existing`` metadata plus ``extra`` (caller-supplied keys win)."""
+    merged = list(existing or ())
+    present = {k.lower() for k, _ in merged}
+    merged.extend((k, v) for k, v in extra if k not in present)
+    return merged
+
+
+class _ClientInterceptor(
+    grpc.UnaryUnaryClientInterceptor,
+    grpc.UnaryStreamClientInterceptor,
+    grpc.StreamUnaryClientInterceptor,
+    grpc.StreamStreamClientInterceptor,
+):
+    """Adds the API key and a default deadline to every RPC (sync channel)."""
+
+    def __init__(self, metadata: Sequence[Tuple[str, str]], timeout: Optional[float]):
+        self._metadata = list(metadata)
+        self._timeout = timeout
+
+    def _details(self, d):
+        return _CallDetails(
+            d.method,
+            d.timeout if d.timeout is not None else self._timeout,
+            _merge_metadata(d.metadata, self._metadata),
+            d.credentials,
+            getattr(d, "wait_for_ready", None),
+            getattr(d, "compression", None),
+        )
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        return continuation(self._details(client_call_details), request)
+
+    def intercept_unary_stream(self, continuation, client_call_details, request):
+        return continuation(self._details(client_call_details), request)
+
+    def intercept_stream_unary(self, continuation, client_call_details, request_iterator):
+        return continuation(self._details(client_call_details), request_iterator)
+
+    def intercept_stream_stream(self, continuation, client_call_details, request_iterator):
+        return continuation(self._details(client_call_details), request_iterator)
+
+
+class _AioClientInterceptor(
+    grpc.aio.UnaryUnaryClientInterceptor,
+    grpc.aio.UnaryStreamClientInterceptor,
+):
+    """Adds the API key and a default deadline to every RPC (asyncio channel)."""
+
+    def __init__(self, metadata: Sequence[Tuple[str, str]], timeout: Optional[float]):
+        self._metadata = list(metadata)
+        self._timeout = timeout
+
+    def _details(self, d):
+        md = grpc.aio.Metadata(*_merge_metadata(d.metadata, self._metadata))
+        return grpc.aio.ClientCallDetails(
+            method=d.method,
+            timeout=d.timeout if d.timeout is not None else self._timeout,
+            metadata=md,
+            credentials=d.credentials,
+            wait_for_ready=d.wait_for_ready,
+        )
+
+    async def intercept_unary_unary(self, continuation, client_call_details, request):
+        return await continuation(self._details(client_call_details), request)
+
+    async def intercept_unary_stream(self, continuation, client_call_details, request):
+        return await continuation(self._details(client_call_details), request)
+
+
+def _auth_metadata(api_key: Optional[str]) -> List[Tuple[str, str]]:
+    # The server accepts `authorization: Bearer <key>` (or `x-api-key: <key>`).
+    return [("authorization", f"Bearer {api_key}")] if api_key else []
+
+
+def _channel_credentials(
+    secure: bool,
+    root_certificates: Optional[bytes],
+    credentials: Optional[grpc.ChannelCredentials],
+) -> Optional[grpc.ChannelCredentials]:
+    if credentials is not None:
+        return credentials
+    if secure or root_certificates is not None:
+        return grpc.ssl_channel_credentials(root_certificates=root_certificates)
+    return None
+
+
+def _str_map(d: Optional[Dict[Any, Any]]) -> Dict[str, str]:
+    """Metadata and metadata filters are string→string on the wire; stringify
+    non-string values (e.g. ``{"year": 2024}`` → ``{"year": "2024"}``)."""
+    return {str(k): v if isinstance(v, str) else str(v) for k, v in (d or {}).items()}
+
+
+def _check_id(object_id: Optional[str]) -> Optional[str]:
+    """Validate an optional caller-assigned object id (must be a UUID)."""
+    if not object_id:
+        return None
+    try:
+        uuid.UUID(str(object_id))
+    except ValueError:
+        raise ValueError(
+            f"KowitoDB object ids must be UUIDs, got {object_id!r} "
+            "(omit the id to let the server assign one)"
+        ) from None
+    return str(object_id)
+
+
+def _insert_request(
+    content: str,
+    keywords=None,
+    metadata=None,
+    relationships=None,
+    importance: float = 0.5,
+    id: Optional[str] = None,
+) -> "pb.InsertRequest":
+    rels = [
+        pb.RelationshipInput(relation_type=r[0], target_id=r[1])
+        for r in (relationships or [])
+    ]
+    req = pb.InsertRequest(
+        content=content,
+        keywords=keywords or [],
+        metadata=_str_map(metadata),
+        relationships=rels,
+        importance=importance,
+    )
+    object_id = _check_id(id)
+    if object_id is not None:
+        req.id = object_id
+    return req
+
+
+def _remember_request(
+    content: str,
+    keywords=None,
+    metadata=None,
+    importance: float = 0.5,
+    id: Optional[str] = None,
+) -> "pb.RememberRequest":
+    req = pb.RememberRequest(
+        content=content,
+        keywords=keywords or [],
+        metadata=_str_map(metadata),
+        importance=importance,
+    )
+    object_id = _check_id(id)
+    if object_id is not None:
+        req.id = object_id
+    return req
+
+
+def _batch_insert_request(items: List[dict]) -> "pb.BatchInsertRequest":
+    return pb.BatchInsertRequest(
+        items=[
+            _insert_request(
+                item["content"],
+                item.get("keywords"),
+                item.get("metadata"),
+                item.get("relationships"),
+                item.get("importance", 0.5),
+                item.get("id"),
+            )
+            for item in items
+        ]
+    )
+
 
 # ---- Dataclasses with helpful reprs ----
 
@@ -249,10 +451,37 @@ class KowitoDBClient:
         db = KowitoDBClient("localhost:50051")
         db.remember("Some knowledge to store")
         response = db.ask("What do you know about X?")
+
+    Args:
+        address: ``host:port`` of the KowitoDB gRPC server.
+        api_key: if set, sent as ``authorization: Bearer <key>`` metadata on
+            every RPC (matches the server's ``--api-key`` / ``KOWITODB_API_KEY``).
+        timeout: default per-RPC deadline in seconds; ``None`` disables it.
+        secure: use TLS (system root certificates unless ``root_certificates``
+            is given). Implied by ``root_certificates`` or ``credentials``.
+        root_certificates: PEM-encoded root certificates for TLS.
+        credentials: explicit ``grpc.ChannelCredentials`` (overrides ``secure``).
+        options: extra gRPC channel options, e.g.
+            ``[("grpc.max_receive_message_length", 64 << 20)]``.
     """
 
-    def __init__(self, address: str = "localhost:50051"):
+    def __init__(
+        self,
+        address: str = "localhost:50051",
+        *,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = DEFAULT_TIMEOUT,
+        secure: bool = False,
+        root_certificates: Optional[bytes] = None,
+        credentials: Optional[grpc.ChannelCredentials] = None,
+        options: Optional[Sequence[Tuple[str, Any]]] = None,
+    ):
         self.address = address
+        self.api_key = api_key
+        self.timeout = timeout
+        self._credentials = _channel_credentials(secure, root_certificates, credentials)
+        self._options = list(options or [])
+        self._raw_channel: Optional[grpc.Channel] = None
         self._channel: Optional[grpc.Channel] = None
         self._stub: Optional[pb_grpc.KowitoDBStub] = None
 
@@ -268,18 +497,30 @@ class KowitoDBClient:
     # ---- Connection ----
 
     def connect(self):
-        """Establish the gRPC connection."""
+        """Create the gRPC channel.
+
+        gRPC channels connect lazily: this does not contact the server. Call
+        e.g. :meth:`stats` to verify the server is reachable.
+        """
         if self._channel is not None:
             return
-        self._channel = grpc.insecure_channel(self.address)
+        if self._credentials is not None:
+            raw = grpc.secure_channel(self.address, self._credentials, options=self._options)
+        else:
+            raw = grpc.insecure_channel(self.address, options=self._options)
+        self._raw_channel = raw
+        self._channel = grpc.intercept_channel(
+            raw, _ClientInterceptor(_auth_metadata(self.api_key), self.timeout)
+        )
         self._stub = pb_grpc.KowitoDBStub(self._channel)
 
     def close(self):
         """Close the gRPC connection."""
-        if self._channel is not None:
-            self._channel.close()
-            self._channel = None
-            self._stub = None
+        if self._raw_channel is not None:
+            self._raw_channel.close()
+        self._raw_channel = None
+        self._channel = None
+        self._stub = None
 
     # ---- High-level AI API ----
 
@@ -287,7 +528,7 @@ class KowitoDBClient:
         self,
         question: str,
         max_results: int = 10,
-        metadata_filter: Optional[Dict[str, str]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> AskResponse:
         """ai.ask() — natural-language query with automatic retrieval.
 
@@ -301,7 +542,7 @@ class KowitoDBClient:
         req = pb.AskRequest(
             question=question,
             max_results=max_results,
-            metadata_filter=metadata_filter or {},
+            metadata_filter=_str_map(metadata_filter),
         )
         resp = self._stub.Ask(req)
         return AskResponse.from_proto(resp)
@@ -312,18 +553,15 @@ class KowitoDBClient:
         keywords: Optional[List[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
         importance: float = 0.5,
+        id: Optional[str] = None,
     ) -> str:
         """ai.remember() — store knowledge for future retrieval.
 
-        Returns the object ID.
+        ``id`` optionally assigns the object id (must be a UUID string);
+        otherwise the server generates one. Returns the object ID.
         """
         self._ensure_connected()
-        req = pb.RememberRequest(
-            content=content,
-            keywords=keywords or [],
-            metadata=metadata or {},
-            importance=importance,
-        )
+        req = _remember_request(content, keywords, metadata, importance, id)
         resp = self._stub.Remember(req)
         return resp.id
 
@@ -340,10 +578,12 @@ class KowitoDBClient:
         """Execute a SQL query against the DataFusion engine.
 
         Returns a list of rows, where each row is a dict mapping column
-        name to its string value.
+        name to its string value. Columns: ``id``, ``content``, ``importance``,
+        ``created_at``, ``updated_at``, ``keywords`` and ``metadata`` (the last
+        two are JSON-encoded strings)::
 
-        SELECT * FROM knowledge WHERE metadata.company = 'Acme'
-        SELECT content FROM knowledge WHERE keyword LIKE '%enterprise%' LIMIT 10
+            SELECT id, content FROM knowledge WHERE metadata LIKE '%"company":"Acme"%'
+            SELECT content FROM knowledge WHERE keywords LIKE '%enterprise%' LIMIT 10
         """
         self._ensure_connected()
         req = pb.SqlRequest(query=query)
@@ -359,20 +599,15 @@ class KowitoDBClient:
         metadata: Optional[Dict[str, str]] = None,
         relationships: Optional[List[tuple]] = None,
         importance: float = 0.5,
+        id: Optional[str] = None,
     ) -> str:
-        """Insert a knowledge object explicitly."""
+        """Insert a knowledge object explicitly.
+
+        ``id`` optionally assigns the object id (must be a UUID string);
+        otherwise the server generates one. Returns the object ID.
+        """
         self._ensure_connected()
-        rels = [
-            pb.RelationshipInput(relation_type=r[0], target_id=r[1])
-            for r in (relationships or [])
-        ]
-        req = pb.InsertRequest(
-            content=content,
-            keywords=keywords or [],
-            metadata=metadata or {},
-            relationships=rels,
-            importance=importance,
-        )
+        req = _insert_request(content, keywords, metadata, relationships, importance, id)
         resp = self._stub.Insert(req)
         return resp.id
 
@@ -389,27 +624,12 @@ class KowitoDBClient:
 
         Supported keys per item: ``content`` (required), ``keywords``,
         ``metadata``, ``relationships`` (list of ``(relation_type, target_id)``
-        tuples), and ``importance``.
+        tuples), ``importance``, and ``id`` (optional caller-assigned UUID).
 
         Returns the list of created object IDs, in input order.
         """
         self._ensure_connected()
-        proto_items = []
-        for item in items:
-            rels = [
-                pb.RelationshipInput(relation_type=r[0], target_id=r[1])
-                for r in (item.get("relationships") or [])
-            ]
-            proto_items.append(
-                pb.InsertRequest(
-                    content=item["content"],
-                    keywords=item.get("keywords") or [],
-                    metadata=item.get("metadata") or {},
-                    relationships=rels,
-                    importance=item.get("importance", 0.5),
-                )
-            )
-        req = pb.BatchInsertRequest(items=proto_items)
+        req = _batch_insert_request(items)
         resp = self._stub.BatchInsert(req)
         return list(resp.ids)
 
@@ -451,7 +671,7 @@ class KowitoDBClient:
         Returns an ``UpdateResult`` with ``updated`` and ``version``.
         """
         self._ensure_connected()
-        req = pb.UpdateRequest(id=id, metadata=metadata or {}, keywords=keywords or [])
+        req = pb.UpdateRequest(id=id, metadata=_str_map(metadata), keywords=keywords or [])
         if content is not None:
             req.content = content
         if importance is not None:
@@ -465,7 +685,7 @@ class KowitoDBClient:
         self,
         query: str,
         top_k: int = 20,
-        metadata_filter: Optional[Dict[str, str]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
         """Direct search (bypasses the AI planner).
 
@@ -474,7 +694,7 @@ class KowitoDBClient:
         """
         self._ensure_connected()
         req = pb.SearchRequest(
-            query=query, top_k=top_k, metadata_filter=metadata_filter or {}
+            query=query, top_k=top_k, metadata_filter=_str_map(metadata_filter)
         )
         resp = self._stub.Search(req)
         return [SearchResult.from_proto(r) for r in resp.results]
@@ -540,10 +760,28 @@ class AsyncKowitoDBClient:
     Usage:
         async with AsyncKowitoDBClient("localhost:50051") as db:
             resp = await db.ask("What do you know about X?")
+
+    Accepts the same keyword options as :class:`KowitoDBClient`
+    (``api_key``, ``timeout``, ``secure``, ``root_certificates``,
+    ``credentials``, ``options``).
     """
 
-    def __init__(self, address: str = "localhost:50051"):
+    def __init__(
+        self,
+        address: str = "localhost:50051",
+        *,
+        api_key: Optional[str] = None,
+        timeout: Optional[float] = DEFAULT_TIMEOUT,
+        secure: bool = False,
+        root_certificates: Optional[bytes] = None,
+        credentials: Optional[grpc.ChannelCredentials] = None,
+        options: Optional[Sequence[Tuple[str, Any]]] = None,
+    ):
         self.address = address
+        self.api_key = api_key
+        self.timeout = timeout
+        self._credentials = _channel_credentials(secure, root_certificates, credentials)
+        self._options = list(options or [])
         self._channel: Optional[grpc.aio.Channel] = None
         self._stub: Optional[pb_grpc.KowitoDBStub] = None
 
@@ -559,10 +797,19 @@ class AsyncKowitoDBClient:
     # ---- Connection ----
 
     async def connect(self):
-        """Establish the gRPC connection."""
+        """Create the gRPC channel (connects lazily, on the first RPC)."""
         if self._channel is not None:
             return
-        self._channel = grpc.aio.insecure_channel(self.address)
+        interceptors = [_AioClientInterceptor(_auth_metadata(self.api_key), self.timeout)]
+        if self._credentials is not None:
+            self._channel = grpc.aio.secure_channel(
+                self.address, self._credentials, options=self._options,
+                interceptors=interceptors,
+            )
+        else:
+            self._channel = grpc.aio.insecure_channel(
+                self.address, options=self._options, interceptors=interceptors
+            )
         self._stub = pb_grpc.KowitoDBStub(self._channel)
 
     async def close(self):
@@ -578,14 +825,14 @@ class AsyncKowitoDBClient:
         self,
         question: str,
         max_results: int = 10,
-        metadata_filter: Optional[Dict[str, str]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> AskResponse:
         """ai.ask() — natural-language query with automatic retrieval."""
         self._ensure_connected()
         req = pb.AskRequest(
             question=question,
             max_results=max_results,
-            metadata_filter=metadata_filter or {},
+            metadata_filter=_str_map(metadata_filter),
         )
         resp = await self._stub.Ask(req)
         return AskResponse.from_proto(resp)
@@ -596,15 +843,11 @@ class AsyncKowitoDBClient:
         keywords: Optional[List[str]] = None,
         metadata: Optional[Dict[str, str]] = None,
         importance: float = 0.5,
+        id: Optional[str] = None,
     ) -> str:
         """ai.remember() — store knowledge for future retrieval."""
         self._ensure_connected()
-        req = pb.RememberRequest(
-            content=content,
-            keywords=keywords or [],
-            metadata=metadata or {},
-            importance=importance,
-        )
+        req = _remember_request(content, keywords, metadata, importance, id)
         resp = await self._stub.Remember(req)
         return resp.id
 
@@ -633,42 +876,22 @@ class AsyncKowitoDBClient:
         metadata: Optional[Dict[str, str]] = None,
         relationships: Optional[List[tuple]] = None,
         importance: float = 0.5,
+        id: Optional[str] = None,
     ) -> str:
-        """Insert a knowledge object explicitly."""
+        """Insert a knowledge object explicitly.
+
+        ``id`` optionally assigns the object id (must be a UUID string);
+        otherwise the server generates one. Returns the object ID.
+        """
         self._ensure_connected()
-        rels = [
-            pb.RelationshipInput(relation_type=r[0], target_id=r[1])
-            for r in (relationships or [])
-        ]
-        req = pb.InsertRequest(
-            content=content,
-            keywords=keywords or [],
-            metadata=metadata or {},
-            relationships=rels,
-            importance=importance,
-        )
+        req = _insert_request(content, keywords, metadata, relationships, importance, id)
         resp = await self._stub.Insert(req)
         return resp.id
 
     async def batch_insert(self, items: List[dict]) -> List[str]:
         """Insert multiple knowledge objects in a single request."""
         self._ensure_connected()
-        proto_items = []
-        for item in items:
-            rels = [
-                pb.RelationshipInput(relation_type=r[0], target_id=r[1])
-                for r in (item.get("relationships") or [])
-            ]
-            proto_items.append(
-                pb.InsertRequest(
-                    content=item["content"],
-                    keywords=item.get("keywords") or [],
-                    metadata=item.get("metadata") or {},
-                    relationships=rels,
-                    importance=item.get("importance", 0.5),
-                )
-            )
-        req = pb.BatchInsertRequest(items=proto_items)
+        req = _batch_insert_request(items)
         resp = await self._stub.BatchInsert(req)
         return list(resp.ids)
 
@@ -700,7 +923,7 @@ class AsyncKowitoDBClient:
     ) -> UpdateResult:
         """Update an existing knowledge object."""
         self._ensure_connected()
-        req = pb.UpdateRequest(id=id, metadata=metadata or {}, keywords=keywords or [])
+        req = pb.UpdateRequest(id=id, metadata=_str_map(metadata), keywords=keywords or [])
         if content is not None:
             req.content = content
         if importance is not None:
@@ -714,12 +937,12 @@ class AsyncKowitoDBClient:
         self,
         query: str,
         top_k: int = 20,
-        metadata_filter: Optional[Dict[str, str]] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
         """Direct search (bypasses the AI planner)."""
         self._ensure_connected()
         req = pb.SearchRequest(
-            query=query, top_k=top_k, metadata_filter=metadata_filter or {}
+            query=query, top_k=top_k, metadata_filter=_str_map(metadata_filter)
         )
         resp = await self._stub.Search(req)
         return [SearchResult.from_proto(r) for r in resp.results]

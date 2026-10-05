@@ -21,11 +21,11 @@ run: ## Run the gRPC server in dev mode (127.0.0.1:50051)
 ask: ## Ask a question in embedded mode: make ask Q="your question"
 	cargo run -p kowitodb -- ask "$(Q)"
 
-test: ## Run the full test suite
-	cargo test --workspace
+test: ## Run the full test suite (matches CI; --locked = Cargo.lock must be current)
+	cargo test --workspace --locked
 
 lint: ## Clippy with warnings-as-errors (matches CI)
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 fmt: ## Format the codebase
 	cargo fmt --all
@@ -51,18 +51,22 @@ docker: ## Build the server Docker image (tag: kowitodb)
 	docker build -t kowitodb .
 
 docker-run: ## Run the server image, persisting to ./data
-	docker run --rm -p 50051:50051 -p 9090:9090 -v "$$PWD/data:/data" kowitodb
+	@mkdir -p data
+	docker run --rm --user "$$(id -u):$$(id -g)" -p 50051:50051 -p 9090:9090 \
+	  -v "$$PWD/data:/data" kowitodb
 
-gen-python: ## Regenerate the Python SDK gRPC stubs from proto/
+gen-python: ## Regenerate the Python SDK gRPC stubs from kowitodb-server/proto/
 	bash sdk/python/scripts/gen.sh
 
-bump: ## Bump + tag a release: make bump V=0.41.0  (needs cargo-edit)
+bump: ## Set the version, run CI, commit + tag a release: make bump V=0.41.0
 	@test -n "$(V)" || { echo "usage: make bump V=X.Y.Z"; exit 1; }
-	cargo set-version --workspace $(V)
+	python3 scripts/bump-version.py --set $(V)
 	$(MAKE) ci
-	git commit -am "Release v$(V)"
+	git add Cargo.toml Cargo.lock
+	@# "chore: bump" prefix: the bump-version workflow skips it (no double bump).
+	git commit -m "chore: bump version to $(V)"
 	git tag "v$(V)"
-	@echo "Now: git push origin main --tags   (triggers crates.io publish)"
+	@echo "Now: git push origin main v$(V)   (the tag triggers the crates.io publish)"
 
 clean: ## Remove build artifacts
 	cargo clean

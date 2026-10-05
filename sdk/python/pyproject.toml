@@ -4,18 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kowitodb"
-version = "0.4.0"
+version = "0.5.0"
 description = "AI Knowledge Operating System — Python SDK"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "KowitoDB Contributors" }]
+# Runtime minimums are dictated by the checked-in stubs: kowitodb_pb2_grpc.py
+# checks GRPC_GENERATED_VERSION (1.81.1) and kowitodb_pb2.py validates the
+# protobuf runtime against its gencode version (6.33.5, same major required).
+# Regenerate with the matching grpcio-tools (see scripts/gen.sh) and bump these
+# together.
+dependencies = [
+    "grpcio>=1.81.1",
+    "protobuf>=6.33.5,<7",
+]
 
 [project.optional-dependencies]
-grpc = ["grpcio>=1.60", "grpcio-tools>=1.60"]
+# Stub regeneration only (scripts/gen.sh); not needed at runtime.
+codegen = ["grpcio-tools==1.81.1"]
+# Kept for backwards compatibility: grpcio is now a base dependency.
+grpc = ["grpcio>=1.81.1"]
 langchain = ["langchain-core>=0.3"]
 llamaindex = ["llama-index-core>=0.10"]
-all = ["kowitodb[grpc]", "kowitodb[langchain]", "kowitodb[llamaindex]"]
+all = ["kowitodb[langchain]", "kowitodb[llamaindex]"]
 
 # Auto-discovers `kowitodb` and `kowitodb.integrations`.
 [tool.setuptools.packages.find]

@@ -15,9 +15,23 @@
  *     console.log(`[${r.relevance_score.toFixed(2)}] ${r.content}`);
  *   }
  *   db.close();
+ *
+ * Authentication / deadlines / TLS:
+ *
+ *   const db = new KowitoDBClient("db.example.com:50051", {
+ *     apiKey: process.env.KOWITODB_API_KEY, // `authorization: Bearer <key>`
+ *     timeoutMs: 30_000,                    // default per-call deadline (0 = none)
+ *     secure: true,                         // TLS with the system roots
+ *   });
  */
 
-import { credentials, ChannelCredentials, ClientUnaryCall } from "@grpc/grpc-js";
+import {
+  credentials,
+  ChannelCredentials,
+  ClientUnaryCall,
+  InterceptingCall,
+  Interceptor,
+} from "@grpc/grpc-js";
 
 import {
   loadKowitoDBService,
@@ -62,12 +76,51 @@ import type {
 } from "./types";
 
 export interface KowitoDBClientOptions {
-  /** Channel credentials. Defaults to insecure (matching the Python SDK). */
+  /**
+   * Channel credentials. Defaults to insecure (matching the Python SDK), or
+   * TLS with the system roots when `secure` is true.
+   */
   credentials?: ChannelCredentials;
+  /** Use TLS (`credentials.createSsl()`) when `credentials` is not given. */
+  secure?: boolean;
+  /**
+   * API key sent as `authorization: Bearer <key>` metadata on every call
+   * (must match the server's `--api-key` / `KOWITODB_API_KEY`). Attached via
+   * an interceptor, so it works over insecure channels too (grpc-js call
+   * credentials cannot be combined with insecure channel credentials).
+   */
+  apiKey?: string;
+  /**
+   * Default per-call deadline in milliseconds, applied to every call that has
+   * no deadline of its own. Defaults to 30000; `0` disables it.
+   */
+  timeoutMs?: number;
 }
 
 const DEFAULT_ADDRESS = "localhost:50051";
 const DEFAULT_IMPORTANCE = 0.5;
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Build the interceptor that adds the API key and the default deadline to
+ * every outgoing call.
+ */
+function makeInterceptor(apiKey: string | undefined, timeoutMs: number): Interceptor {
+  return (options, nextCall) => {
+    const callOptions =
+      timeoutMs > 0 && options.deadline === undefined
+        ? { ...options, deadline: new Date(Date.now() + timeoutMs) }
+        : options;
+    return new InterceptingCall(nextCall(callOptions), {
+      start(metadata, listener, next) {
+        if (apiKey && metadata.get("authorization").length === 0) {
+          metadata.set("authorization", `Bearer ${apiKey}`);
+        }
+        next(metadata, listener);
+      },
+    });
+  };
+}
 
 /**
  * Promisify a unary gRPC call.
@@ -120,8 +173,13 @@ export class KowitoDBClient {
       return;
     }
     const ServiceClient = loadKowitoDBService();
-    const creds = this.options.credentials ?? credentials.createInsecure();
-    this.stub = new ServiceClient(this.address, creds);
+    const creds =
+      this.options.credentials ??
+      (this.options.secure ? credentials.createSsl() : credentials.createInsecure());
+    const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.stub = new ServiceClient(this.address, creds, {
+      interceptors: [makeInterceptor(this.options.apiKey, timeoutMs)],
+    });
   }
 
   /** Close the gRPC connection. */
@@ -173,6 +231,9 @@ export class KowitoDBClient {
       metadata: options.metadata ?? {},
       importance: options.importance ?? DEFAULT_IMPORTANCE,
     };
+    if (options.id) {
+      req.id = options.id;
+    }
     const resp = await callUnary<RememberResponse>((cb) => stub.remember(req, cb));
     return resp.id;
   }
@@ -190,8 +251,10 @@ export class KowitoDBClient {
   /**
    * Execute a SQL query against the DataFusion engine.
    *
-   *   SELECT * FROM knowledge WHERE metadata.company = 'Acme'
-   *   SELECT content FROM knowledge WHERE keyword LIKE '%enterprise%' LIMIT 10
+   *   SELECT id, content FROM knowledge WHERE metadata LIKE '%"company":"Acme"%'
+   *   SELECT content FROM knowledge WHERE keywords LIKE '%enterprise%' LIMIT 10
+   *
+   * `metadata` and `keywords` are JSON-encoded string columns.
    *
    * Returns one row per result; each row is a column-name -> value map.
    */
@@ -251,13 +314,17 @@ export class KowitoDBClient {
         target_id: targetId,
       }),
     );
-    return {
+    const req: InsertRequest = {
       content,
       keywords: options.keywords ?? [],
       metadata: options.metadata ?? {},
       relationships,
       importance: options.importance ?? DEFAULT_IMPORTANCE,
     };
+    if (options.id) {
+      req.id = options.id;
+    }
+    return req;
   }
 
   /** Insert a knowledge object explicitly. Returns the new object ID. */

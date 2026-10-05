@@ -2,8 +2,12 @@ name: bump-version
 
 # Auto-bump the workspace patch version on every push to main. The bump commit
 # is made with the default GITHUB_TOKEN, which by design does NOT trigger further
-# workflows — so this can't loop. (`[skip ci]` and the `if` guard below are
-# belt-and-suspenders.)
+# workflows — so this can't loop. The `if:` guard below (skip any commit whose
+# message starts with "chore: bump") is the belt-and-suspenders.
+#
+# The bump commit deliberately does NOT carry `[skip ci]`: GitHub also honours
+# skip instructions on *tag* pushes, so a `vX.Y.Z` tag pointing at a
+# "[skip ci]" bot commit would never run publish.yml.
 on:
   push:
     branches: [main]
@@ -17,7 +21,8 @@ concurrency:
 
 jobs:
   bump:
-    # Don't bump in response to a bump commit (or any [skip ci] commit).
+    # Don't bump in response to a bump commit (bot or `make bump`, both use the
+    # "chore: bump version to X" message), or when a human opts out with [skip ci].
     if: >-
       ${{ !contains(github.event.head_commit.message, '[skip ci]')
           && !startsWith(github.event.head_commit.message, 'chore: bump') }}
@@ -33,6 +38,9 @@ jobs:
           echo "Bumped workspace to $new"
           git config user.name "kowito"
           git config user.email "hi@kowito.com"
-          git commit -am "chore: bump version to $new [skip ci]"
+          # The script also syncs Cargo.lock, so `cargo publish --locked` works
+          # on a tag that points at this commit.
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to $new"
           # Re-base onto any concurrent pushes, then push.
           git push || (git pull --rebase --autostash origin main && git push)

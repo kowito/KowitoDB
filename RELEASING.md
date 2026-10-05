@@ -1,8 +1,8 @@
 # Releasing KowitoDB
 
-All workspace crates share one version and are auto-published to
+All workspace crates share one version and are published to
 [crates.io](https://crates.io) by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
-when you push a `vX.Y.Z` tag.
+when a `vX.Y.Z` tag is pushed. Nothing is published without a tag.
 
 ## One-time setup
 
@@ -13,30 +13,83 @@ when you push a `vX.Y.Z` tag.
 3. Make sure the crate names (`kowitodb`, `kowitodb-core`, …) are available or
    owned by your crates.io account. The first publish claims them.
 
-## Cutting a release
+## How versions move
 
-The crates' versions **and** their internal dependency versions must move
-together. The easiest way is [`cargo-edit`](https://github.com/killercup/cargo-edit):
+A version lives in three places that must agree, or `cargo publish --locked`
+fails:
+
+- `version` under `[workspace.package]` in the root `Cargo.toml`;
+- the `version = "…"` on every internal `kowitodb-*` crate in
+  `[workspace.dependencies]` (root `Cargo.toml`);
+- the workspace packages' own entries in `Cargo.lock`.
+
+[`scripts/bump-version.py`](scripts/bump-version.py) updates all three and
+prints the new version:
 
 ```bash
-cargo install cargo-edit            # once
-make bump V=0.41.0                  # set-version --workspace + ci + commit + tag
-git push origin main --tags         # the tag triggers the crates.io publish
+python3 scripts/bump-version.py                # patch bump: 0.40.5 -> 0.40.6
+python3 scripts/bump-version.py minor          # 0.40.5 -> 0.41.0
+python3 scripts/bump-version.py --set 0.41.0   # explicit version
 ```
 
-`make bump` runs `cargo set-version --workspace` (bumps every crate **and** its
-internal dependency versions in lockstep), then `make ci`, then commits and tags.
+### The auto-bump bot
 
-Pushing the tag triggers the `publish` workflow, which verifies the tag matches
-the workspace version and publishes the crates **in dependency order**
-(`kowitodb-core` → `-storage`/`-index` → `-planner`/`-sql` → `-server` →
-`kowitodb`). `cargo publish` waits for each crate to appear in the index before
-the next dependent is published. Re-running on an already-published version is a
-no-op (idempotent).
+[`.github/workflows/bump-version.yml`](.github/workflows/bump-version.yml) runs
+on every push to `main`. Unless the head commit's message starts with
+`chore: bump` (or contains `[skip ci]`), it runs the script (patch bump),
+commits `Cargo.toml` + `Cargo.lock` as **`chore: bump version to X.Y.Z`**, and
+pushes. It cannot loop: pushes made with the workflow's `GITHUB_TOKEN` don't
+trigger workflows, and the `chore: bump` guard skips them anyway.
 
-> If you don't use `cargo-edit`, bump `version` under `[workspace.package]` **and**
-> the `version = "…"` on every internal crate in `[workspace.dependencies]` in the
-> root `Cargo.toml` by hand — they must match, or publishing fails.
+So `main` always carries a fresh, never-published patch version, but **the bot
+never tags and never publishes**. Its commits deliberately do *not* contain
+`[skip ci]` — GitHub honours skip instructions on tag pushes too, so a tag on
+such a commit would never run `publish.yml`.
+
+## Cutting a release
+
+Pick one:
+
+**A. Release what the bot already bumped** (patch release). Tag the bot's
+`chore: bump version to X.Y.Z` commit on `main` and push the tag:
+
+```bash
+git pull
+grep -m1 '^version = ' Cargo.toml       # -> version = "X.Y.Z"
+git tag vX.Y.Z                          # on the bump commit (HEAD of main)
+git push origin vX.Y.Z
+```
+
+**B. Choose the version yourself** (minor/major, or any explicit version):
+
+```bash
+make bump V=0.41.0          # bump-version.py --set + make ci + commit + tag
+git push origin main v0.41.0
+```
+
+`make bump` commits with the `chore: bump version to 0.41.0` message, so the bot
+does not bump again on top of it.
+
+Either way, pushing the tag triggers the `publish` workflow, which verifies the
+tag matches the workspace version and publishes the crates **in dependency
+order** with `cargo publish --locked` (`kowitodb-core` → `-storage`/`-index` →
+`-planner`/`-sql` → `-server` → `kowitodb`). `cargo publish` waits for each
+crate to appear in the index before the next dependent is published. Re-running
+on an already-published version is a no-op (idempotent), so a failed publish can
+be retried from the Actions tab.
+
+> Bumping by hand? Edit all three locations listed above (or just run the
+> script). After editing only `Cargo.toml` (e.g. with cargo-edit's
+> `cargo set-version --workspace X.Y.Z`), run `cargo update --workspace` to sync
+> `Cargo.lock`. CI builds with `--locked`, so a stale `Cargo.lock` fails CI
+> rather than the release.
+
+## SDK versions
+
+The Python (`sdk/python/pyproject.toml`), TypeScript (`sdk/typescript/package.json`)
+and Go (`sdk/go`; Go sub-module tags look like `sdk/go/vX.Y.Z`, which do not
+match the `v*` publish trigger) SDKs are versioned independently of the crates
+and are not touched by the bot or `make bump`.
 
 ## Dry run
 

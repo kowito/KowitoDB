@@ -5,7 +5,7 @@ use crate::{SelectColumn, SqlError, SqlStatement, WhereClause};
 /// Parse a SQL string into a `SqlStatement`.
 pub fn parse(sql: &str) -> Result<SqlStatement, SqlError> {
     let sql = sql.trim();
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
 
     if !upper.starts_with("SELECT") {
         return Err(SqlError::Parse("Query must start with SELECT".into()));
@@ -38,8 +38,8 @@ pub fn parse(sql: &str) -> Result<SqlStatement, SqlError> {
 }
 
 fn split_keyword<'a>(s: &'a str, keyword: &str) -> Result<(&'a str, &'a str), SqlError> {
-    let upper = s.to_uppercase();
-    let kw_upper = keyword.to_uppercase();
+    let upper = s.to_ascii_uppercase();
+    let kw_upper = keyword.to_ascii_uppercase();
     let mut in_quote = false;
     let mut i = 0;
     let bytes = s.as_bytes();
@@ -50,7 +50,10 @@ fn split_keyword<'a>(s: &'a str, keyword: &str) -> Result<(&'a str, &'a str), Sq
             i += 1;
             continue;
         }
-        if !in_quote && i + keyword.len() <= upper.len() && upper[i..].starts_with(&kw_upper) {
+        if !in_quote
+            && i + keyword.len() <= upper.len()
+            && upper.as_bytes()[i..].starts_with(kw_upper.as_bytes())
+        {
             let after = i + keyword.len();
             let is_boundary =
                 after >= bytes.len() || bytes[after].is_ascii_whitespace() || bytes[after] == b';';
@@ -85,6 +88,11 @@ fn parse_columns(s: &str) -> Result<Vec<SelectColumn>, SqlError> {
 fn parse_rest(s: &str) -> Result<(&str, Option<&str>, Option<usize>), SqlError> {
     let where_idx = find_keyword_boundary(s, "WHERE");
     let limit_idx = find_keyword_boundary(s, "LIMIT");
+    if let (Some(w), Some(l)) = (where_idx, limit_idx) {
+        if l < w {
+            return Err(SqlError::Parse("LIMIT must come after WHERE".into()));
+        }
+    }
     let table_end = where_idx.unwrap_or(limit_idx.unwrap_or(s.len()));
 
     let where_str = if let Some(idx) = where_idx {
@@ -112,8 +120,8 @@ fn parse_rest(s: &str) -> Result<(&str, Option<&str>, Option<usize>), SqlError> 
 }
 
 fn find_keyword_boundary(s: &str, keyword: &str) -> Option<usize> {
-    let upper = s.to_uppercase();
-    let kw_upper = keyword.to_uppercase();
+    let upper = s.to_ascii_uppercase();
+    let kw_upper = keyword.to_ascii_uppercase();
     let mut in_quote = false;
     let bytes = s.as_bytes();
 
@@ -125,7 +133,9 @@ fn find_keyword_boundary(s: &str, keyword: &str) -> Option<usize> {
         if in_quote {
             continue;
         }
-        if i + keyword.len() <= upper.len() && upper[i..].starts_with(&kw_upper) {
+        if i + keyword.len() <= upper.len()
+            && upper.as_bytes()[i..].starts_with(kw_upper.as_bytes())
+        {
             let after = i + keyword.len();
             let is_boundary =
                 after >= bytes.len() || bytes[after].is_ascii_whitespace() || bytes[after] == b';';
@@ -139,6 +149,13 @@ fn find_keyword_boundary(s: &str, keyword: &str) -> Option<usize> {
 }
 
 fn parse_where_clauses(s: &str) -> Result<Vec<WhereClause>, SqlError> {
+    // Only AND-ed predicates are supported; reject OR rather than silently
+    // dropping everything after it.
+    if find_keyword_boundary(s, "OR").is_some() {
+        return Err(SqlError::Unsupported(
+            "OR in WHERE (only AND-ed conditions are supported)".into(),
+        ));
+    }
     let parts = split_on_and(s);
     let mut clauses = Vec::new();
     for part in parts {
@@ -156,7 +173,7 @@ fn split_on_and(s: &str) -> Vec<&str> {
     let mut in_quote = false;
     let mut last = 0;
     let bytes = s.as_bytes();
-    let upper = s.to_uppercase();
+    let upper = s.to_ascii_uppercase();
 
     for i in 0..bytes.len() {
         if bytes[i] == b'\'' {
@@ -166,7 +183,7 @@ fn split_on_and(s: &str) -> Vec<&str> {
         if in_quote {
             continue;
         }
-        if i + 3 <= upper.len() && &upper[i..i + 3] == "AND" {
+        if i + 3 <= upper.len() && &upper.as_bytes()[i..i + 3] == b"AND" {
             let after = i + 3;
             let is_boundary = after >= bytes.len() || bytes[after].is_ascii_whitespace();
             let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
@@ -185,7 +202,7 @@ fn split_on_and(s: &str) -> Vec<&str> {
 
 fn parse_single_where(s: &str) -> Result<WhereClause, SqlError> {
     let s = s.trim();
-    let upper = s.to_uppercase();
+    let upper = s.to_ascii_uppercase();
 
     if upper.starts_with("METADATA.") {
         return parse_metadata_clause(&s[9..]);
@@ -280,6 +297,15 @@ fn parse_importance_clause(s: &str) -> Result<WhereClause, SqlError> {
 }
 
 fn parse_created_clause(s: &str) -> Result<WhereClause, SqlError> {
+    // Bounds are inclusive, so `>=`/`<=` mean the same as `>`/`<`. Strip the
+    // two-char operators first so `=` isn't taken as the value.
+    let s = s.trim();
+    let s = s
+        .strip_prefix(">=")
+        .map(|rest| format!(">{rest}"))
+        .or_else(|| s.strip_prefix("<=").map(|rest| format!("<{rest}")))
+        .unwrap_or_else(|| s.to_string());
+    let s = s.as_str();
     if let Some(rest) = s.strip_prefix('>') {
         let value = extract_string_value(rest)?;
         return Ok(WhereClause::CreatedAfter { timestamp: value });
@@ -292,20 +318,20 @@ fn parse_created_clause(s: &str) -> Result<WhereClause, SqlError> {
 }
 
 fn find_operator(s: &str, op: &str) -> Option<usize> {
-    let upper = s.to_uppercase();
-    let op_upper = op.to_uppercase();
+    // ASCII uppercasing keeps byte offsets aligned with `s`.
+    let upper = s.to_ascii_uppercase().into_bytes();
+    let op_upper = op.to_ascii_uppercase();
     let mut in_quote = false;
-    let bytes = s.as_bytes();
 
-    for i in 0..bytes.len() {
-        if bytes[i] == b'\'' {
+    for (i, &byte) in s.as_bytes().iter().enumerate() {
+        if byte == b'\'' {
             in_quote = !in_quote;
             continue;
         }
         if in_quote {
             continue;
         }
-        if i + op.len() <= upper.len() && upper[i..].starts_with(&op_upper) {
+        if upper[i..].starts_with(op_upper.as_bytes()) {
             return Some(i);
         }
     }
@@ -315,10 +341,21 @@ fn find_operator(s: &str, op: &str) -> Option<usize> {
 fn extract_string_value(s: &str) -> Result<String, SqlError> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('\'') {
-        if let Some(end) = rest.find('\'') {
-            return Ok(rest[..end].to_string());
+        // SQL escapes a quote inside a literal by doubling it: 'O''Brien'.
+        let mut value = String::new();
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    value.push('\'');
+                    continue;
+                }
+                return Ok(value);
+            }
+            value.push(c);
         }
-        return Ok(rest.trim_end_matches('\'').to_string());
+        return Ok(value);
     }
     Ok(s.split_whitespace().next().unwrap_or("").to_string())
 }

@@ -1,8 +1,21 @@
+# Build output (the image builds its own target/ — copying the host's would
+# clobber the cached dependency layer and bloat the context).
 target/
+**/target/
+
+# Local data, secrets and environments
 data/
+.env*
+**/.env*
+.venv/
+**/.venv/
+venv/
+**/__pycache__/
+
+# Not needed to build the server binary
 .git/
 .github/
+sdk/
 **/node_modules/
-sdk/typescript/dist/
 **/*.rs.bk
 **/.DS_Store

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use kowitodb_core::Result as KResult;
@@ -15,7 +16,7 @@ use kowitodb_storage::{StorageBackend, StorageEngine, StorageFilter, StoredObjec
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::embedding::{EmbeddingClient, ProxyEmbeddingClient};
 use crate::llm::LlmClient;
@@ -137,6 +138,23 @@ fn auto_graph_enabled() -> bool {
 /// Max prior objects linked per shared entity at ingest (bounds fan-out).
 const AUTO_GRAPH_FANOUT: usize = 5;
 
+/// Most recent objects remembered per entity for auto-linking. Only the last
+/// [`AUTO_GRAPH_FANOUT`] are linked, so older entries are dropped.
+const ENTITY_INDEX_CAP: usize = AUTO_GRAPH_FANOUT * 4;
+
+/// Capitalised words that start sentences rather than name things; linking on
+/// them would connect almost every object to every other.
+const ENTITY_STOPWORDS: &[&str] = &[
+    "the", "this", "that", "these", "those", "there", "then", "than", "when", "what", "which",
+    "who", "whom", "whose", "where", "why", "how", "and", "but", "for", "nor", "yet", "with",
+    "from", "into", "onto", "our", "your", "their", "its", "his", "her", "she", "they", "you",
+    "after", "before", "also", "however", "because", "while", "although", "since", "until",
+    "about", "all", "any", "each", "every", "some", "many", "most", "more", "other", "such",
+    "here", "now", "today", "yes", "not", "can", "will", "would", "should", "could", "may",
+    "might", "must", "has", "have", "had", "was", "were", "are", "been", "being", "did", "does",
+    "let", "please", "thanks",
+];
+
 /// Cheap deterministic entity extraction: capitalized tokens (proper nouns)
 /// from the content plus the object's explicit keywords, normalized for
 /// matching. The LazyGraphRAG insight — a light extractor at ingest is enough
@@ -146,7 +164,10 @@ fn extract_entities(obj: &KnowledgeObject) -> Vec<String> {
     for word in obj.content.split_whitespace() {
         let clean: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
         if clean.chars().count() > 2 && clean.chars().next().is_some_and(|c| c.is_uppercase()) {
-            set.insert(clean.to_lowercase());
+            let lower = clean.to_lowercase();
+            if !ENTITY_STOPWORDS.contains(&lower.as_str()) {
+                set.insert(lower);
+            }
         }
     }
     for kw in &obj.keywords {
@@ -168,30 +189,21 @@ fn is_read_only_sql(sql: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_lowercase();
-    if !(lower.starts_with("select ") || lower.starts_with("with ")) {
+    let first = lower.split(|c: char| c.is_whitespace() || c == '(').next();
+    if !matches!(first, Some("select") | Some("with")) {
         return false;
     }
     // Reject embedded write/DDL/filesystem verbs even inside a leading SELECT
-    // (e.g. CTEs or sub-statements). Matched with surrounding spaces to avoid
-    // tripping on column names like `created_at`.
+    // (e.g. CTEs or sub-statements). Matched as whole words (any whitespace or
+    // punctuation around them) so column names like `created_at` don't trip it.
+    // DataFusion itself is also run with DDL/DML disabled (`SqlContext::sql`).
     const FORBIDDEN: &[&str] = &[
-        " insert ",
-        " update ",
-        " delete ",
-        " drop ",
-        " create ",
-        " alter ",
-        " copy ",
-        " attach ",
-        " grant ",
-        " truncate ",
-        " replace ",
-        " merge ",
-        " call ",
-        " execute ",
+        "insert", "update", "delete", "drop", "create", "alter", "copy", "attach", "grant",
+        "truncate", "replace", "merge", "call", "execute", "set",
     ];
-    let padded = format!(" {lower} ");
-    !FORBIDDEN.iter().any(|kw| padded.contains(kw))
+    !lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| FORBIDDEN.contains(&word))
 }
 
 /// Strip Markdown code fences and a leading `sql` tag from an LLM SQL reply.
@@ -294,6 +306,197 @@ pub struct CommunitySummary {
 const MIN_COMMUNITY_SIZE: usize = 2;
 const COMMUNITY_SUMMARY_MAX_MEMBERS: usize = 50;
 
+/// Marker file written next to the index snapshots when they exactly reflect
+/// storage (see [`SnapshotState`]).
+const CLEAN_MARKER: &str = "CLEAN";
+
+/// Number of lock stripes serializing writes (insert/update/delete) per id.
+const WRITE_LOCK_STRIPES: usize = 64;
+
+/// Upper bound on vector/keyword candidates fetched when a metadata filter
+/// forces post-filtering.
+const MAX_FILTERED_FETCH: usize = 2_000;
+
+/// Most objects a date-scoped question pulls in from the time index.
+const TIME_FILTER_CAP: usize = 200;
+
+/// Tracks whether the on-disk index snapshots (`hnsw.bin`, `multivector.bin`
+/// and the Tantivy index) are known to match storage.
+///
+/// A checkpoint taken while no write is in flight writes a `CLEAN` marker, and
+/// the first write after it removes the marker *before* touching storage. On
+/// open the vector snapshot is trusted only if the marker is present;
+/// otherwise (a crash, SIGKILL, or writes from an engine that never
+/// checkpointed) the vector index is rebuilt from storage and the full-text
+/// index is reconciled against it.
+#[derive(Default)]
+struct SnapshotState {
+    /// The `CLEAN` marker is currently on disk.
+    clean_on_disk: bool,
+    /// Writes in progress.
+    in_flight: usize,
+    /// Bumped whenever a write finishes, so a checkpoint can tell whether
+    /// anything changed while it was saving.
+    generation: u64,
+    /// An index update failed after storage was written; the indexes may not
+    /// match storage until the next restart, so never mark them clean.
+    inconsistent: bool,
+}
+
+/// Held for the duration of one write; see [`KowitoDBEngine::begin_write`].
+struct WriteGuard {
+    state: Arc<Mutex<SnapshotState>>,
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.in_flight -= 1;
+        state.generation += 1;
+    }
+}
+
+/// Create the `CLEAN` marker durably.
+fn write_clean_marker(dir: &std::path::Path) -> std::io::Result<()> {
+    let file = std::fs::File::create(dir.join(CLEAN_MARKER))?;
+    file.sync_all()?;
+    sync_dir(dir)
+}
+
+/// Remove the `CLEAN` marker durably (a missing marker is fine).
+fn remove_clean_marker(dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(dir.join(CLEAN_MARKER)) {
+        Ok(()) => sync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The one embedding of `obj` that goes into the (single-vector) HNSW index:
+/// the only one, or — for objects with several — the first by model name
+/// whose dimension matches the index. Deterministic, so insert and reindex
+/// agree.
+fn index_vector(obj: &KnowledgeObject, dim: Option<usize>) -> Option<&Embedding> {
+    if obj.embeddings.len() <= 1 {
+        return obj.embeddings.values().next();
+    }
+    let mut models: Vec<&String> = obj.embeddings.keys().collect();
+    models.sort();
+    models
+        .iter()
+        .map(|m| &obj.embeddings[*m])
+        .find(|v| dim.is_none_or(|d| v.len() == d))
+        .or_else(|| models.first().map(|m| &obj.embeddings[*m]))
+}
+
+/// At most `max_chars` characters of `s`, for log lines (never splits a
+/// multi-byte character).
+fn preview(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((end, _)) => &s[..end],
+        None => s,
+    }
+}
+
+/// Inclusive `created_at` range (ms since epoch) for the years — and, with a
+/// single year, the month — a question mentions; `None` without a year.
+fn created_range_for(dates: &[String]) -> Option<(i64, i64)> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let years: Vec<i32> = dates.iter().filter_map(|d| d.parse().ok()).collect();
+    let (first_year, last_year) = (*years.iter().min()?, *years.iter().max()?);
+    let months: Vec<u32> = dates
+        .iter()
+        .filter_map(|d| MONTHS.iter().position(|m| m == d))
+        .map(|i| i as u32 + 1)
+        .collect();
+    let (start, end) = match (first_year == last_year, months.as_slice()) {
+        (true, [m]) => {
+            let start = NaiveDate::from_ymd_opt(first_year, *m, 1)?;
+            let end = if *m == 12 {
+                NaiveDate::from_ymd_opt(first_year + 1, 1, 1)?
+            } else {
+                NaiveDate::from_ymd_opt(first_year, m + 1, 1)?
+            };
+            (start, end)
+        }
+        _ => (
+            NaiveDate::from_ymd_opt(first_year, 1, 1)?,
+            NaiveDate::from_ymd_opt(last_year + 1, 1, 1)?,
+        ),
+    };
+    let to_ms = |d: NaiveDate| {
+        d.and_hms_opt(0, 0, 0)
+            .map(|dt| Utc.from_utc_datetime(&dt).timestamp_millis())
+    };
+    Some((to_ms(start)?, to_ms(end)? - 1))
+}
+
+/// Whether `obj` satisfies one parsed SQL `WHERE` clause.
+fn clause_matches(obj: &KnowledgeObject, clause: &kowitodb_sql::WhereClause) -> KResult<bool> {
+    use kowitodb_sql::WhereClause as W;
+    let meta_str = |key: &str| -> Option<String> {
+        obj.metadata.get(key).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    };
+    let ts = |t: &str| {
+        chrono::DateTime::parse_from_rfc3339(t).map_err(|e| {
+            kowitodb_core::KowitoError::InvalidInput(format!(
+                "invalid created_at timestamp '{t}' (expected RFC 3339): {e}"
+            ))
+        })
+    };
+    Ok(match clause {
+        W::MetadataEquals { key, value } => meta_str(key).is_some_and(|v| v == *value),
+        W::MetadataContains { key, substring } => {
+            meta_str(key).is_some_and(|v| v.contains(substring.as_str()))
+        }
+        W::KeywordEquals { value } => {
+            let value = value.to_lowercase();
+            obj.keywords.iter().any(|k| k.to_lowercase() == value)
+        }
+        W::KeywordContains { substring } => {
+            let substring = substring.to_lowercase();
+            obj.keywords
+                .iter()
+                .any(|k| k.to_lowercase().contains(&substring))
+        }
+        W::ContentContains { substring } => obj
+            .content
+            .to_lowercase()
+            .contains(&substring.to_lowercase()),
+        W::CreatedAfter { timestamp } => obj.created_at >= ts(timestamp)?,
+        W::CreatedBefore { timestamp } => obj.created_at <= ts(timestamp)?,
+        W::ImportanceGe { value } => obj.importance >= *value,
+        W::ImportanceLe { value } => obj.importance <= *value,
+    })
+}
+
 /// Core engine wiring storage, all 6 indexes, query planner, and all optimizers.
 pub struct KowitoDBEngine {
     pub storage: Arc<dyn StorageBackend>,
@@ -331,6 +534,15 @@ pub struct KowitoDBEngine {
     community_summaries: Arc<Mutex<Vec<CommunitySummary>>>,
     #[allow(dead_code)]
     default_model: String,
+    /// Whether the on-disk index snapshots match storage (see [`SnapshotState`]).
+    snapshot_state: Arc<Mutex<SnapshotState>>,
+    /// Set once the in-memory indexes are loaded from storage. Until then
+    /// `checkpoint` must not overwrite the on-disk snapshots with a partial
+    /// index (e.g. an engine built with [`Self::new`] for a one-off insert).
+    indexes_loaded: AtomicBool,
+    /// Per-id write locks: an update can't interleave with a delete or another
+    /// update of the same object.
+    write_locks: Arc<[tokio::sync::Mutex<()>]>,
 }
 
 impl KowitoDBEngine {
@@ -436,12 +648,22 @@ impl KowitoDBEngine {
             embedding_client,
             plan_cache: Arc::new(plan_cache),
             content_cache: Arc::new(ContentCache::new(CONTENT_CACHE_CAP)),
-            index_path,
+            index_path: index_path.clone(),
             reranker_model: select_reranker(),
             llm_client: crate::llm::from_env(),
             entity_index: Arc::new(Mutex::new(HashMap::new())),
             community_summaries: Arc::new(Mutex::new(Vec::new())),
             default_model: "default".to_string(),
+            snapshot_state: Arc::new(Mutex::new(SnapshotState {
+                clean_on_disk: index_path
+                    .as_ref()
+                    .is_some_and(|p| p.join(CLEAN_MARKER).exists()),
+                ..Default::default()
+            })),
+            indexes_loaded: AtomicBool::new(false),
+            write_locks: (0..WRITE_LOCK_STRIPES)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
         }
     }
 
@@ -455,12 +677,14 @@ impl KowitoDBEngine {
         self.index_path.as_ref().map(|p| p.join("hnsw.bin"))
     }
 
-    /// Load the persisted vector index if a snapshot exists, then rebuild the
-    /// remaining in-memory indexes from storage. If no snapshot is found the
-    /// vector index is rebuilt from stored embeddings too.
+    /// Load the persisted vector index if a snapshot exists and was written by
+    /// a clean checkpoint, then rebuild the remaining in-memory indexes from
+    /// storage. Otherwise the vector index is rebuilt from stored embeddings
+    /// and the full-text index reconciled against storage.
     async fn load_or_reindex(&mut self) -> KResult<()> {
+        let clean = self.snapshot_state.lock().clean_on_disk;
         let loaded = match self.hnsw_snapshot_path() {
-            Some(path) => match ShardedHnswIndex::load(&path) {
+            Some(path) if clean => match ShardedHnswIndex::load(&path) {
                 Ok(Some(index)) => {
                     info!("Loaded persisted vector index ({} vectors)", index.len());
                     self.hnsw_index = Arc::new(index);
@@ -468,27 +692,64 @@ impl KowitoDBEngine {
                 }
                 Ok(None) => false,
                 Err(e) => {
-                    tracing::warn!("Could not load vector index snapshot ({e}); rebuilding");
+                    warn!("Could not load vector index snapshot ({e}); rebuilding");
                     false
                 }
             },
+            Some(path) => {
+                if path.exists() {
+                    warn!(
+                        "Vector index snapshot was not written by a clean checkpoint \
+                         (crash, kill, or writes from another process); rebuilding \
+                         it from storage"
+                    );
+                }
+                false
+            }
             None => false,
         };
         // Restore the late-interaction index if a snapshot exists (token vectors
-        // can't be rebuilt from storage without a multi-vector model).
+        // can't be rebuilt from storage without a multi-vector model). Entries
+        // for objects no longer in storage are pruned by the reindex below.
         if let Some(path) = self.multivector_snapshot_path() {
-            if let Ok(Some(mv)) = MultiVectorIndex::load(&path) {
-                info!("Loaded late-interaction index ({} docs)", mv.len());
-                self.multivector_index = Arc::new(mv);
+            match MultiVectorIndex::load(&path) {
+                Ok(Some(mv)) => {
+                    info!("Loaded late-interaction index ({} docs)", mv.len());
+                    self.multivector_index = Arc::new(mv);
+                }
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "Could not load late-interaction index snapshot ({e}); token \
+                     vectors must be re-indexed"
+                ),
             }
         }
-        self.reindex_from_storage(!loaded).await?;
+        self.reindex(!loaded, !clean).await?;
+        self.indexes_loaded.store(true, AtomicOrdering::Release);
         Ok(())
     }
 
-    /// Persist the vector index to disk so it need not be rebuilt on restart.
-    /// No-op for in-memory engines.
+    /// Persist the index snapshots to disk so they need not be rebuilt on
+    /// restart, and — when no write happened meanwhile — mark them clean so the
+    /// next open trusts them. No-op for in-memory engines, for engines whose
+    /// indexes were never loaded from storage, and when nothing changed since
+    /// the last clean checkpoint.
     pub fn checkpoint(&self) -> KResult<()> {
+        let Some(dir) = self.index_path.clone() else {
+            return Ok(());
+        };
+        if !self.indexes_loaded.load(AtomicOrdering::Acquire) {
+            debug!("Skipping checkpoint: indexes were not loaded from storage");
+            return Ok(());
+        }
+        let start = {
+            let state = self.snapshot_state.lock();
+            if state.clean_on_disk {
+                return Ok(());
+            }
+            state.generation
+        };
+
         if let Some(path) = self.hnsw_snapshot_path() {
             self.hnsw_index
                 .save(&path)
@@ -500,15 +761,54 @@ impl KowitoDBEngine {
             );
         }
         // Persist the late-interaction index too (token vectors can't be rebuilt
-        // from storage — there is no bundled multi-vector model).
+        // from storage — there is no bundled multi-vector model). An empty index
+        // removes the snapshot so deleted token vectors don't come back.
         if let Some(path) = self.multivector_snapshot_path() {
-            if !self.multivector_index.is_empty() {
+            if self.multivector_index.is_empty() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(kowitodb_core::KowitoError::Io(e)),
+                }
+            } else {
                 self.multivector_index
                     .save(&path)
                     .map_err(kowitodb_core::KowitoError::Io)?;
             }
         }
+        self.fulltext_index.commit()?;
+
+        let mut state = self.snapshot_state.lock();
+        if state.in_flight == 0 && state.generation == start && !state.inconsistent {
+            write_clean_marker(&dir).map_err(kowitodb_core::KowitoError::Io)?;
+            state.clean_on_disk = true;
+        }
         Ok(())
+    }
+
+    /// Start a write: removes the `CLEAN` marker (before storage changes) and
+    /// counts the write as in flight until the returned guard drops.
+    fn begin_write(&self) -> KResult<WriteGuard> {
+        let mut state = self.snapshot_state.lock();
+        if state.clean_on_disk {
+            if let Some(dir) = &self.index_path {
+                remove_clean_marker(dir).map_err(kowitodb_core::KowitoError::Io)?;
+            }
+            state.clean_on_disk = false;
+        }
+        state.in_flight += 1;
+        Ok(WriteGuard {
+            state: self.snapshot_state.clone(),
+        })
+    }
+
+    /// Record that an index update failed after storage changed.
+    fn mark_inconsistent(&self) {
+        self.snapshot_state.lock().inconsistent = true;
+    }
+
+    fn write_lock(&self, id: ObjectId) -> &tokio::sync::Mutex<()> {
+        &self.write_locks[(id.as_u128() % WRITE_LOCK_STRIPES as u128) as usize]
     }
 
     /// Rebuild the in-memory indexes (vector/metadata/time/graph) and content
@@ -522,6 +822,15 @@ impl KowitoDBEngine {
     /// When `include_vectors` is false the HNSW index is left untouched (e.g. it
     /// was just loaded from a snapshot); the other indexes are still rebuilt.
     pub async fn reindex_from_storage(&self, include_vectors: bool) -> KResult<usize> {
+        self.reindex(include_vectors, false).await
+    }
+
+    /// [`Self::reindex_from_storage`], optionally also reconciling the
+    /// full-text index with storage (after an unclean shutdown): documents for
+    /// deleted objects are removed and missing ones added. Without LLM
+    /// contextualization every document is re-indexed, which also repairs any
+    /// stale content.
+    async fn reindex(&self, include_vectors: bool, reconcile_fulltext: bool) -> KResult<usize> {
         let objects = self.storage.search(StorageFilter::default()).await?;
         let count = objects.len();
 
@@ -537,15 +846,43 @@ impl KowitoDBEngine {
         // Log progress every 10% (or at least once for small datasets).
         let report_every = (count / 10).max(1);
 
+        let stored_ids: HashSet<ObjectId> = objects.iter().map(|o| o.id).collect();
+        let fulltext_ids = if reconcile_fulltext {
+            Some(self.fulltext_index.ids()?)
+        } else {
+            None
+        };
+        // The dimension every indexed vector must share: the loaded snapshot's,
+        // or (when rebuilding) the first stored vector's.
+        let mut dim = self.hnsw_index.dimension();
+
         for (i, stored) in objects.iter().enumerate() {
-            let obj = stored_to_obj(stored)?;
+            let obj = match stored_to_obj(stored) {
+                Ok(obj) => obj,
+                Err(e) => {
+                    warn!("Skipping unreadable stored object {}: {e}", stored.id);
+                    continue;
+                }
+            };
             self.content_cache.insert(obj.id, obj.content.clone());
 
             if include_vectors {
-                for embedding in obj.embeddings.values() {
-                    vectors.push((obj.id, embedding.clone()));
+                if let Some(v) = index_vector(&obj, dim) {
+                    dim.get_or_insert(v.len());
+                    vectors.push((obj.id, v.clone()));
                 }
             }
+            if let Some(ft_ids) = &fulltext_ids {
+                if !llm_contextual_enabled() || !ft_ids.contains(&obj.id) {
+                    self.fulltext_index.insert(
+                        obj.id,
+                        &contextualize_for_index(&obj),
+                        &obj.keywords,
+                        &serde_json::to_string(&obj.metadata).unwrap_or_default(),
+                    )?;
+                }
+            }
+            self.register_entities(&obj);
             for (key, value) in &obj.metadata {
                 let val_str = match value {
                     serde_json::Value::String(s) => s.clone(),
@@ -575,6 +912,24 @@ impl KowitoDBEngine {
             self.hnsw_index.build_parallel(vectors);
         }
 
+        // Token vectors live only in the multi-vector snapshot; drop those of
+        // objects deleted since it was written.
+        for id in self.multivector_index.ids() {
+            if !stored_ids.contains(&id) {
+                self.multivector_index.remove(id);
+            }
+        }
+
+        if let Some(ft_ids) = fulltext_ids {
+            let mut removed = 0;
+            for id in ft_ids.difference(&stored_ids) {
+                self.fulltext_index.remove(*id)?;
+                removed += 1;
+            }
+            self.fulltext_index.commit()?;
+            info!("Reconciled full-text index with storage ({removed} stale document(s) removed)");
+        }
+
         if count > 0 {
             info!(
                 "Reindex complete: {} object(s) loaded into in-memory indexes",
@@ -584,42 +939,119 @@ impl KowitoDBEngine {
         Ok(count)
     }
 
-    /// Insert a knowledge object into storage and all 6 indexes.
-    pub async fn insert(&self, mut obj: KnowledgeObject) -> KResult<ObjectId> {
-        let id = obj.id;
+    /// Insert a knowledge object into storage and all 6 indexes. Inserting an
+    /// existing id replaces that object (and every index entry for it).
+    pub async fn insert(&self, obj: KnowledgeObject) -> KResult<ObjectId> {
+        let (obj, indexed_text) = self.prepare_insert(obj).await?;
+        let _lock = self.write_lock(obj.id).lock().await;
+        self.write_prepared(obj, indexed_text).await
+    }
 
-        // Cache the *original* content for retrieval/display.
-        self.content_cache.insert(id, obj.content.clone());
-
+    /// Validate `obj`, build its context-augmented index text and embed it if
+    /// needed. Reads no stored state, so it runs outside the per-id write lock.
+    async fn prepare_insert(&self, mut obj: KnowledgeObject) -> KResult<(KnowledgeObject, String)> {
         // Contextual Retrieval (Anthropic, 2024): embed and full-text index a
         // context-augmented version of the text while storage returns the
         // original. The dense vector and BM25 index then capture structured
         // context (metadata/keywords), improving recall.
         let indexed_text = self.contextualize(&obj).await;
 
-        // Index vectors (auto-embed if needed). The generated embedding is
-        // written back onto the object so it is persisted to storage and can be
-        // restored by reindex_from_storage() after a restart.
-        for embedding in obj.embeddings.values() {
-            self.hnsw_index.insert(id, embedding.clone());
-        }
+        // Auto-embed if needed. The generated embedding is written back onto
+        // the object so it is persisted to storage and can be restored by
+        // reindex_from_storage() after a restart. A failed embedding fails the
+        // insert: an object stored without a vector would never be found by
+        // vector search.
         if obj.embeddings.is_empty() && !obj.content.is_empty() {
-            if let Ok(result) = self.embedding_client.embed(&indexed_text).await {
-                self.hnsw_index.insert(id, result.vector.clone());
-                obj.embeddings.insert(result.model, result.vector);
-                self.cost_tracker.record_embedding_calls(1);
+            let result = self
+                .embedding_client
+                .embed(&indexed_text)
+                .await
+                .map_err(|e| {
+                    kowitodb_core::KowitoError::Internal(format!("embedding failed: {e}"))
+                })?;
+            self.cost_tracker.record_embedding_calls(1);
+            obj.embeddings.insert(result.model, result.vector);
+        }
+        self.validate_embeddings(&obj)?;
+        Ok((obj, indexed_text))
+    }
+
+    /// Reject embeddings that would silently break vector search: empty or
+    /// non-finite vectors, or one whose dimension differs from the index's.
+    fn validate_embeddings(&self, obj: &KnowledgeObject) -> KResult<()> {
+        for (model, v) in &obj.embeddings {
+            if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
+                return Err(kowitodb_core::KowitoError::InvalidInput(format!(
+                    "embedding '{model}' is empty or contains NaN/infinite values"
+                )));
             }
+        }
+        let dim = self.hnsw_index.dimension();
+        if let (Some(v), Some(d)) = (index_vector(obj, dim), dim) {
+            if v.len() != d {
+                return Err(kowitodb_core::KowitoError::InvalidInput(format!(
+                    "embedding has {} dimensions but the vector index uses {d}",
+                    v.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist a prepared object, then index it. Callers hold its write lock.
+    async fn write_prepared(
+        &self,
+        obj: KnowledgeObject,
+        indexed_text: String,
+    ) -> KResult<ObjectId> {
+        let id = obj.id;
+        let _write = self.begin_write()?;
+
+        // Storage is the source of truth: write it first, so a failure leaves
+        // the indexes untouched and a crash before indexing is repaired on
+        // restart (the CLEAN marker is already gone).
+        let stored = obj_to_stored(&obj)?;
+        self.storage.put(stored).await?;
+
+        if let Err(e) = self.index_object(&obj, &indexed_text) {
+            self.mark_inconsistent();
+            return Err(e);
+        }
+        self.content_cache.insert(id, obj.content.clone());
+        self.plan_cache.clear();
+
+        info!(
+            "Inserted {}: {} (vecs={}, kws={}, rels={})",
+            id,
+            preview(&obj.content, 80),
+            obj.embeddings.len(),
+            obj.keywords.len(),
+            obj.relationships.len(),
+        );
+        Ok(id)
+    }
+
+    /// Bring every index in line with `obj`, replacing whatever was indexed
+    /// for its id before (so re-inserting never leaves stale metadata, edges
+    /// or vectors behind).
+    fn index_object(&self, obj: &KnowledgeObject, indexed_text: &str) -> KResult<()> {
+        let id = obj.id;
+        self.metadata_index.remove_object(id);
+        self.graph_index.remove_out_edges(id);
+
+        match index_vector(obj, self.hnsw_index.dimension()) {
+            Some(v) => self.hnsw_index.insert(id, v.clone()),
+            None => self.hnsw_index.remove(id),
         }
 
         // Full-text index (over the context-augmented text).
         self.fulltext_index.insert(
             id,
-            &indexed_text,
+            indexed_text,
             &obj.keywords,
             &serde_json::to_string(&obj.metadata).unwrap_or_default(),
         )?;
 
-        // Metadata index
         for (key, value) in &obj.metadata {
             let val_str = match value {
                 serde_json::Value::String(s) => s.clone(),
@@ -628,11 +1060,9 @@ impl KowitoDBEngine {
             self.metadata_index.insert(id, key, &val_str);
         }
 
-        // Time index
         self.time_index
             .insert(id, obj.created_at.timestamp_millis());
 
-        // Graph index (relationships)
         if !obj.relationships.is_empty() {
             self.graph_index
                 .insert_relationships(id, &obj.relationships);
@@ -641,27 +1071,11 @@ impl KowitoDBEngine {
         // LazyGraphRAG-style auto-enrichment: link to prior objects that share
         // an entity, so the graph is useful even without explicit relationships.
         if auto_graph_enabled() {
-            self.auto_link_entities(id, &obj);
+            self.auto_link_entities(id, obj);
         }
 
-        // Persist to storage
-        let stored = obj_to_stored(&obj)?;
-        self.storage.put(stored).await?;
-
-        // Ensure fulltext index is searchable immediately
-        let _ = self.fulltext_index.commit();
-
-        self.plan_cache.clear();
-
-        info!(
-            "Inserted {}: {} (vecs={}, kws={}, rels={})",
-            id,
-            &obj.content[..obj.content.len().min(80)],
-            obj.embeddings.len(),
-            obj.keywords.len(),
-            obj.relationships.len(),
-        );
-        Ok(id)
+        // Make the change durable and searchable immediately.
+        self.fulltext_index.commit()
     }
 
     /// Insert many objects in one call, returning their ids in order.
@@ -712,11 +1126,7 @@ impl KowitoDBEngine {
                 r.score *= importance_factor * recency_factor;
             }
         }
-        ranked.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
         ranked
     }
 
@@ -776,18 +1186,32 @@ impl KowitoDBEngine {
         }
     }
 
-    /// Delete from all indexes and storage.
+    /// Delete from storage and all indexes.
     pub async fn delete(&self, id: ObjectId) -> KResult<bool> {
+        let _lock = self.write_lock(id).lock().await;
+        let _write = self.begin_write()?;
+
+        // Storage first: if it fails, nothing changes; a crash after it leaves
+        // index entries that the next open reconciles away.
+        let existed = self.storage.delete(id).await?;
+
         self.hnsw_index.remove(id);
         self.vector_index.remove(id);
-        let _ = self.fulltext_index.remove(id);
         self.metadata_index.remove_object(id);
         self.time_index.remove(id);
         self.graph_index.remove_object(id);
         self.multivector_index.remove(id);
         self.content_cache.remove(&id);
+        self.forget_entities(id);
+        let fulltext = self
+            .fulltext_index
+            .remove(id)
+            .and_then(|()| self.fulltext_index.commit());
+        if let Err(e) = fulltext {
+            self.mark_inconsistent();
+            warn!("Full-text removal of {id} failed ({e}); it is reconciled on restart");
+        }
 
-        let existed = self.storage.delete(id).await?;
         if existed {
             self.plan_cache.clear();
             info!("Deleted {}", id);
@@ -798,8 +1222,9 @@ impl KowitoDBEngine {
     /// Update an existing object in place (id preserved), recording a version
     /// history entry. Returns the new version count, or `None` if not found.
     ///
-    /// Changing the content clears the stored embedding so it is regenerated on
-    /// re-insert, keeping the vector index accurate.
+    /// Changing the content clears the stored embedding so it is regenerated,
+    /// keeping the vector index accurate. The new version overwrites the old
+    /// one in storage in a single write, so a failure never loses the object.
     pub async fn update(
         &self,
         id: ObjectId,
@@ -809,6 +1234,7 @@ impl KowitoDBEngine {
         importance: Option<f32>,
         change_description: Option<String>,
     ) -> KResult<Option<usize>> {
+        let _lock = self.write_lock(id).lock().await;
         let Some(mut obj) = self.get(id).await? else {
             return Ok(None);
         };
@@ -833,12 +1259,13 @@ impl KowitoDBEngine {
         obj.record_version(change_description);
         if content_changed {
             obj.embeddings.clear();
+            // Token vectors describe the old content.
+            self.multivector_index.remove(id);
         }
         let version = obj.version_history.len();
 
-        // Re-index: drop stale entries, then re-insert under the same id.
-        self.delete(id).await?;
-        self.insert(obj).await?;
+        let (obj, indexed_text) = self.prepare_insert(obj).await?;
+        self.write_prepared(obj, indexed_text).await?;
         Ok(Some(version))
     }
 
@@ -879,8 +1306,31 @@ impl KowitoDBEngine {
             (intent, plan)
         };
 
+        // A metadata filter is applied to the fused results, so fetch enough
+        // candidates that about `max_results` survive it, scaled by how
+        // selective the filter is.
+        let allowed: Option<HashSet<ObjectId>> =
+            (!metadata_filter.is_empty()).then(|| self.metadata_allowed_set(metadata_filter));
+        let fetch = match &allowed {
+            None => max_results,
+            Some(allowed) => {
+                let total = self.time_index.len().max(1);
+                let scale = total.div_ceil(allowed.len().max(1));
+                max_results.saturating_mul(scale).min(MAX_FILTERED_FETCH)
+            }
+        };
+        let keep_allowed = |ranked: Vec<RankedResult>| -> Vec<RankedResult> {
+            match &allowed {
+                None => ranked,
+                Some(allowed) => ranked
+                    .into_iter()
+                    .filter(|r| allowed.contains(&r.id))
+                    .collect(),
+            }
+        };
+
         // Execute plan against all indexes
-        let raw_results = self.execute_plan(&plan, &intent).await?;
+        let raw_results = self.execute_plan(&plan, &intent, fetch).await?;
         self.cost_tracker.record_index_lookups(raw_results.len());
 
         // Graph traversal
@@ -890,9 +1340,10 @@ impl KowitoDBEngine {
 
         // Rerank with intent-conditioned source weights (the planner's detected
         // intent steers RRF fusion toward the indexes that matter for it).
-        let mut ranked = self
-            .reranker
-            .rerank_for_intent(&all_results, &intent.intent);
+        let mut ranked = keep_allowed(
+            self.reranker
+                .rerank_for_intent(&all_results, &intent.intent),
+        );
 
         // CRAG-style corrective gate: when retrieval confidence is low (few
         // results / little cross-source agreement), broaden the search across
@@ -905,24 +1356,13 @@ impl KowitoDBEngine {
                 self.cost_tracker
                     .record_index_lookups(corrective.iter().map(|r| r.ids.len()).sum());
                 all_results.extend(corrective);
-                ranked = self
-                    .reranker
-                    .rerank_for_intent(&all_results, &intent.intent);
+                ranked = keep_allowed(
+                    self.reranker
+                        .rerank_for_intent(&all_results, &intent.intent),
+                );
                 debug!("Corrective retrieval engaged for low-confidence query");
             }
         }
-
-        // Apply metadata filter (via the metadata index) before limiting, so the
-        // result count reflects the constraint.
-        let ranked: Vec<RankedResult> = if metadata_filter.is_empty() {
-            ranked
-        } else {
-            let allowed = self.metadata_allowed_set(metadata_filter);
-            ranked
-                .into_iter()
-                .filter(|r| allowed.contains(&r.id))
-                .collect()
-        };
 
         // Boost results by stored `importance` (priority) and recency (newer
         // knowledge), so high-priority and fresh items surface. Applied over a
@@ -970,11 +1410,7 @@ impl KowitoDBEngine {
             for (l, s) in loaded.iter_mut().zip(scores) {
                 l.relevance_score = s;
             }
-            loaded.sort_by(|a, b| {
-                b.relevance_score
-                    .partial_cmp(&a.relevance_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            loaded.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
         }
         loaded
     }
@@ -995,7 +1431,12 @@ impl KowitoDBEngine {
                         self.content_cache.insert(r.id, val.clone());
                         val
                     }
-                    _ => format!("<Object {}>", r.id),
+                    // Deleted since it was indexed: don't spend a result slot on it.
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("Could not load result {}: {e}", r.id);
+                        continue;
+                    }
                 }
             };
 
@@ -1061,10 +1502,13 @@ impl KowitoDBEngine {
     }
 
     /// Execute the planned retrieval steps.
+    /// `fetch` is the minimum number of candidates each vector/keyword step
+    /// retrieves (raised when results will be post-filtered).
     async fn execute_plan(
         &self,
         plan: &ExecutionPlan,
         intent: &DetectedIntent,
+        fetch: usize,
     ) -> KResult<Vec<IndexResult>> {
         let mut all_results: Vec<IndexResult> = Vec::new();
         let question = &plan.question;
@@ -1082,7 +1526,9 @@ impl KowitoDBEngine {
             match step.step_type {
                 kowitodb_planner::PlanStepType::VectorSearch => {
                     if let Some(ref emb) = query_embedding {
-                        let results = self.hnsw_index.search(emb, step.limit.unwrap_or(20));
+                        let results = self
+                            .hnsw_index
+                            .search(emb, step.limit.unwrap_or(20).max(fetch));
                         if !results.is_empty() {
                             let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
                             let scores: Vec<_> = results.iter().map(|(_, s)| *s).collect();
@@ -1099,7 +1545,7 @@ impl KowitoDBEngine {
                     if !query_str.is_empty() {
                         if let Ok(results) = self
                             .fulltext_index
-                            .search(&query_str, step.limit.unwrap_or(20))
+                            .search(&query_str, step.limit.unwrap_or(20).max(fetch))
                         {
                             if !results.is_empty() {
                                 let ids: Vec<_> = results.iter().map(|(id, _)| *id).collect();
@@ -1114,9 +1560,13 @@ impl KowitoDBEngine {
                     }
                 }
                 kowitodb_planner::PlanStepType::TimeFilter => {
-                    if !dates.is_empty() {
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        let ids = self.time_index.before(now_ms);
+                    // Only a concrete year (optionally with a month) scopes by
+                    // creation time; newest first, capped, so a date in the
+                    // question can't flood the fusion with the whole database.
+                    if let Some((start, end)) = created_range_for(dates) {
+                        let mut ids = self.time_index.between(start, end);
+                        ids.reverse();
+                        ids.truncate(TIME_FILTER_CAP);
                         if !ids.is_empty() {
                             let scores = vec![1.0; ids.len()];
                             all_results.push(IndexResult::new(ids, scores, IndexSource::Time));
@@ -1196,7 +1646,7 @@ impl KowitoDBEngine {
     /// Results are loaded from storage with real content.
     pub async fn sql_query(&self, sql: &str) -> KResult<Vec<LoadedResult>> {
         let stmt = kowitodb_sql::parse_sql(sql)
-            .map_err(|e| kowitodb_core::KowitoError::Planner(e.to_string()))?;
+            .map_err(|e| kowitodb_core::KowitoError::InvalidInput(e.to_string()))?;
 
         let (where_clauses, limit) = match stmt {
             kowitodb_sql::SqlStatement::Select {
@@ -1206,104 +1656,87 @@ impl KowitoDBEngine {
             } => (where_clauses, limit),
         };
 
-        let mut candidate_sets: Vec<Vec<ObjectId>> = Vec::new();
-
+        // Narrow candidates with the indexes where one applies (AND semantics:
+        // a clause matching nothing empties the result). Every clause is then
+        // checked exactly against each loaded object.
+        let mut candidates: Option<Vec<ObjectId>> = None;
+        let mut narrow = |ids: Vec<ObjectId>| {
+            candidates = Some(match candidates.take() {
+                None => ids,
+                Some(mut current) => {
+                    let ids: HashSet<ObjectId> = ids.into_iter().collect();
+                    current.retain(|id| ids.contains(id));
+                    current
+                }
+            });
+        };
         for clause in &where_clauses {
             match clause {
                 kowitodb_sql::WhereClause::MetadataEquals { key, value } => {
-                    let ids = self.metadata_index.query_exact(key, value);
-                    if !ids.is_empty() {
-                        candidate_sets.push(ids);
-                    }
+                    narrow(self.metadata_index.query_exact(key, value));
                 }
                 kowitodb_sql::WhereClause::MetadataContains { key, substring } => {
-                    let ids = self.metadata_index.query_contains(key, substring);
-                    if !ids.is_empty() {
-                        candidate_sets.push(ids);
-                    }
+                    narrow(self.metadata_index.query_contains(key, substring));
                 }
-                kowitodb_sql::WhereClause::KeywordContains { substring } => {
-                    // Use full-text search for keyword contains
-                    if let Ok(results) = self.fulltext_index.search(substring, 100) {
-                        if !results.is_empty() {
-                            candidate_sets.push(results.into_iter().map(|(id, _)| id).collect());
-                        }
-                    }
+                kowitodb_sql::WhereClause::CreatedAfter { timestamp }
+                | kowitodb_sql::WhereClause::CreatedBefore { timestamp } => {
+                    let dt = chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|e| {
+                        kowitodb_core::KowitoError::InvalidInput(format!(
+                            "invalid created_at timestamp '{timestamp}' (expected RFC 3339): {e}"
+                        ))
+                    })?;
+                    let ms = dt.timestamp_millis();
+                    narrow(match clause {
+                        kowitodb_sql::WhereClause::CreatedAfter { .. } => self.time_index.after(ms),
+                        _ => self.time_index.before(ms),
+                    });
                 }
-                kowitodb_sql::WhereClause::ContentContains { substring } => {
-                    if let Ok(results) = self.fulltext_index.search(substring, 100) {
-                        if !results.is_empty() {
-                            candidate_sets.push(results.into_iter().map(|(id, _)| id).collect());
-                        }
-                    }
-                }
-                kowitodb_sql::WhereClause::CreatedAfter { timestamp } => {
-                    // Parse timestamp to milliseconds
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
-                        let ids = self.time_index.after(dt.timestamp_millis());
-                        if !ids.is_empty() {
-                            candidate_sets.push(ids);
-                        }
-                    }
-                }
-                kowitodb_sql::WhereClause::CreatedBefore { timestamp } => {
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
-                        let ids = self.time_index.before(dt.timestamp_millis());
-                        if !ids.is_empty() {
-                            candidate_sets.push(ids);
-                        }
-                    }
-                }
-                _ => {
-                    debug!("SQL clause not yet routed to index: {:?}", clause);
-                }
+                // Keyword/content/importance predicates have no exact index;
+                // they are checked per object below.
+                _ => {}
             }
         }
-
-        // Intersect candidate sets (AND semantics)
-        let final_ids: Vec<ObjectId> = if candidate_sets.is_empty() {
-            // No WHERE clauses: get all objects
-            self.storage.list_ids().await?
-        } else if candidate_sets.len() == 1 {
-            candidate_sets.into_iter().next().unwrap()
-        } else {
-            // Intersect all sets
-            let mut sets: Vec<std::collections::HashSet<ObjectId>> = candidate_sets
-                .into_iter()
-                .map(|v| v.into_iter().collect())
-                .collect();
-            let (first, rest) = sets.split_at_mut(1);
-            first[0].retain(|id| rest.iter().all(|s| s.contains(id)));
-            first[0].iter().copied().collect()
+        let candidates = match candidates {
+            Some(ids) => ids,
+            None => self.storage.list_ids().await?,
         };
 
-        // Apply limit
-        let final_ids: Vec<ObjectId> = if let Some(lim) = limit {
-            final_ids.into_iter().take(lim).collect()
-        } else {
-            final_ids
-        };
-
-        // Load content for results
-        let mut loaded = Vec::with_capacity(final_ids.len());
-        for id in &final_ids {
-            let content = if let Some(cached) = self.content_cache.get(id) {
-                cached
-            } else if let Ok(Some(stored)) = self.storage.get(*id).await {
-                let val = stored.content.clone();
-                self.content_cache.insert(*id, val.clone());
-                val
-            } else {
-                format!("<Object {}>", id)
+        let mut loaded = Vec::new();
+        for id in candidates {
+            if limit.is_some_and(|lim| loaded.len() >= lim) {
+                break;
+            }
+            let Some(obj) = self.get(id).await? else {
+                continue;
             };
-
+            let mut matches = true;
+            for clause in &where_clauses {
+                if !clause_matches(&obj, clause)? {
+                    matches = false;
+                    break;
+                }
+            }
+            if !matches {
+                continue;
+            }
+            let metadata = obj
+                .metadata
+                .iter()
+                .map(|(k, v)| {
+                    let v = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), v)
+                })
+                .collect();
             loaded.push(LoadedResult {
-                id: *id,
-                content,
+                id,
+                content: obj.content,
                 relevance_score: 1.0,
                 retrieval_sources: vec!["sql".to_string()],
-                metadata: HashMap::new(),
-                importance: 0.5,
+                metadata,
+                importance: obj.importance,
             });
         }
 
@@ -1536,6 +1969,14 @@ impl KowitoDBEngine {
     /// from a multi-vector model (e.g. ColBERT) — KowitoDB indexes and scores
     /// them; it does not bundle the model.
     pub fn index_token_vectors(&self, id: ObjectId, tokens: Vec<Vec<f32>>) {
+        let _write = match self.begin_write() {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                warn!("Could not clear the index CLEAN marker ({e})");
+                self.mark_inconsistent();
+                None
+            }
+        };
         self.multivector_index.insert(id, tokens);
     }
 
@@ -1573,10 +2014,9 @@ impl KowitoDBEngine {
             _ => TurnRole::User,
         };
 
-        let mut session = self.agent_memory.get_or_create(session_id);
-        session.add_turn(turn_role.clone(), content.clone());
-        let count = session.turn_count() as u32;
-        self.agent_memory.save(session);
+        let count = self
+            .agent_memory
+            .record_turn(session_id, turn_role.clone(), content.clone()) as u32;
 
         // Promote to searchable knowledge (idempotent by stable id), linked in
         // the graph to the existing knowledge the turn mentions. With an LLM
@@ -1628,7 +2068,13 @@ impl KowitoDBEngine {
             }
         }
         for e in &entities {
-            idx.entry(e.clone()).or_default().push(id);
+            let ids = idx.entry(e.clone()).or_default();
+            if !ids.contains(&id) {
+                ids.push(id);
+                if ids.len() > ENTITY_INDEX_CAP {
+                    ids.remove(0);
+                }
+            }
         }
         drop(idx);
 
@@ -1640,11 +2086,39 @@ impl KowitoDBEngine {
             target_id,
             weight: Some(0.5),
         };
-        let out: Vec<Relationship> = targets.iter().map(|&t| edge(t)).collect();
-        self.graph_index.insert_relationships(id, &out);
+        // Add edges without replacing the objects' existing (explicit or
+        // earlier auto-linked) relationships.
         for &t in &targets {
-            self.graph_index.insert_relationships(t, &[edge(id)]);
+            self.graph_index.add_relationship(id, edge(t));
+            self.graph_index.add_relationship(t, edge(id));
         }
+    }
+
+    /// Register `obj`'s entities for future auto-linking without linking it
+    /// (used when rebuilding from storage).
+    fn register_entities(&self, obj: &KnowledgeObject) {
+        if !auto_graph_enabled() {
+            return;
+        }
+        let mut idx = self.entity_index.lock();
+        for e in extract_entities(obj) {
+            let ids = idx.entry(e).or_default();
+            if !ids.contains(&obj.id) {
+                ids.push(obj.id);
+                if ids.len() > ENTITY_INDEX_CAP {
+                    ids.remove(0);
+                }
+            }
+        }
+    }
+
+    /// Drop a deleted object from the entity index so new inserts don't link
+    /// to it.
+    fn forget_entities(&self, id: ObjectId) {
+        self.entity_index.lock().retain(|_, ids| {
+            ids.retain(|x| *x != id);
+            !ids.is_empty()
+        });
     }
 
     /// Up to `k` existing knowledge objects related to `text` (via the full-text
@@ -2804,5 +3278,391 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("Globex"));
+    }
+
+    fn temp_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("kowitodb-{tag}-{}", uuid::Uuid::new_v4()));
+        let storage = base.join("storage");
+        let index = base.join("index");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::create_dir_all(&index).unwrap();
+        (base, storage, index)
+    }
+
+    /// Writes after the last checkpoint must survive a crash (no final
+    /// checkpoint): the stale snapshot is not trusted and is rebuilt.
+    #[tokio::test]
+    async fn test_unclean_shutdown_rebuilds_stale_snapshot() {
+        let (base, storage_path, index_path) = temp_dirs("crash");
+        let (kept, deleted, late, late2);
+        let (deleted_vec, late_vec);
+        {
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
+                .unwrap();
+            kept = engine
+                .insert(KnowledgeObject::new("alpha document"))
+                .await
+                .unwrap();
+            deleted = engine
+                .insert(KnowledgeObject::new("bravo document"))
+                .await
+                .unwrap();
+            engine.checkpoint().unwrap();
+            assert!(index_path.join(CLEAN_MARKER).exists());
+
+            late = engine
+                .insert(KnowledgeObject::new("charlie document"))
+                .await
+                .unwrap();
+            late2 = engine
+                .insert(KnowledgeObject::new("delta document"))
+                .await
+                .unwrap();
+            let vector_of = |obj: KnowledgeObject| obj.embeddings.into_values().next().unwrap();
+            deleted_vec = vector_of(engine.get(deleted).await.unwrap().unwrap());
+            late_vec = vector_of(engine.get(late).await.unwrap().unwrap());
+            assert!(engine.delete(deleted).await.unwrap());
+            assert!(!index_path.join(CLEAN_MARKER).exists());
+            // Dropped without a final checkpoint, like SIGKILL or a crash.
+        }
+
+        let engine = KowitoDBEngine::open(&storage_path, &index_path)
+            .await
+            .unwrap();
+        // The snapshot on disk holds {alpha, bravo}; storage holds
+        // {alpha, charlie, delta}. The vector index must match storage.
+        assert_eq!(engine.stats().await.unwrap().vector_count, 3);
+        let vector_hits = |v: &Embedding| -> Vec<ObjectId> {
+            engine
+                .hnsw_index
+                .search(v, 10)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert!(vector_hits(&late_vec).contains(&late));
+        assert!(!vector_hits(&deleted_vec).contains(&deleted));
+        assert!(engine.get(kept).await.unwrap().is_some());
+        assert!(engine.get(late2).await.unwrap().is_some());
+        assert!(engine
+            .fulltext_index
+            .search("bravo", 10)
+            .unwrap()
+            .is_empty());
+
+        // A clean checkpoint with no writes in flight marks it clean again, and
+        // an idle checkpoint leaves it so.
+        engine.checkpoint().unwrap();
+        assert!(index_path.join(CLEAN_MARKER).exists());
+        engine.checkpoint().unwrap();
+        assert!(index_path.join(CLEAN_MARKER).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An engine whose indexes were never loaded (`new`, as the CLI `insert`
+    /// command uses) must not overwrite the snapshot with a partial index.
+    #[tokio::test]
+    async fn test_unloaded_engine_never_clobbers_snapshot() {
+        let (base, storage_path, index_path) = temp_dirs("clobber");
+        {
+            let engine = KowitoDBEngine::open(&storage_path, &index_path)
+                .await
+                .unwrap();
+            for i in 0..3 {
+                engine
+                    .insert(KnowledgeObject::new(format!("document {i}")))
+                    .await
+                    .unwrap();
+            }
+            engine.checkpoint().unwrap();
+        }
+        {
+            let engine = KowitoDBEngine::new(&storage_path, &index_path).unwrap();
+            engine
+                .insert(KnowledgeObject::new("added offline"))
+                .await
+                .unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let engine = KowitoDBEngine::open(&storage_path, &index_path)
+            .await
+            .unwrap();
+        assert_eq!(engine.stats().await.unwrap().vector_count, 4);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn test_non_ascii_content_does_not_panic() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        // 3-byte characters, long enough to cross the 80-char log preview and
+        // the 2000-byte context trim at a non-boundary.
+        let thai = "สวัสดีครับ".repeat(100);
+        let id = engine
+            .insert(KnowledgeObject::new(thai.clone()))
+            .await
+            .unwrap();
+        assert_eq!(engine.get(id).await.unwrap().unwrap().content, thai);
+        let answer = engine.ask("สวัสดีครับ", 5).await.unwrap();
+        assert!(!answer.results.is_empty());
+        engine
+            .sql_query("SELECT * FROM knowledge WHERE content LIKE '%สวัสดี%'")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_auto_link_keeps_explicit_relationships() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let target = engine
+            .insert(KnowledgeObject::new("plain target"))
+            .await
+            .unwrap();
+        let a = engine
+            .insert(
+                KnowledgeObject::new("Acme Corporation raised money.")
+                    .with_relationship("invested_in", target),
+            )
+            .await
+            .unwrap();
+        let b = engine
+            .insert(KnowledgeObject::new("Acme Corporation hired a CEO."))
+            .await
+            .unwrap();
+        let out_a = engine.graph_index.out_edges(a);
+        assert!(out_a
+            .iter()
+            .any(|r| r.target_id == target && r.relation_type == "invested_in"));
+        assert!(out_a
+            .iter()
+            .any(|r| r.target_id == b && r.relation_type == "co_mentions"));
+    }
+
+    #[tokio::test]
+    async fn test_reinsert_replaces_index_entries() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let first = KnowledgeObject::new("tenant one data").with_metadata("tenant", "acme");
+        let id = first.id;
+        engine.insert(first).await.unwrap();
+        let mut second = KnowledgeObject::new("tenant two data").with_metadata("tenant", "globex");
+        second.id = id;
+        engine.insert(second).await.unwrap();
+
+        assert!(engine
+            .metadata_index
+            .query_exact("tenant", "acme")
+            .is_empty());
+        assert_eq!(
+            engine.metadata_index.query_exact("tenant", "globex"),
+            vec![id]
+        );
+        assert_eq!(engine.stats().await.unwrap().vector_count, 1);
+        let filter = HashMap::from([("tenant".to_string(), "acme".to_string())]);
+        let answer = engine
+            .ask_filtered("tenant data", 5, None, &filter)
+            .await
+            .unwrap();
+        assert!(answer.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_is_in_place_and_keeps_incoming_edges() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let target = engine
+            .insert(KnowledgeObject::new("target v1"))
+            .await
+            .unwrap();
+        let source = engine
+            .insert(KnowledgeObject::new("source doc").with_relationship("cites", target))
+            .await
+            .unwrap();
+        engine
+            .update(
+                target,
+                Some("target v2".into()),
+                HashMap::new(),
+                vec![],
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            engine.get(target).await.unwrap().unwrap().content,
+            "target v2"
+        );
+        assert!(engine
+            .graph_index
+            .in_edges(target)
+            .iter()
+            .any(|(_, src)| *src == source));
+        assert_eq!(engine.stats().await.unwrap().vector_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_sql_query_where_semantics() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        engine
+            .insert(
+                KnowledgeObject::new("important note")
+                    .with_importance(0.9)
+                    .with_metadata("company", "Acme"),
+            )
+            .await
+            .unwrap();
+        engine
+            .insert(KnowledgeObject::new("minor note").with_importance(0.2))
+            .await
+            .unwrap();
+
+        let none = engine
+            .sql_query("SELECT * FROM knowledge WHERE metadata.company = 'NoSuchCo'")
+            .await
+            .unwrap();
+        assert!(
+            none.is_empty(),
+            "a predicate matching nothing must return nothing"
+        );
+
+        let high = engine
+            .sql_query("SELECT * FROM knowledge WHERE importance >= 0.8")
+            .await
+            .unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].content, "important note");
+        assert_eq!(
+            high[0].metadata.get("company").map(String::as_str),
+            Some("Acme")
+        );
+
+        let both = engine
+            .sql_query("SELECT * FROM knowledge WHERE content LIKE '%note%' AND importance <= 0.5")
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].content, "minor note");
+
+        assert!(engine
+            .sql_query("SELECT * FROM knowledge WHERE created_at > 'yesterday'")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_embeddings_are_rejected() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        engine
+            .insert(KnowledgeObject::new("three dims").with_embedding("m", vec![1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        let wrong_dim = engine
+            .insert(KnowledgeObject::new("five dims").with_embedding("m", vec![1.0; 5]))
+            .await;
+        assert!(matches!(
+            wrong_dim,
+            Err(kowitodb_core::KowitoError::InvalidInput(_))
+        ));
+        let nan = engine
+            .insert(KnowledgeObject::new("nan").with_embedding("m", vec![f32::NAN, 0.0, 0.0]))
+            .await;
+        assert!(matches!(
+            nan,
+            Err(kowitodb_core::KowitoError::InvalidInput(_))
+        ));
+        assert_eq!(engine.stats().await.unwrap().vector_count, 1);
+    }
+
+    /// A selective metadata filter must still find matches that rank outside
+    /// the unfiltered top candidates.
+    #[tokio::test]
+    async fn test_metadata_filter_finds_rare_matches() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        for i in 0..60 {
+            engine
+                .insert(
+                    KnowledgeObject::new(format!("shared topic text number {i}"))
+                        .with_metadata("session_id", "other"),
+                )
+                .await
+                .unwrap();
+        }
+        let target = engine
+            .insert(
+                KnowledgeObject::new("shared topic text number 999")
+                    .with_metadata("session_id", "target"),
+            )
+            .await
+            .unwrap();
+        let filter = HashMap::from([("session_id".to_string(), "target".to_string())]);
+        let answer = engine
+            .ask_filtered("shared topic text", 5, None, &filter)
+            .await
+            .unwrap();
+        let ids: Vec<_> = answer.results.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec![target.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_deleted_objects_leave_keyword_search() {
+        let engine = KowitoDBEngine::new_in_memory().unwrap();
+        let id = engine
+            .insert(KnowledgeObject::new("zebra unique word"))
+            .await
+            .unwrap();
+        assert_eq!(engine.fulltext_index.search("zebra", 10).unwrap().len(), 1);
+        assert!(engine.delete(id).await.unwrap());
+        assert!(engine
+            .fulltext_index
+            .search("zebra", 10)
+            .unwrap()
+            .is_empty());
+        assert!(engine.ask("zebra", 5).await.unwrap().results.is_empty());
+    }
+
+    #[test]
+    fn test_read_only_sql_guard_uses_word_boundaries() {
+        assert!(is_read_only_sql(
+            "SELECT created_at, updated_at FROM knowledge"
+        ));
+        assert!(is_read_only_sql("select\tcount(*)\nfrom knowledge"));
+        assert!(!is_read_only_sql("SELECT 1;\tDROP TABLE knowledge"));
+        assert!(!is_read_only_sql(
+            "WITH x AS (SELECT 1)\nINSERT\tINTO t SELECT * FROM x"
+        ));
+        assert!(!is_read_only_sql(
+            "SELECT * FROM knowledge WHERE 1=1\nUNION SELECT * FROM (COPY t TO 'x')"
+        ));
+        assert!(!is_read_only_sql("DELETE FROM knowledge"));
+    }
+
+    #[test]
+    fn test_created_range_for_dates() {
+        use chrono::{TimeZone, Utc};
+        let ms = |y, m, d| {
+            Utc.with_ymd_and_hms(y, m, d, 0, 0, 0)
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert_eq!(created_range_for(&["march".into()]), None);
+        assert_eq!(
+            created_range_for(&["2024".into()]),
+            Some((ms(2024, 1, 1), ms(2025, 1, 1) - 1))
+        );
+        assert_eq!(
+            created_range_for(&["march".into(), "2024".into()]),
+            Some((ms(2024, 3, 1), ms(2024, 4, 1) - 1))
+        );
+        assert_eq!(
+            created_range_for(&["december".into(), "2023".into()]),
+            Some((ms(2023, 12, 1), ms(2024, 1, 1) - 1))
+        );
+    }
+
+    #[test]
+    fn test_preview_respects_char_boundaries() {
+        let thai = "สวัสดี".repeat(30);
+        assert_eq!(preview(&thai, 80).chars().count(), 80);
+        assert_eq!(preview("short", 80), "short");
     }
 }

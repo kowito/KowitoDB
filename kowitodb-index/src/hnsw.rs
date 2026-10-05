@@ -17,7 +17,7 @@ use kowitodb_core::{Embedding, ObjectId};
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Set of object ids using a fast (ahash) hasher. UUID hashing with the default
 /// SipHasher dominates the hot path, so the index uses ahash everywhere ids are
@@ -658,7 +658,7 @@ impl HnswIndex {
             match *dim {
                 None => *dim = Some(vector.len()),
                 Some(d) if d != vector.len() => {
-                    debug!(
+                    warn!(
                         "HNSW: skipping insert of {}-dim vector into a {}-dim index ({})",
                         vector.len(),
                         d,
@@ -986,7 +986,7 @@ impl HnswIndex {
             candidates.into_iter().zip(distances).collect()
         };
 
-        results.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
         results.truncate(k);
 
         // Map indices back to object ids and convert squared distance to a
@@ -1045,12 +1045,7 @@ impl HnswIndex {
 
     /// Persist the index to `path` (atomic write via a temp file + rename).
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
-        let bytes = self.to_bytes()?;
-        let tmp = path.with_extension("bin.tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::write_atomic(path.as_ref(), &self.to_bytes()?)
     }
 
     /// Load an index from `path`, or `Ok(None)` if the file does not exist.
@@ -1212,7 +1207,7 @@ impl HnswIndex {
             .iter()
             .map(|&idx| (idx, scorer.score(&nodes[idx as usize].vector)))
             .collect();
-        sorted.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
         // Default: keep the `m` closest (fast). The diversity heuristic below is
         // opt-in via `diversify_neighbors`.
@@ -1263,7 +1258,7 @@ impl HnswIndex {
             .iter()
             .map(|&c| (c, scorer.node_dist(center_vec, &nodes[c as usize].vector)))
             .collect();
-        sorted.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
         if !self.params.diversify_neighbors {
             return sorted.into_iter().take(m).map(|(c, _)| c).collect();
@@ -1302,21 +1297,21 @@ impl HnswIndex {
 /// Summed over **8 independent accumulators** rather than one: a single `.sum()`
 /// is latency-bound (each add waits on the previous on the FP pipeline), whereas
 /// 8 lanes break the dependency chain so the CPU pipelines them and the loop
-/// auto-vectorizes cleanly to NEON/SSE. `chunks_exact(8)` keeps the hot loop
+/// auto-vectorizes cleanly to NEON/SSE. `as_chunks::<8>()` keeps the hot loop
 /// bounds-check-free.
 #[inline]
 fn squared_dist(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
-    let mut ai = a.chunks_exact(8);
-    let mut bi = b.chunks_exact(8);
-    for (ca, cb) in ai.by_ref().zip(bi.by_ref()) {
+    let (a_chunks, a_rest) = a.as_chunks::<8>();
+    let (b_chunks, b_rest) = b.as_chunks::<8>();
+    for (ca, cb) in a_chunks.iter().zip(b_chunks) {
         for j in 0..8 {
             let d = ca[j] - cb[j];
             acc[j] += d * d;
         }
     }
     let mut sum = acc.iter().sum::<f32>();
-    for (x, y) in ai.remainder().iter().zip(bi.remainder()) {
+    for (x, y) in a_rest.iter().zip(b_rest) {
         let d = x - y;
         sum += d * d;
     }
@@ -1328,16 +1323,16 @@ fn squared_dist(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn int8_dist_sq(query: &[f32], q: &[i8]) -> f32 {
     let mut acc = [0.0f32; 8];
-    let mut qi = query.chunks_exact(8);
-    let mut ci = q.chunks_exact(8);
-    for (cq, cc) in qi.by_ref().zip(ci.by_ref()) {
+    let (q_chunks, q_rest) = query.as_chunks::<8>();
+    let (c_chunks, c_rest) = q.as_chunks::<8>();
+    for (cq, cc) in q_chunks.iter().zip(c_chunks) {
         for j in 0..8 {
             let d = cq[j] - cc[j] as f32 * INV_QUANT_SCALE;
             acc[j] += d * d;
         }
     }
     let mut sum = acc.iter().sum::<f32>();
-    for (x, &c) in qi.remainder().iter().zip(ci.remainder()) {
+    for (x, &c) in q_rest.iter().zip(c_rest) {
         let d = x - c as f32 * INV_QUANT_SCALE;
         sum += d * d;
     }
@@ -1414,7 +1409,7 @@ mod tests {
                 .iter()
                 .map(|(id, v)| (*id, squared_dist(q, v)))
                 .collect();
-            bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            bf.sort_by(|a, b| a.1.total_cmp(&b.1));
             let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
             for (id, _) in idx.search(q, 10) {
                 if truth.contains(&id) {
@@ -1464,7 +1459,7 @@ mod tests {
                 .iter()
                 .map(|(id, v)| (*id, squared_dist(q, v)))
                 .collect();
-            bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            bf.sort_by(|a, b| a.1.total_cmp(&b.1));
             let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
             for (id, _) in idx.search(q, 10) {
                 if truth.contains(&id) {
@@ -1511,7 +1506,7 @@ mod tests {
                     .iter()
                     .map(|(id, v)| (*id, squared_dist(q, v)))
                     .collect();
-                bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                bf.sort_by(|a, b| a.1.total_cmp(&b.1));
                 let truth: HashSet<_> = bf.iter().take(10).map(|(id, _)| *id).collect();
                 for (id, _) in idx.search(q, 10) {
                     if truth.contains(&id) {

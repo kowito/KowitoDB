@@ -42,16 +42,18 @@ incremental = false
 faster, smaller binary — expect the optimized release build (which compiles
 Arrow/DataFusion) to take several minutes from clean.
 
-To build the server with the optional Lance backend:
+To build the binary with the optional Lance backend available:
 
 ```bash
-cargo build --release -p kowitodb-server --features lance
+cargo build --release -p kowitodb --features lance
+# -> target/release/kowitodb, then: kowitodb serve --storage lance
 ```
 
-The `lance` feature is declared on `kowitodb-server` (and forwarded to
-`kowitodb-storage`). The default `kowitodb` CLI binary does **not** enable it
-and always uses sled; to serve over Lance you build/run the server crate with
-the feature and use `KowitoDBEngine::new_with_lance`. See
+The `lance` feature on the `kowitodb` binary crate forwards to
+`kowitodb-server/lance` (and on to `kowitodb-storage`). Building
+`-p kowitodb-server --features lance` only builds the library, not the binary.
+A default build (no feature) still accepts `--storage lance` but exits with an
+error telling you to rebuild with the feature. See
 [Storage backend selection](#storage-backend-selection).
 
 ## Run the server
@@ -93,7 +95,10 @@ variable) plus a few embedding/logging env vars. There is no config file.
 | --- | --- | --- | --- | --- |
 | `--addr` | `-a` | — | `127.0.0.1:50051` | Socket address to bind the gRPC server. Use `0.0.0.0:50051` to accept remote connections. |
 | `--storage-path` | `-s` | — | `./data/storage` | Directory for the sled object store. |
-| `--index-path` | `-i` | — | `./data/index` | Directory for the Tantivy full-text index (created under `{index-path}/tantivy/`). |
+| `--index-path` | `-i` | — | `./data/index` | Directory for the Tantivy full-text index (`{index-path}/tantivy/`), the vector-index snapshot, and the agent-session store (`{index-path}/sessions`). |
+| `--storage` | — | `KOWITODB_STORAGE` | `sled` | Storage backend: `sled` or `lance` (`lance` requires a build with `--features lance`). |
+| `--lance-uri` | — | `KOWITODB_LANCE_URI` | `{storage-path}/lance` | Lance dataset URI/path, used with `--storage lance`. |
+| `--max-results` | — | `KOWITODB_MAX_RESULTS` | `100` | Upper bound on results returned by `Ask`/`Search`. |
 | `--api-key` | — | `KOWITODB_API_KEY` | _(unset)_ | Require this key on every gRPC call, presented as `authorization: Bearer <key>` or `x-api-key: <key>`. Auth is off when unset. |
 | `--tls-cert` | — | `KOWITODB_TLS_CERT` | _(unset)_ | Path to a PEM TLS certificate chain. Enables TLS together with `--tls-key`. |
 | `--tls-key` | — | `KOWITODB_TLS_KEY` | _(unset)_ | Path to the PEM TLS private key. |
@@ -109,16 +114,16 @@ these flags.
 | Variable | Effect |
 | --- | --- |
 | `RUST_LOG` | Sets the `tracing-subscriber` `EnvFilter`. Defaults to `info` when unset. Examples: `RUST_LOG=info`, `RUST_LOG=kowitodb=debug,warn`. |
-| `KOWITODB_API_KEY`, `KOWITODB_TLS_CERT`, `KOWITODB_TLS_KEY`, `KOWITODB_METRICS_ADDR` | Fallbacks for the corresponding `serve` flags above. |
+| `KOWITODB_API_KEY`, `KOWITODB_TLS_CERT`, `KOWITODB_TLS_KEY`, `KOWITODB_METRICS_ADDR`, `KOWITODB_STORAGE`, `KOWITODB_LANCE_URI`, `KOWITODB_MAX_RESULTS` | Fallbacks for the corresponding `serve` flags above. |
 | `KOWITODB_EMBEDDING_PROVIDER` | Selects the embedding provider: `openai`, `ollama`, or (unset/other) the deterministic dev proxy. |
 | `OPENAI_API_KEY` / `KOWITODB_OPENAI_API_KEY` | API key for the `openai` provider. |
 | `KOWITODB_OPENAI_BASE_URL` | OpenAI-compatible base URL (default `https://api.openai.com/v1`). |
 | `KOWITODB_EMBEDDING_MODEL` | Embedding model name (default `text-embedding-3-small`; `nomic-embed-text` for Ollama). |
 | `KOWITODB_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434/v1`). |
 
-There is no env var for the bind port (use `--addr`) and no env var that switches
-the storage backend (that is a build-time feature plus a code-level constructor
-choice — see below).
+There is no env var for the bind address (use `--addr`) or for the
+storage/index paths (use `--storage-path`/`--index-path`). The storage backend is
+selected with `--storage` / `KOWITODB_STORAGE` (see below).
 
 ### Embedding provider
 
@@ -148,46 +153,66 @@ content — re-embed existing objects (via `update`) if you switch models.
 
 | Backend | How to select | Persistence |
 | --- | --- | --- |
-| sled (default) | Default `serve` / CLI; nothing to do. | Disk |
-| Lance | Build `kowitodb-server` with `--features lance` and call `KowitoDBEngine::new_with_lance(uri, index_path)` from a server entry point. | Disk (Arrow/columnar) |
+| sled (default) | Default `serve` / CLI; nothing to do (`--storage sled`). | Disk |
+| Lance | Build with `cargo build --release -p kowitodb --features lance`, then `kowitodb serve --storage lance` (or `KOWITODB_STORAGE=lance`), optionally with `--lance-uri` / `KOWITODB_LANCE_URI`. | Disk (Arrow/columnar) |
 
-The shipped `kowitodb serve` binary constructs the engine with
-`KowitoDBEngine::new(...)` (sled). There is no CLI flag to switch to Lance in
-v0.1.0; selecting Lance requires a small server binary that calls
-`new_with_lance` and is built with the `lance` feature. The Lance `uri` may be a
-local path or any URI Lance supports.
+```bash
+cargo build --release -p kowitodb --features lance
+KOWITODB_STORAGE=lance ./target/release/kowitodb serve \
+  --storage-path /var/lib/kowitodb/storage \
+  --index-path /var/lib/kowitodb/index
+# Lance dataset defaults to {storage-path}/lance; override with --lance-uri
+```
+
+With `--storage lance`, `serve` opens the engine via
+`KowitoDBEngine::new_with_lance(uri, index_path)`; the `uri` may be a local path
+or any URI Lance supports. Only `serve` selects the backend — the embedded
+`ask`/`sql`/`stats` CLI commands always open the sled store. A binary built
+without the feature rejects `--storage lance` at startup with an error.
 
 ## Dockerfile
 
 The repository root ships a real multi-stage [`Dockerfile`](../Dockerfile). It:
 
-- builds the tuned release binary in a `rust:1-bookworm` stage, installing
-  `protobuf-compiler` (`protoc`) — which `tonic-build` requires to compile the
-  gRPC definitions;
-- ships the binary on `debian:bookworm-slim` with `ca-certificates`;
+- builds the tuned release binary (`cargo build --release --locked -p kowitodb`)
+  in a `rust:1-bookworm` stage, caching third-party dependencies in their own
+  layer (the placeholder workspace crates used for that layer are fully
+  discarded before the real build);
+- ships the binary on `debian:bookworm-slim` with `ca-certificates` and `curl`;
+- runs as the unprivileged user `kowitodb` (uid/gid **10001**), which owns
+  `/data`;
 - mounts a `/data` volume, exposes **50051** (gRPC) and **9090**
   (Prometheus `/metrics` + `/healthz`), and its default `CMD` runs
-  `serve` with `--metrics-addr 0.0.0.0:9090` against `/data/storage` and
-  `/data/index`.
+  `serve --addr 0.0.0.0:50051` with `--metrics-addr 0.0.0.0:9090` against
+  `/data/storage` and `/data/index`;
+- declares a `HEALTHCHECK` that polls `http://127.0.0.1:9090/healthz` (if you
+  override `CMD` without `--metrics-addr 0.0.0.0:9090`, run with
+  `--no-healthcheck`) and `STOPSIGNAL SIGTERM` for graceful shutdown.
 
 Build and run:
 
 ```bash
-docker build -t kowitodb:0.1.0 .
+docker build -t kowitodb .
 docker run --rm \
   -p 50051:50051 -p 9090:9090 \
+  -e KOWITODB_API_KEY="$(openssl rand -hex 32)" \
   -v kowitodb-data:/data \
-  kowitodb:0.1.0
+  kowitodb
 ```
 
-Override the default `CMD` to add `--api-key`, `--tls-cert`/`--tls-key`, or
-embedding env vars (pass the latter with `-e`/`--env-file`). Because auth and
-TLS are off by default, do this before exposing the container beyond a trusted
-network — see [Security posture](#security-posture).
+A named volume (as above) inherits the image's `/data` ownership. With a bind
+mount (`-v "$PWD/data:/data"`), the host directory must be writable by uid 10001
+— or run the container as your own user, as `make docker-run` does:
+`docker run --user "$(id -u):$(id -g)" …`.
 
-For the Lance backend you would need a server entry point that calls
-`new_with_lance` and a build with `--features lance`; the stock `kowitodb serve`
-binary does not select Lance.
+The image binds **0.0.0.0** (all interfaces) — see
+[Security posture](#security-posture). Pass `KOWITODB_API_KEY`,
+`KOWITODB_TLS_CERT`/`KOWITODB_TLS_KEY` (mount the PEM files), and embedding env
+vars with `-e`/`--env-file`, or override the default `CMD` to add flags.
+
+The stock image is built without the `lance` feature. For a Lance image, add
+`--features lance` to the final `cargo build` line in the Dockerfile and set
+`KOWITODB_STORAGE=lance`.
 
 ## Continuous integration
 
@@ -195,10 +220,15 @@ binary does not select Lance.
 `main` and on pull requests:
 
 - **Rust:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
-  -- -D warnings` (warnings are errors), and `cargo test --workspace`, with
-  `protoc` installed and the build cache warmed.
-- **SDKs:** builds and vets the Go SDK (`go build ./... && go vet ./...`) and
-  type-checks the TypeScript SDK (`npx tsc --noEmit`).
+  --locked -- -D warnings` (warnings are errors), and
+  `cargo test --workspace --locked`, with `protoc` installed and the build cache
+  warmed. `--locked` makes a stale `Cargo.lock` fail CI.
+- **SDKs:** builds and vets the Go SDK (`go build ./... && go vet ./...`),
+  type-checks the TypeScript SDK (`npm ci && npx tsc --noEmit`), and installs
+  the Python SDK and imports it.
+
+Releases are handled by `bump-version.yml` and `publish.yml` — see
+[RELEASING.md](../RELEASING.md).
 
 ## Resource and sizing guidance
 
@@ -233,19 +263,28 @@ Two directories matter, both under the paths you pass to `serve`:
 ```
 {storage-path}/          sled object store (persistent)
 {index-path}/tantivy/    Tantivy full-text index (persistent)
+{index-path}/hnsw.bin    HNSW vector-index snapshot (persistent)
+{index-path}/sessions/   agent conversation sessions (persistent sled store)
 ```
 
 What persists and what does not:
 
 - **Persistent on disk:** the object store (sled, or a Lance dataset if used) —
-  including embeddings and version history — and the Tantivy full-text index.
-- **In-memory, rebuilt from storage on startup:** the HNSW vector index, the
-  metadata index, the time index, and the graph index. `serve` (and the
-  `ask`/`sql`/`stats` CLI commands) call `KowitoDBEngine::open()`, which runs a
-  reindex pass over the persisted object store before serving — so all search
-  modes work immediately after a restart, with no re-ingestion required.
-- **Not persistent and not rebuilt:** the plan cache and agent memory (both
-  ephemeral), and the brute-force vector index (not on the live `ask` path).
+  including embeddings and version history — the Tantivy full-text index, and
+  **agent memory**: `RecordTurn` sessions are written to a sled store at
+  `{index-path}/sessions` and reloaded on startup, so `GetSession` and
+  `active_agent_sessions` survive restarts.
+- **Snapshotted, else rebuilt:** the HNSW vector index is checkpointed to
+  `{index-path}/hnsw.bin` (periodically and on graceful shutdown) and loaded on
+  startup; if the snapshot is missing or not from a clean checkpoint (e.g. after
+  a hard kill), it is rebuilt from the stored embeddings.
+- **In-memory, rebuilt from storage on startup:** the metadata index, the time
+  index, and the graph index. `serve` (and the `ask`/`sql`/`stats` CLI
+  commands) call `KowitoDBEngine::open()`, which loads/rebuilds these before
+  serving — so all search modes work immediately after a restart, with no
+  re-ingestion required.
+- **Not persistent:** the plan cache (ephemeral) and the brute-force vector
+  index (not on the live `ask` path).
 
 The reindex pass uses the persisted embeddings — it makes **no** embedding API
 calls — and skips the already-persisted full-text index. Its cost is
@@ -283,9 +322,18 @@ See [OPERATIONS.md](OPERATIONS.md) for interpreting `Stats` and the metrics.
 
 Read this before binding to anything other than loopback.
 
+> **There is no authentication unless you set `--api-key` / `KOWITODB_API_KEY`.**
+> Anyone who can reach the gRPC port can read, write, and delete everything.
+> The **Docker image binds `0.0.0.0:50051`** (and `0.0.0.0:9090` for metrics),
+> so `docker run -p 50051:50051 …` exposes an unauthenticated database on every
+> interface of the host unless you pass `-e KOWITODB_API_KEY=…` (and ideally
+> TLS), or publish the port on loopback only (`-p 127.0.0.1:50051:50051`).
+
 - **Auth is off by default.** Set `--api-key` (env `KOWITODB_API_KEY`) to require
   a Bearer / `x-api-key` token on every gRPC call. When unset, the server accepts
-  any client that can reach the port.
+  any client that can reach the port. The SDKs send the key with `api_key=`
+  (Python), `apiKey` (TypeScript), or `WithAPIKey` (Go) — see
+  [SDKS.md](SDKS.md#authentication-deadlines-and-tls).
 - **TLS is off by default.** Set `--tls-cert` and `--tls-key` to terminate TLS in
   the server itself. When unset, the server speaks plaintext gRPC and SDK clients
   connect with insecure channels.
@@ -293,8 +341,12 @@ Read this before binding to anything other than loopback.
   unauthenticated by design**, so liveness probes and tooling work without
   credentials. They expose service metadata (reflection) but not your data; keep
   the endpoint off the public internet regardless.
-- **Default bind is loopback** (`127.0.0.1:50051`). Keep it that way unless you
-  have a network boundary you trust.
+- **Default bind is loopback** (`127.0.0.1:50051`) for the binary — but not for
+  the Docker image, whose default `CMD` binds `0.0.0.0`. Keep it on loopback
+  unless you have a network boundary you trust.
+- **The metrics endpoint** (`--metrics-addr`, `/metrics` + `/healthz`) is plain
+  HTTP and unauthenticated; it exposes operational counters, not data, but keep
+  it on a private network.
 
 Recommended hardening:
 
@@ -305,4 +357,5 @@ Recommended hardening:
    can add mTLS and richer authz in front if you need more than a static key.
 3. Restrict ingress with security groups / network policies to known clients.
 4. Run the process as an unprivileged user with write access only to the data
-   directory, and keep TLS key files readable only by that user.
+   directory (the Docker image runs as uid 10001), and keep TLS key files
+   readable only by that user.

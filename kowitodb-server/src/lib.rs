@@ -1,3 +1,7 @@
+// `async_trait` marks its boxed futures `#[must_use]`, which newer clippy
+// reports as `double_must_use` on every async trait method.
+#![allow(clippy::double_must_use)]
+
 mod cluster;
 mod config;
 mod db;
@@ -23,6 +27,9 @@ pub use metrics::{MetricsCollector, ServerMetrics};
 pub use openai::{OpenAiConfig, OpenAiEmbeddingClient};
 pub use service::KowitoDBService;
 
+// Generated code: newer clippy flags tonic's `#[must_use]` futures and its
+// large `Status` error type.
+#[allow(clippy::double_must_use, clippy::result_large_err)]
 pub mod proto {
     tonic::include_proto!("kowitodb");
 
@@ -71,8 +78,13 @@ pub async fn serve_with_config(
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
-                if let Err(e) = engine.checkpoint() {
-                    warn!("Periodic vector-index checkpoint failed: {}", e);
+                // Serializing the index is CPU/IO heavy; keep it off the async
+                // worker threads.
+                let engine = engine.clone();
+                match tokio::task::spawn_blocking(move || engine.checkpoint()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Periodic vector-index checkpoint failed: {}", e),
+                    Err(e) => warn!("Periodic vector-index checkpoint panicked: {}", e),
                 }
             }
         });
@@ -94,7 +106,7 @@ pub async fn serve_with_config(
         .build_v1alpha()?;
 
     // Wrap the main service with an API-key interceptor when configured.
-    let api_key = config.api_key.clone();
+    let api_key = normalize_api_key(config.api_key.clone());
     if api_key.is_some() {
         info!("API-key authentication enabled");
     } else {
@@ -123,21 +135,22 @@ pub async fn serve_with_config(
         }
     );
 
-    // Graceful shutdown on Ctrl-C / SIGINT so the final index checkpoint runs.
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutdown signal received; draining");
-    };
-
+    // Graceful shutdown on SIGINT (Ctrl-C) or SIGTERM (`docker stop`,
+    // Kubernetes) so the final index checkpoint runs.
     builder
         .add_service(health_service)
         .add_service(reflection)
         .add_service(main_service)
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
     // Persist the vector index one last time on the way out.
-    match engine.checkpoint() {
+    let final_engine = engine.clone();
+    match tokio::task::spawn_blocking(move || final_engine.checkpoint())
+        .await
+        .map_err(|e| anyhow::anyhow!("checkpoint task panicked: {e}"))
+        .and_then(|r| r.map_err(anyhow::Error::from))
+    {
         Ok(()) => info!("Final vector-index checkpoint written"),
         Err(e) => warn!("Final vector-index checkpoint failed: {}", e),
     }
@@ -157,6 +170,7 @@ pub async fn serve_gateway(
     write_quorum: usize,
     api_key: Option<String>,
 ) -> anyhow::Result<()> {
+    let api_key = normalize_api_key(api_key);
     let cluster = Arc::new(
         Cluster::connect(&peers, replication_factor, write_quorum, api_key.clone()).await?,
     );
@@ -207,9 +221,43 @@ pub async fn serve_gateway(
         .add_service(health_service)
         .add_service(reflection)
         .add_service(main_service)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM — the signal `docker stop`
+/// and Kubernetes send before killing the process.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                warn!("Could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("Shutdown signal received; draining");
+}
+
+/// An empty or whitespace-only key would accept an empty credential while
+/// logging that auth is on; treat it as "no key".
+fn normalize_api_key(key: Option<String>) -> Option<String> {
+    key.filter(|k| !k.trim().is_empty())
 }
 
 /// Validate the API key on an incoming request. A no-op when no key is set.
@@ -292,6 +340,13 @@ mod tests {
         let key = Some("secret".to_string());
         assert!(check_auth(&key, req_with("authorization", "Bearer secret")).is_ok());
         assert!(check_auth(&key, req_with("x-api-key", "secret")).is_ok());
+    }
+
+    #[test]
+    fn empty_api_key_means_no_key() {
+        assert_eq!(normalize_api_key(Some(String::new())), None);
+        assert_eq!(normalize_api_key(Some("  ".into())), None);
+        assert_eq!(normalize_api_key(Some("k".into())), Some("k".into()));
     }
 
     #[test]

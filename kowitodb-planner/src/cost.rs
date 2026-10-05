@@ -39,8 +39,9 @@ pub struct CostModel {
 impl Default for CostModel {
     fn default() -> Self {
         Self {
-            // ~OpenAI text-embedding-3-small pricing
-            embedding_cost_per_1k: 0.00002,
+            // OpenAI text-embedding-3-small is ~$0.00002 per 1K *tokens*; at
+            // ~250 tokens per embedded query/chunk that is ~$0.005 per 1K calls.
+            embedding_cost_per_1k: 0.005,
             // ~GPT-4o-mini input pricing
             llm_input_cost_per_1k_tokens: 0.00015,
             // ~GPT-4o-mini output pricing

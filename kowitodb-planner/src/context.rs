@@ -76,7 +76,8 @@ impl ContextOptimizer {
         }
     }
 
-    /// Set custom deduplication threshold (0.0 = never dedup, 1.0 = exact match only).
+    /// Set custom deduplication threshold on word-set Jaccard similarity
+    /// (0.0 = never dedup, 1.0 = only identical word sets).
     pub fn with_dedup_threshold(mut self, threshold: f32) -> Self {
         self.dedup_threshold = threshold.clamp(0.0, 1.0);
         self
@@ -139,11 +140,7 @@ impl ContextOptimizer {
 
         // Step 2: Sort by relevance (highest first)
         let mut sorted = deduped;
-        sorted.sort_unstable_by(|a, b| {
-            b.relevance
-                .partial_cmp(&a.relevance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sorted.sort_unstable_by(|a, b| b.relevance.total_cmp(&a.relevance));
 
         // Step 3: Enforce token budget (greedy by relevance)
         let mut final_chunks = Vec::new();
@@ -198,8 +195,13 @@ impl ContextOptimizer {
             return content.to_string();
         }
 
-        // Try to find a sentence boundary near the max
-        let end = self.max_chunk_chars;
+        // Try to find a sentence boundary near the max. `max_chunk_chars` is a
+        // byte budget; back off to a char boundary so multi-byte text (Thai,
+        // CJK, emoji, accents) can't be sliced mid-character.
+        let mut end = self.max_chunk_chars;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
         if let Some(period_idx) = content[..end].rfind('.') {
             if period_idx > end / 2 {
                 return content[..=period_idx].to_string();
@@ -223,11 +225,7 @@ impl ContextOptimizer {
         }
 
         // Sort by relevance so we keep the best
-        chunks.sort_unstable_by(|a, b| {
-            b.relevance
-                .partial_cmp(&a.relevance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        chunks.sort_unstable_by(|a, b| b.relevance.total_cmp(&a.relevance));
 
         let mut kept = Vec::new();
         let mut drop_set: HashSet<usize> = HashSet::new();
@@ -245,7 +243,7 @@ impl ContextOptimizer {
                 let words_j = word_set(&chunk_j.content);
                 let similarity = jaccard_similarity(&words_i, &words_j);
 
-                if similarity >= self.dedup_threshold {
+                if self.dedup_threshold > 0.0 && similarity >= self.dedup_threshold {
                     drop_set.insert(j);
                 }
             }
@@ -271,8 +269,10 @@ fn word_set(text: &str) -> HashSet<String> {
 
 /// Jaccard similarity: |A ∩ B| / |A ∪ B|
 fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
-    if a.is_empty() && b.is_empty() {
-        return 1.0;
+    // Two chunks with no comparable words (emoji, single characters) aren't
+    // evidence of duplication.
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
     }
     let intersection = a.intersection(b).count();
     let union = a.union(b).count();
@@ -289,6 +289,29 @@ pub fn estimate_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_content_never_splits_multibyte_characters() {
+        let optimizer = ContextOptimizer::new(4096).with_max_chunk_chars(2000);
+        // 3-byte Thai characters: byte 2000 falls mid-character.
+        let thai = "สวัสดี".repeat(200);
+        let trimmed = optimizer.trim_content(&thai);
+        assert!(trimmed.len() <= 2000);
+        assert!(thai.starts_with(&trimmed));
+        for text in [
+            "é".repeat(1500),
+            "😀".repeat(700),
+            format!("a{}", "中".repeat(800)),
+        ] {
+            let trimmed = optimizer.trim_content(&text);
+            assert!(trimmed.len() <= 2000 && text.starts_with(&trimmed));
+        }
+    }
+
+    #[test]
+    fn zero_dedup_threshold_disables_dedup() {
+        assert_eq!(jaccard_similarity(&HashSet::new(), &HashSet::new()), 0.0);
+    }
     use std::collections::HashMap;
 
     #[test]

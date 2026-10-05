@@ -36,12 +36,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kowitodb_core::ObjectId;
-use tonic::transport::Channel;
-use tonic::{Request, Response, Status};
+use std::time::Duration;
+
+use tonic::transport::{Channel, Endpoint};
+use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use crate::proto;
 use crate::proto::kowito_db_client::KowitoDbClient;
+
+/// How long to wait for a TCP/HTTP2 connection to a peer.
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on any single peer RPC (large batch inserts included).
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on a heartbeat probe.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Page size used when walking a node's objects (rebalance).
+const LIST_PAGE: u32 = 500;
+/// Most objects one List call may return (matches the data nodes' cap).
+const MAX_LIST_LIMIT: usize = 1_000;
+
+/// Whether an RPC error means the node itself is unreachable or broken, as
+/// opposed to the node answering "no" (bad argument, not found, ...). Only the
+/// former should take a node out of rotation, or one malformed client request
+/// could mark every node down.
+fn is_node_failure(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
+    )
+}
+
+/// Two replicas' copies of an object differ in user-visible data. Timestamps
+/// are set independently by each replica and embeddings may be regenerated
+/// non-deterministically, so they are ignored — otherwise every read would
+/// "repair" identical copies forever.
+fn copies_diverge(a: &proto::KnowledgeObject, b: &proto::KnowledgeObject) -> bool {
+    a.content != b.content
+        || a.metadata != b.metadata
+        || a.keywords != b.keywords
+        || a.relationships != b.relationships
+        || a.importance != b.importance
+}
 
 /// One node in the cluster — a data node over gRPC, or a test double.
 #[tonic::async_trait]
@@ -106,7 +142,17 @@ impl RemoteNode {
         } else {
             format!("http://{addr}")
         };
-        let channel = Channel::from_shared(endpoint)?.connect().await?;
+        // Bounded connect/request times and keepalives, so a hung or partitioned
+        // peer fails fast instead of stalling every write and scatter. The
+        // channel connects lazily: the gateway starts even if a node is down,
+        // and the heartbeat tracks when it comes back.
+        let channel = Endpoint::from_shared(endpoint)?
+            .connect_timeout(PEER_CONNECT_TIMEOUT)
+            .timeout(PEER_REQUEST_TIMEOUT)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .connect_lazy();
         let token = match api_key {
             Some(k) => Some(
                 format!("Bearer {k}")
@@ -239,6 +285,11 @@ impl Cluster {
         self.health[i].load(Ordering::Relaxed)
     }
 
+    /// Record a failed RPC to node `i`: only node-level failures mark it down.
+    fn note_failure(&self, i: usize, err: &Status) {
+        self.set_health(i, !is_node_failure(err));
+    }
+
     /// Update a node's health, logging up/down transitions.
     fn set_health(&self, i: usize, healthy: bool) {
         let prev = self.health[i].swap(healthy, Ordering::Relaxed);
@@ -262,8 +313,18 @@ impl Cluster {
     /// periodically by the gateway so down nodes are detected and recovered
     /// without waiting for a request to hit them.
     pub async fn heartbeat_once(&self) {
-        for i in 0..self.nodes.len() {
-            let ok = self.nodes[i].stats(proto::StatsRequest {}).await.is_ok();
+        let probes = self.nodes.iter().enumerate().map(|(i, node)| {
+            let node = node.clone();
+            async move {
+                let ok = matches!(
+                    tokio::time::timeout(HEARTBEAT_TIMEOUT, node.stats(proto::StatsRequest {}))
+                        .await,
+                    Ok(Ok(_))
+                );
+                (i, ok)
+            }
+        });
+        for (i, ok) in futures::future::join_all(probes).await {
             self.set_health(i, ok);
         }
     }
@@ -288,10 +349,17 @@ impl Cluster {
         let mut nodes: Vec<Arc<dyn ClusterNode>> = Vec::with_capacity(peers.len());
         for peer in peers {
             let node = RemoteNode::connect(peer.clone(), api_key.as_deref()).await?;
-            info!("Cluster: connected to data node {}", node.addr());
+            info!("Cluster: data node {}", node.addr());
             nodes.push(Arc::new(node));
         }
-        Ok(Self::new(nodes, replication_factor).with_write_quorum(write_quorum))
+        let cluster = Self::new(nodes, replication_factor).with_write_quorum(write_quorum);
+        cluster.heartbeat_once().await;
+        for (i, peer) in peers.iter().enumerate() {
+            if !cluster.is_healthy(i) {
+                warn!("Cluster: data node {peer} is not reachable yet; it will be used once it responds");
+            }
+        }
+        Ok(cluster)
     }
 
     pub fn node_count(&self) -> usize {
@@ -373,7 +441,7 @@ impl Cluster {
             match self.nodes[node].batch_insert(req).await {
                 Ok(_) => self.set_health(node, true),
                 Err(e) => {
-                    self.set_health(node, false);
+                    self.note_failure(node, &e);
                     warn!("batch_insert on node {node} failed: {e}");
                     failed.insert(node);
                 }
@@ -410,7 +478,7 @@ impl Cluster {
                     acks += 1;
                 }
                 Err(e) => {
-                    self.set_health(i, false);
+                    self.note_failure(i, &e);
                     warn!("write to replica {i} failed: {e}");
                     last_err = Some(e);
                 }
@@ -459,8 +527,11 @@ impl Cluster {
                         copies.push((i, obj));
                     }
                 }
-                Err(_) => self.set_health(i, false),
+                Err(e) => self.note_failure(i, &e),
             }
+        }
+        if responded.is_empty() && !replicas.is_empty() {
+            return Err(Status::unavailable(format!("no replica of {id} responded")));
         }
 
         // Last-write-wins: the freshest copy by `updated_at` (RFC3339 sorts
@@ -477,7 +548,7 @@ impl Cluster {
                 .iter()
                 .copied()
                 .filter(|i| match copies.iter().find(|(ci, _)| ci == i) {
-                    Some((_, o)) => o.updated_at < obj.updated_at || o.content != obj.content,
+                    Some((_, o)) => copies_diverge(o, obj),
                     None => true,
                 })
                 .collect();
@@ -495,15 +566,20 @@ impl Cluster {
 
     pub async fn update(&self, req: proto::UpdateRequest) -> Result<proto::UpdateResponse, Status> {
         let id = parse_id(&req.id)?;
+        let replicas = self.replicas_for_id(id);
         let mut out = proto::UpdateResponse {
             updated: false,
             version: 0,
         };
-        for &i in &self.replicas_for_id(id) {
-            if let Ok(resp) = self.nodes[i].update(req.clone()).await {
-                if resp.updated {
-                    out = resp;
-                }
+        let results = self
+            .on_replicas(&replicas, |n| {
+                let req = req.clone();
+                async move { n.update(req).await }
+            })
+            .await?;
+        for resp in results {
+            if resp.updated {
+                out = resp;
             }
         }
         Ok(out)
@@ -511,13 +587,49 @@ impl Cluster {
 
     pub async fn delete(&self, req: proto::DeleteRequest) -> Result<proto::DeleteResponse, Status> {
         let id = parse_id(&req.id)?;
-        let mut existed = false;
-        for &i in &self.replicas_for_id(id) {
-            if let Ok(resp) = self.nodes[i].delete(req.clone()).await {
-                existed |= resp.existed;
+        let replicas = self.replicas_for_id(id);
+        let results = self
+            .on_replicas(&replicas, |n| {
+                let req = req.clone();
+                async move { n.delete(req).await }
+            })
+            .await?;
+        Ok(proto::DeleteResponse {
+            existed: results.iter().any(|r| r.existed),
+        })
+    }
+
+    /// Run `f` on every replica, succeeding once `write_quorum` of them
+    /// answer. Errors (with the last failure) when the quorum isn't met, so a
+    /// write that reached too few replicas is never reported as a success.
+    async fn on_replicas<F, Fut, T>(&self, replicas: &[usize], f: F) -> Result<Vec<T>, Status>
+    where
+        F: Fn(Arc<dyn ClusterNode>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Status>>,
+    {
+        let quorum = self.write_quorum.clamp(1, replicas.len().max(1));
+        let mut oks = Vec::with_capacity(replicas.len());
+        let mut last_err = None;
+        for &i in replicas {
+            match f(self.nodes[i].clone()).await {
+                Ok(v) => {
+                    self.set_health(i, true);
+                    oks.push(v);
+                }
+                Err(e) => {
+                    self.note_failure(i, &e);
+                    warn!("replica {i} failed: {e}");
+                    last_err = Some(e);
+                }
             }
         }
-        Ok(proto::DeleteResponse { existed })
+        if oks.len() >= quorum {
+            Ok(oks)
+        } else {
+            Err(last_err.unwrap_or_else(|| {
+                Status::unavailable(format!("quorum not met: {}/{quorum} replicas", oks.len()))
+            }))
+        }
     }
 
     // ---- Scatter-gather reads ----
@@ -545,11 +657,7 @@ impl Cluster {
             }
         }
         let mut merged: Vec<_> = by_id.into_values().collect();
-        merged.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        merged.sort_by(|a, b| b.score.total_cmp(&a.score));
         merged.truncate(top_k);
 
         Ok(proto::SearchResponse {
@@ -587,11 +695,7 @@ impl Cluster {
             }
         }
         let mut merged: Vec<_> = by_id.into_values().collect();
-        merged.sort_by(|a, b| {
-            b.relevance_score
-                .partial_cmp(&a.relevance_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        merged.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
         merged.truncate(max_results);
 
         Ok(proto::AskResponse {
@@ -632,20 +736,37 @@ impl Cluster {
             if !self.is_healthy(i) {
                 continue;
             }
-            let listed = match node
-                .list(proto::ListRequest {
-                    offset: 0,
-                    limit: u32::MAX,
-                })
-                .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    self.set_health(i, false);
-                    continue;
+            // Collect this node's objects page by page first (relocating while
+            // paging would shift the offsets), keeping only misplaced ones.
+            let mut misplaced: Vec<proto::KnowledgeObject> = Vec::new();
+            let mut offset = 0u32;
+            let listing_ok = loop {
+                let page = match node
+                    .list(proto::ListRequest {
+                        offset,
+                        limit: LIST_PAGE,
+                    })
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.note_failure(i, &e);
+                        break false;
+                    }
+                };
+                let n = page.objects.len() as u32;
+                misplaced.extend(page.objects.into_iter().filter(|obj| {
+                    parse_id(&obj.id).is_ok_and(|id| !self.replicas_for_id(id).contains(&i))
+                }));
+                if n < LIST_PAGE {
+                    break true;
                 }
+                offset += n;
             };
-            for obj in listed.objects {
+            if !listing_ok {
+                continue;
+            }
+            for obj in misplaced {
                 let Ok(id) = parse_id(&obj.id) else { continue };
                 let owners = self.replicas_for_id(id);
                 if owners.contains(&i) {
@@ -687,7 +808,7 @@ impl Cluster {
         let limit = if req.limit == 0 {
             100
         } else {
-            req.limit as usize
+            (req.limit as usize).min(MAX_LIST_LIMIT)
         };
         // Over-fetch (offset+limit) from each node, merge by id, then page.
         let per_node = proto::ListRequest {
@@ -747,13 +868,16 @@ impl Cluster {
         req: proto::RecordTurnRequest,
     ) -> Result<proto::RecordTurnResponse, Status> {
         let replicas = self.replicas_for_key(&req.session_id);
-        let mut out = proto::RecordTurnResponse { turn_count: 0 };
-        for &i in &replicas {
-            if let Ok(resp) = self.nodes[i].record_turn(req.clone()).await {
-                out = resp;
-            }
-        }
-        Ok(out)
+        let results = self
+            .on_replicas(&replicas, |n| {
+                let req = req.clone();
+                async move { n.record_turn(req).await }
+            })
+            .await?;
+        Ok(results
+            .into_iter()
+            .max_by_key(|r| r.turn_count)
+            .unwrap_or(proto::RecordTurnResponse { turn_count: 0 }))
     }
 
     pub async fn get_session(
@@ -805,7 +929,7 @@ impl Cluster {
                     oks.push(v);
                 }
                 Err(e) => {
-                    self.set_health(i, false);
+                    self.note_failure(i, &e);
                     last_err = Some(e);
                 }
             }
@@ -1050,6 +1174,8 @@ mod tests {
         // id -> (content, score, updated_at)
         objects: Mutex<HashMap<String, (String, f32, String)>>,
         fail: std::sync::atomic::AtomicBool,
+        /// Inserts received (to observe read-repair writes).
+        inserts: std::sync::atomic::AtomicUsize,
     }
 
     impl MockNode {
@@ -1076,6 +1202,8 @@ mod tests {
     impl ClusterNode for MockNode {
         async fn insert(&self, req: proto::InsertRequest) -> Result<proto::InsertResponse, Status> {
             self.check()?;
+            self.inserts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let id = req.id.clone().unwrap();
             self.objects.lock().insert(
                 id.clone(),
@@ -1152,9 +1280,9 @@ mod tests {
         ) -> Result<proto::UpdateResponse, Status> {
             Ok(proto::UpdateResponse::default())
         }
-        async fn list(&self, _req: proto::ListRequest) -> Result<proto::ListResponse, Status> {
+        async fn list(&self, req: proto::ListRequest) -> Result<proto::ListResponse, Status> {
             self.check()?;
-            let objects: Vec<proto::KnowledgeObject> = self
+            let mut objects: Vec<proto::KnowledgeObject> = self
                 .objects
                 .lock()
                 .iter()
@@ -1165,16 +1293,23 @@ mod tests {
                     ..Default::default()
                 })
                 .collect();
-            Ok(proto::ListResponse {
-                total: objects.len() as u64,
-                objects,
-            })
+            objects.sort_by(|a, b| a.id.cmp(&b.id));
+            let total = objects.len() as u64;
+            let objects = objects
+                .into_iter()
+                .skip(req.offset as usize)
+                .take(req.limit as usize)
+                .collect();
+            Ok(proto::ListResponse { total, objects })
         }
         async fn ask(&self, _req: proto::AskRequest) -> Result<proto::AskResponse, Status> {
             Ok(proto::AskResponse::default())
         }
-        async fn sql(&self, _req: proto::SqlRequest) -> Result<proto::SqlResponse, Status> {
+        async fn sql(&self, req: proto::SqlRequest) -> Result<proto::SqlResponse, Status> {
             self.check()?;
+            if req.query == "not sql" {
+                return Err(Status::invalid_argument("parse error"));
+            }
             // Simulate this shard answering `SELECT COUNT(*)` with its partial.
             let mut columns = HashMap::new();
             columns.insert(
@@ -1521,5 +1656,86 @@ mod tests {
                 "every replica reconciled to the latest version"
             );
         }
+    }
+
+    fn mock_cluster(n: usize, rf: usize) -> (Cluster, Vec<Arc<MockNode>>) {
+        let mocks: Vec<Arc<MockNode>> = (0..n).map(|_| Arc::new(MockNode::default())).collect();
+        let nodes: Vec<Arc<dyn ClusterNode>> = mocks.iter().map(|m| m.clone() as _).collect();
+        (Cluster::new(nodes, rf), mocks)
+    }
+
+    #[tokio::test]
+    async fn test_client_errors_do_not_mark_nodes_unhealthy() {
+        let (cluster, _mocks) = mock_cluster(3, 1);
+        assert!(cluster
+            .sql(proto::SqlRequest {
+                query: "not sql".into()
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            cluster.healthy_count(),
+            3,
+            "a bad query must not take nodes down"
+        );
+        // A real outage still does.
+        _mocks[0].set_fail(true);
+        let _ = cluster
+            .sql(proto::SqlRequest {
+                query: "SELECT COUNT(*) FROM knowledge".into(),
+            })
+            .await;
+        assert_eq!(cluster.healthy_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_repair_ignores_replica_timestamps() {
+        let (cluster, mocks) = mock_cluster(3, 3);
+        let id = uuid::Uuid::from_u128(0).to_string();
+        // Same write, timestamped independently by each replica.
+        mocks[0].seed(&id, "same", "2026-01-01T00:00:00.001Z");
+        mocks[1].seed(&id, "same", "2026-01-01T00:00:00.002Z");
+        mocks[2].seed(&id, "same", "2026-01-01T00:00:00.003Z");
+        for _ in 0..3 {
+            cluster
+                .get(proto::GetRequest { id: id.clone() })
+                .await
+                .unwrap();
+        }
+        let repairs: usize = mocks
+            .iter()
+            .map(|m| m.inserts.load(std::sync::atomic::Ordering::SeqCst))
+            .sum();
+        assert_eq!(repairs, 0, "identical copies must not be rewritten on read");
+    }
+
+    #[tokio::test]
+    async fn test_failed_writes_are_errors_not_misses() {
+        let (cluster, mocks) = mock_cluster(2, 2);
+        let id = uuid::Uuid::from_u128(7).to_string();
+        for m in &mocks {
+            m.seed(&id, "doc", "2026-01-01T00:00:00Z");
+            m.set_fail(true);
+        }
+        assert!(cluster
+            .delete(proto::DeleteRequest { id: id.clone() })
+            .await
+            .is_err());
+        // With every replica unreachable, Get reports unavailability rather
+        // than "not found".
+        cluster.set_health(0, true);
+        cluster.set_health(1, true);
+        let err = cluster.get(proto::GetRequest { id }).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn test_metadata_strings_round_trip_unquoted() {
+        let obj = kowitodb_core::KnowledgeObject::new("x").with_metadata("tenant", "acme");
+        let proto = crate::service::knowledge_to_proto(obj);
+        assert_eq!(
+            proto.metadata.get("tenant").map(String::as_str),
+            Some("acme")
+        );
     }
 }

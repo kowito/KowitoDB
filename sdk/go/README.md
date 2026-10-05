@@ -82,10 +82,28 @@ func main() {
 
 ## API
 
-`NewClient(addr string, opts ...grpc.DialOption) (*Client, error)` opens a
-connection. Pass `""` to use the default address `localhost:50051`. By default
-an insecure (plaintext) connection is used; supply `grpc.DialOption`s to
-customise transport credentials, interceptors, etc. Call `Close()` when done.
+`NewClient(addr string, opts ...grpc.DialOption) (*Client, error)` creates a
+client (the connection is made lazily, on the first RPC). Pass `""` to use the
+default address `localhost:50051`. The default transport is plaintext
+(insecure); any `grpc.DialOption`s you pass are applied after it, so adding
+interceptors keeps the default, and
+`grpc.WithTransportCredentials(credentials.NewTLS(...))` switches to TLS. Call
+`Close()` when done.
+
+Helpers:
+
+- `WithAPIKey(key string) grpc.DialOption` — sends `authorization: Bearer <key>`
+  on every RPC (matches the server's `--api-key` / `KOWITODB_API_KEY`).
+- `WithDefaultTimeout(d time.Duration) grpc.DialOption` — applies a deadline to
+  every RPC whose context has none (a caller's context deadline wins).
+
+```go
+db, err := kowitodb.NewClient("db.example.com:50051",
+	kowitodb.WithAPIKey(os.Getenv("KOWITODB_API_KEY")),
+	kowitodb.WithDefaultTimeout(30*time.Second),
+	// grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})), // TLS
+)
+```
 
 All RPC methods take a `context.Context` as the first argument and return a
 typed response plus an `error`.
@@ -110,6 +128,7 @@ typed response plus an `error`.
 
 `Remember` and `Insert` accept functional options:
 
+- `WithID(id string)` — assign the object id (a UUID); otherwise server-generated
 - `WithKeywords(keywords ...string)`
 - `WithMetadata(map[string]string)`
 - `WithImportance(float32)` — default `0.5`
@@ -119,6 +138,7 @@ typed response plus an `error`.
 
 ```go
 type InsertItem struct {
+	ID            string         // optional UUID; empty = server-generated
 	Content       string
 	Keywords      []string
 	Metadata      map[string]string
@@ -155,8 +175,11 @@ make generate
 ```
 
 This requires `protoc`, `protoc-gen-go`, and `protoc-gen-go-grpc`. Install the
-Go plugins with:
+Go plugins (pinned to the versions in the generated file headers) with:
 
 ```sh
 make tools
 ```
+
+No system `protoc`? The one bundled with `grpcio-tools` works too:
+`make generate PROTOC="python -m grpc_tools.protoc"`.

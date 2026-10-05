@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Regenerate the Python gRPC stubs from proto/kowitodb.proto and fix the
-# generated absolute import so the package imports cleanly. Run from anywhere:
+# Regenerate the Python gRPC stubs from kowitodb-server/proto/kowitodb.proto
+# (the single source of truth) and fix the generated absolute import so the
+# package imports cleanly. Run from anywhere:
 #   bash sdk/python/scripts/gen.sh        (or: make gen-python)
 #
-# Requires: pip install grpcio-tools
+# Requires: pip install "kowitodb[codegen]"   (i.e. grpcio-tools==1.81.1)
+# The grpcio-tools version determines the runtime minimums the generated code
+# enforces (grpcio>=1.81.1, protobuf>=6.33.5) — if you change it, update
+# `dependencies` in sdk/python/pyproject.toml to match.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."   # sdk/python

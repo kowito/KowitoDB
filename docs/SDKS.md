@@ -2,19 +2,19 @@
 
 Client libraries for the KowitoDB gRPC service in Python, TypeScript, and Go.
 All three target the same `KowitoDB` service defined in
-[`proto/kowitodb.proto`](../proto/kowitodb.proto) and expose the same core
-surface.
+[`kowitodb-server/proto/kowitodb.proto`](../kowitodb-server/proto/kowitodb.proto)
+and expose the same core surface.
 
 The default server address is `localhost:50051`. All clients default to
 **insecure (plaintext)** connections. The server's auth and TLS are off by
 default; if you enable them (`--api-key`, `--tls-cert`/`--tls-key` — see
-[DEPLOYMENT.md](DEPLOYMENT.md#security-posture)), pass the matching credentials
-through the client's transport options (e.g. a Bearer / `x-api-key` metadata
-header and TLS channel credentials).
+[DEPLOYMENT.md](DEPLOYMENT.md#security-posture)), configure the client as shown
+in [Authentication, deadlines and TLS](#authentication-deadlines-and-tls).
 
 ## Contents
 
 - [Capability matrix](#capability-matrix)
+- [Authentication, deadlines and TLS](#authentication-deadlines-and-tls)
 - [Python](#python)
 - [TypeScript](#typescript)
 - [Go](#go)
@@ -43,9 +43,49 @@ column-name → value maps (Python/TS: `list`/`Array` of dict/`Record`; Go:
 `vector_count`, `index_size_bytes`, `graph_nodes`, `graph_edges`,
 `active_agent_sessions`, `total_cost_usd`, `cache_entries`, `cache_hit_rate`.
 
-Connection lifecycle: every client connects lazily on first call. Python and
-TypeScript expose explicit `connect()`/`close()`; Go opens on `NewClient` and
-closes on `Close()`.
+Connection lifecycle: every client connects lazily on first call (so an
+unreachable server surfaces as an `UNAVAILABLE` error from the first RPC, not
+from construction). Python and TypeScript expose explicit `connect()`/`close()`;
+Go creates the channel in `NewClient` and closes it on `Close()`.
+
+`insert`/`remember`/batch-insert items accept an optional caller-assigned `id`
+(must be a UUID string; otherwise the server generates one) — Python `id=`,
+TypeScript `{ id }`, Go `WithID(...)` / `InsertItem.ID`.
+
+## Authentication, deadlines and TLS
+
+Each SDK can attach the server's API key to every RPC (as
+`authorization: Bearer <key>` metadata — the server also accepts
+`x-api-key: <key>`), apply a default per-call deadline, and use TLS:
+
+| | Python (`KowitoDBClient` / `AsyncKowitoDBClient`) | TypeScript (`new KowitoDBClient(addr, opts)`) | Go (`NewClient(addr, opts...)`) |
+| --- | --- | --- | --- |
+| API key | `api_key="..."` | `{ apiKey: "..." }` | `kowitodb.WithAPIKey("...")` |
+| Default deadline | `timeout=30.0` (seconds, default 30; `None` = none) | `{ timeoutMs: 30000 }` (default 30 s; `0` = none) | `kowitodb.WithDefaultTimeout(30*time.Second)` (off unless set; a context deadline always wins) |
+| TLS | `secure=True`, `root_certificates=b"..."`, or `credentials=grpc.ssl_channel_credentials(...)` | `{ secure: true }` or `{ credentials: grpc.credentials.createSsl(...) }` | `grpc.WithTransportCredentials(credentials.NewTLS(...))` |
+
+```python
+db = KowitoDBClient("db.example.com:50051", api_key=os.environ["KOWITODB_API_KEY"],
+                    timeout=30.0, secure=True)
+```
+
+```ts
+const db = new KowitoDBClient("db.example.com:50051", {
+  apiKey: process.env.KOWITODB_API_KEY, timeoutMs: 30_000, secure: true,
+});
+```
+
+```go
+db, err := kowitodb.NewClient("db.example.com:50051",
+	kowitodb.WithAPIKey(os.Getenv("KOWITODB_API_KEY")),
+	kowitodb.WithDefaultTimeout(30*time.Second),
+	grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
+```
+
+The key is added by a client interceptor / per-RPC credentials that do not
+require TLS, so it also works against a plaintext server — but then the key
+crosses the network in clear text. Use TLS (server `--tls-cert`/`--tls-key`, or a
+TLS-terminating proxy) outside a trusted network.
 
 ## Python
 
@@ -54,14 +94,15 @@ Package: `kowitodb` (`sdk/python`), transport `grpcio`.
 ### Install
 
 ```bash
-# From the repository:
+pip install kowitodb
+# or, from the repository:
 cd sdk/python
-pip install -e ".[grpc]"
+pip install -e .
 ```
 
-The `grpc` extra pulls in `grpcio` and `grpcio-tools`. Requires Python ≥ 3.10.
-Generated stubs (`kowitodb_pb2.py`, `kowitodb_pb2_grpc.py`) are checked into the
-package.
+`grpcio` and `protobuf` are regular dependencies (the minimum versions match the
+checked-in stubs). Requires Python ≥ 3.10. Generated stubs (`kowitodb_pb2.py`,
+`kowitodb_pb2_grpc.py`) are checked into the package.
 
 ### Remember, then ask
 
@@ -244,11 +285,13 @@ func main() {
 ```
 
 `NewClient("")` uses the default address `localhost:50051`. Pass
-`grpc.DialOption`s to `NewClient` to customize transport credentials or
-interceptors (e.g. TLS credentials, or a per-call API-key metadata header when
-the server is run with `--api-key`). `Remember`/`Insert` accept functional
-options: `WithKeywords`, `WithMetadata`, `WithImportance`, and
-`WithRelationships` (`Insert` only).
+`grpc.DialOption`s to `NewClient` to customize the connection: the default
+plaintext transport is applied first, so adding interceptors keeps it and
+`grpc.WithTransportCredentials(...)` replaces it. Use `kowitodb.WithAPIKey` and
+`kowitodb.WithDefaultTimeout` (see
+[Authentication, deadlines and TLS](#authentication-deadlines-and-tls)).
+`Remember`/`Insert` accept functional options: `WithID`, `WithKeywords`,
+`WithMetadata`, `WithImportance`, and `WithRelationships` (`Insert` only).
 
 ### Update, SQL, and agent memory
 
@@ -272,7 +315,7 @@ for _, row := range rows {
 // Agent conversation memory.
 _, _ = db.RecordTurn(ctx, "session-1", "user", "Who renewed after Series A?")
 _, _ = db.RecordTurn(ctx, "session-1", "assistant", "Acme Corp did.")
-turns, err := db.GetSession(ctx, "session-1") // empty slice if not found
+turns, err := db.GetSession(ctx, "session-1") // nil if not found
 // ... handle err
 for _, t := range turns {
     fmt.Println(t.Role, t.Content)
@@ -284,23 +327,28 @@ Update options: `WithUpdatedContent`, `WithUpdatedMetadata`,
 
 ## Regenerating gRPC stubs
 
-All SDKs derive from [`proto/kowitodb.proto`](../proto/kowitodb.proto). If you
-change the proto, regenerate the stubs and roll clients with the server (there
-is no negotiated API versioning).
+All SDKs derive from
+[`kowitodb-server/proto/kowitodb.proto`](../kowitodb-server/proto/kowitodb.proto)
+(the server's copy is the single source of truth). If you change the proto,
+regenerate the stubs and roll clients with the server (there is no negotiated
+API versioning).
 
 ### Python
 
-The `grpc` extra installs `grpcio-tools`. From `sdk/python`:
+Install the pinned generator (`pip install "kowitodb[codegen]"`, i.e.
+`grpcio-tools==1.81.1`), then from the repository root:
 
 ```bash
-python -m grpc_tools.protoc \
-  -I ../../proto \
-  --python_out=kowitodb \
-  --grpc_python_out=kowitodb \
-  ../../proto/kowitodb.proto
+make gen-python            # or: bash sdk/python/scripts/gen.sh
 ```
 
-This regenerates `kowitodb/kowitodb_pb2.py` and `kowitodb/kowitodb_pb2_grpc.py`.
+[`sdk/python/scripts/gen.sh`](../sdk/python/scripts/gen.sh) runs
+`python -m grpc_tools.protoc -I ../../kowitodb-server/proto …` from `sdk/python`
+and rewrites the generated absolute import to a relative one. It regenerates
+`kowitodb/kowitodb_pb2.py` and `kowitodb/kowitodb_pb2_grpc.py`. The generator
+version fixes the runtime minimums the stubs enforce (`grpcio>=1.81.1`,
+`protobuf>=6.33.5`); if you change it, update `dependencies` in
+`sdk/python/pyproject.toml` to match.
 
 ### TypeScript
 
@@ -309,7 +357,7 @@ regenerate — only the bundled copy of the proto to refresh:
 
 ```bash
 cd sdk/typescript
-npm run proto:gen   # copies proto/kowitodb.proto into the package's proto/ dir
+npm run proto:gen   # copies kowitodb-server/proto/kowitodb.proto into the package's proto/ dir
 ```
 
 If you add or change message fields, also update the hand-written interfaces in
@@ -320,8 +368,9 @@ If you add or change message fields, also update the hand-written interfaces in
 From `sdk/go` (requires `protoc`, `protoc-gen-go`, `protoc-gen-go-grpc`):
 
 ```sh
-make tools      # install the protoc Go plugins (one-time)
-make generate   # regenerate kowitodbpb/*.pb.go from ../../proto/kowitodb.proto
+make tools      # install the pinned protoc Go plugins (one-time)
+make generate   # regenerate kowitodbpb/*.pb.go from ../../kowitodb-server/proto/kowitodb.proto
+# no system protoc? make generate PROTOC="python -m grpc_tools.protoc"
 ```
 
 ## The `sql()` helper
@@ -361,15 +410,18 @@ pip install "kowitodb[llamaindex]"
 from kowitodb import KowitoDBClient
 from kowitodb.integrations.langchain import KowitoDBRetriever, KowitoDBVectorStore
 
-client = KowitoDBClient("localhost:50051")
+client = KowitoDBClient("localhost:50051", api_key="...")   # api_key/timeout/secure optional
 
 retriever = KowitoDBRetriever(client=client, max_results=5)   # uses ai.ask() by default
+# or: KowitoDBRetriever.from_address("localhost:50051", api_key="...", max_results=5)
 docs = retriever.invoke("which customers renewed after Series A?")
 
 store = KowitoDBVectorStore(client)                            # embedding happens server-side
 store.add_texts(["Acme renewed.", "Globex churned."],
                 metadatas=[{"company": "Acme"}, {"company": "Globex"}])
-hits = store.similarity_search("renewals", k=3)
+hits = store.similarity_search("renewals", k=3, filter={"company": "Acme"})
+# add_documents() keeps Document.id (a UUID) as the object id;
+# KowitoDBVectorStore.from_texts(..., address=, api_key=, timeout=) builds its own client.
 ```
 
 **LlamaIndex** — `kowitodb.integrations.llamaindex`:
@@ -379,9 +431,11 @@ from kowitodb import KowitoDBClient
 from kowitodb.integrations.llamaindex import KowitoDBRetriever
 
 retriever = KowitoDBRetriever(KowitoDBClient("localhost:50051"), top_k=5)
+# or: KowitoDBRetriever(address="localhost:50051", api_key="...", top_k=5)
 nodes = retriever.retrieve("which customers renewed after Series A?")
 ```
 
 Both retrievers default to the `ai.ask()` pipeline (intent detection,
 multi-index retrieval, graph traversal, rerank); pass `use_ask=False` for the
-raw `search()` path, and `metadata_filter=` to constrain by metadata.
+raw `search()` path, and `metadata_filter=` to constrain by metadata
+(non-string filter values are stringified, matching how metadata is stored).

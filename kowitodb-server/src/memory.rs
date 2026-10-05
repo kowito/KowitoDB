@@ -181,9 +181,24 @@ impl AgentMemory {
 
     /// Save/update a session (and persist it when a store is configured).
     pub fn save(&self, session: AgentSession) {
-        self.persist(&session);
         let mut sessions = self.sessions.write();
+        self.persist(&session);
         sessions.insert(session.id.clone(), session);
+    }
+
+    /// Append a turn to a session (creating it if needed) and persist it, as one
+    /// atomic step. Returns the session's new turn count. Unlike
+    /// `get_or_create` + `save`, concurrent turns on the same session can't
+    /// overwrite each other.
+    pub fn record_turn(&self, session_id: &str, role: TurnRole, content: String) -> usize {
+        let mut sessions = self.sessions.write();
+        let session = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| AgentSession::new(session_id.to_string()));
+        session.add_turn(role, content);
+        let count = session.turn_count();
+        self.persist(session);
+        count
     }
 
     /// Get a session by ID.

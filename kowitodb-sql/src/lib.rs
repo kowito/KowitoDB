@@ -149,4 +149,52 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn non_ascii_input_does_not_panic() {
+        for sql in [
+            "SELECT données FROM knowledge",
+            "SELECT * FROM knowledge WHERE keyword = café LIMIT 5",
+            "SELECT * FROM knowledge WHERE metadata.ชื่อ = 'สวัสดี'",
+            "SELECT * FROM knowledge WHERE content LIKE '%😀%' AND keyword = 'ɐ'",
+        ] {
+            let _ = parse_sql(sql);
+        }
+        let stmt = parse_sql("SELECT * FROM knowledge WHERE metadata.ชื่อ = 'สวัสดี'").unwrap();
+        let SqlStatement::Select { where_clauses, .. } = stmt;
+        assert!(matches!(
+            &where_clauses[0],
+            WhereClause::MetadataEquals { key, value } if key == "ชื่อ" && value == "สวัสดี"
+        ));
+    }
+
+    #[test]
+    fn limit_before_where_is_an_error_not_a_panic() {
+        assert!(parse_sql("SELECT * FROM knowledge LIMIT 5 WHERE importance > 0.5").is_err());
+    }
+
+    #[test]
+    fn or_is_rejected_instead_of_ignored() {
+        assert!(parse_sql("SELECT * FROM knowledge WHERE keyword = 'a' OR keyword = 'b'").is_err());
+        // "OR" inside a literal or a word is not the operator.
+        assert!(parse_sql("SELECT * FROM knowledge WHERE keyword = 'this OR that'").is_ok());
+        assert!(parse_sql("SELECT * FROM knowledge WHERE metadata.origin = 'x'").is_ok());
+    }
+
+    #[test]
+    fn created_at_two_char_operators_and_quote_escapes() {
+        let stmt = parse_sql("SELECT * FROM knowledge WHERE created_at >= '2024-01-01T00:00:00Z'")
+            .unwrap();
+        let SqlStatement::Select { where_clauses, .. } = stmt;
+        assert!(matches!(
+            &where_clauses[0],
+            WhereClause::CreatedAfter { timestamp } if timestamp == "2024-01-01T00:00:00Z"
+        ));
+        let stmt = parse_sql("SELECT * FROM knowledge WHERE metadata.name = 'O''Brien'").unwrap();
+        let SqlStatement::Select { where_clauses, .. } = stmt;
+        assert!(matches!(
+            &where_clauses[0],
+            WhereClause::MetadataEquals { value, .. } if value == "O'Brien"
+        ));
+    }
 }

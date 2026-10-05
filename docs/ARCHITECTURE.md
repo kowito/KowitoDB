@@ -347,11 +347,12 @@ sets with AND semantics. It does not do projection or aggregation — use
   `CostModel` — embedding calls, index lookups (free), LLM input tokens, LLM
   output tokens. Surfaced as `total_cost_usd` in stats.
 
-- **Agent memory** (`AgentMemory`): in-memory sessions holding conversation
-  turns, working-memory facts, pinned objects, and metadata. Reachable over gRPC
-  via `RecordTurn` (append a turn) and `GetSession` (read turns), and surfaced in
-  stats as `active_agent_sessions`. **Not persisted** — sessions are lost on
-  restart.
+- **Agent memory** (`AgentMemory`): sessions holding conversation turns,
+  working-memory facts, pinned objects, and metadata. Reachable over gRPC via
+  `RecordTurn` (append a turn) and `GetSession` (read turns), and surfaced in
+  stats as `active_agent_sessions`. **Persisted** to a sled store under
+  `{index-path}/sessions` (written through on each `RecordTurn`/save) and reloaded on
+  startup.
 
 - **Metrics** (`MetricsCollector`): request counters (ask/remember/insert/sql/
   errors) and cumulative ask latency, behind a `RwLock`; rendered as Prometheus
@@ -388,13 +389,13 @@ the production-hardening layer around the gRPC service. All of it is driven by
 | --- | --- | --- |
 | Object store (sled or Lance) | **Yes** | Source of truth; includes embeddings and version history. |
 | Full-text index (Tantivy) | **Yes** | On disk under `{index-path}/tantivy/`. |
-| HNSW vector index | In-memory | **Rebuilt on `open()`** from persisted embeddings. |
+| HNSW vector index | Snapshot | Loaded from `{index-path}/hnsw.bin` on `open()` when it was written by a clean checkpoint; otherwise **rebuilt** from persisted embeddings. |
 | Metadata index | In-memory | **Rebuilt on `open()`**. |
 | Time index | In-memory | **Rebuilt on `open()`**. |
 | Graph index | In-memory | **Rebuilt on `open()`**. |
 | Brute-force vector index | In-memory | Not rebuilt (not on the live `ask` path). |
 | Plan cache | No (ephemeral) | |
-| Agent memory | No (ephemeral) | |
+| Agent memory | **Yes** | sled store under `{index-path}/sessions`, reloaded on `open()`. |
 
 ### Startup lifecycle
 

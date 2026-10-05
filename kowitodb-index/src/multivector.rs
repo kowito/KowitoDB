@@ -87,6 +87,11 @@ impl MultiVectorIndex {
         self.docs.read().len()
     }
 
+    /// Ids of every indexed document.
+    pub fn ids(&self) -> Vec<ObjectId> {
+        self.docs.read().keys().copied().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.docs.read().is_empty()
     }
@@ -117,11 +122,7 @@ impl MultiVectorIndex {
                 .collect(),
             None => docs.iter().map(|(id, d)| (*id, maxsim(&q, d))).collect(),
         };
-        scored.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
-        });
+        scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
     }
@@ -144,11 +145,7 @@ impl MultiVectorIndex {
 
     /// Persist to `path` (atomic temp + rename).
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
-        let tmp = path.with_extension("bin.tmp");
-        std::fs::write(&tmp, self.to_bytes()?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::persist::write_atomic(path.as_ref(), &self.to_bytes()?)
     }
 
     /// Load from `path`, or `Ok(None)` if it does not exist.

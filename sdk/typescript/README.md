@@ -55,9 +55,10 @@ async function main() {
   const page = await db.list(0, 50);
   console.log(`${page.objects.length} of ${page.total}`);
 
-  // SQL query (DataFusion engine) — returns an array of column->value maps
+  // SQL query (DataFusion engine) — returns an array of column->value maps.
+  // `metadata` is a JSON-encoded string column, so match it with LIKE.
   const rows = await db.sql(
-    "SELECT id, content FROM knowledge WHERE metadata.company = 'OpenAI'",
+    `SELECT id, content FROM knowledge WHERE metadata LIKE '%"company":"OpenAI"%'`,
   );
   for (const row of rows) {
     console.log(row.id, row.content);
@@ -95,17 +96,33 @@ const stats = await db.stats();  // auto-connects
 db.close();
 ```
 
+### Authentication, deadlines, TLS
+
+```ts
+const db = new KowitoDBClient("db.example.com:50051", {
+  apiKey: process.env.KOWITODB_API_KEY, // sent as `authorization: Bearer <key>`
+  timeoutMs: 30_000,                    // default per-call deadline; 0 = none
+  secure: true,                         // TLS with system roots
+  // credentials: grpc.credentials.createSsl(rootCert), // or explicit creds
+});
+```
+
+`apiKey` must match the server's `--api-key` / `KOWITODB_API_KEY`. It is added
+by a client interceptor, so it also works on insecure channels (where grpc-js
+call credentials can't be used) — but then it travels in plaintext, so prefer
+TLS outside a trusted network. `timeoutMs` defaults to 30 s.
+
 ## API
 
 | Method | Description | Returns |
 | --- | --- | --- |
 | `connect()` | Open the gRPC channel (idempotent). | `void` |
 | `close()` | Close the gRPC channel. | `void` |
-| `remember(content, { keywords?, metadata?, importance? })` | Store knowledge. | `Promise<string>` (id) |
+| `remember(content, { id?, keywords?, metadata?, importance? })` | Store knowledge (`id`: optional UUID, else server-assigned). | `Promise<string>` (id) |
 | `ask(question, maxResults?, { maxResults?, metadataFilter? })` | Natural-language query with auto retrieval. | `Promise<AskResponse>` |
 | `forget(id)` | Delete a knowledge object. | `Promise<boolean>` (existed) |
 | `sql(query)` | SQL query over the DataFusion engine. | `Promise<Array<Record<string, string>>>` (rows) |
-| `insert(content, { keywords?, metadata?, relationships?, importance? })` | Explicit insert. | `Promise<string>` (id) |
+| `insert(content, { id?, keywords?, metadata?, relationships?, importance? })` | Explicit insert (`id`: optional UUID). | `Promise<string>` (id) |
 | `batchInsert(items)` | Insert many objects; each item is `{ content, ...insertOptions }`. | `Promise<string[]>` (ids) |
 | `get(id)` | Fetch a knowledge object. | `Promise<KnowledgeObject \| null>` |
 | `list(offset?, limit?)` | Paginate stored objects (`limit` 0 = server default). | `Promise<{ objects: KnowledgeObject[]; total: number }>` |
@@ -134,7 +151,7 @@ Why dynamic loading: the proto is small and stable, and this avoids requiring a
 with the repository's canonical proto via `npm run proto:gen`.
 
 ```bash
-npm run proto:gen   # copy proto/kowitodb.proto from the repo root into the package
+npm run proto:gen   # copy kowitodb-server/proto/kowitodb.proto into the package
 ```
 
 If you change the proto, re-run `proto:gen` and update `src/types.ts` to match.

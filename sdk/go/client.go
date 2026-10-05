@@ -13,16 +13,25 @@
 //		kowitodb.WithKeywords("openai", "funding"),
 //		kowitodb.WithMetadata(map[string]string{"company": "OpenAI"}))
 //
-//	resp, _ := db.Ask(ctx, "Which companies raised funding?")
+//	resp, _ := db.Ask(ctx, "Which companies raised funding?", 10)
 //	for _, r := range resp.Results {
 //		fmt.Printf("[%.2f] %s\n", r.RelevanceScore, r.Content)
 //	}
+//
+// Authentication and deadlines:
+//
+//	db, err := kowitodb.NewClient("db.example.com:50051",
+//		kowitodb.WithAPIKey(os.Getenv("KOWITODB_API_KEY")),
+//		kowitodb.WithDefaultTimeout(30*time.Second))
 package kowitodb
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/kowito/kowitodb/sdk/go/kowitodbpb"
@@ -38,21 +47,29 @@ type Client struct {
 	stub pb.KowitoDBClient
 }
 
-// NewClient dials a KowitoDB server and returns a connected Client.
-// If addr is empty, DefaultAddress ("localhost:50051") is used.
+// NewClient creates a Client for a KowitoDB server. If addr is empty,
+// DefaultAddress ("localhost:50051") is used. The connection is established
+// lazily, on the first RPC.
+//
 // Additional grpc.DialOption values may be supplied to customise the
-// connection (TLS, interceptors, etc.). By default an insecure connection
-// is used.
+// connection (WithAPIKey, WithDefaultTimeout, interceptors, ...). The default
+// transport is plaintext (insecure); it is applied before opts, so passing
+// grpc.WithTransportCredentials(credentials.NewTLS(...)) switches to TLS.
 func NewClient(addr string, opts ...grpc.DialOption) (*Client, error) {
 	if addr == "" {
 		addr = DefaultAddress
 	}
-	if len(opts) == 0 {
-		opts = []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		}
+	// Later options win, so the caller's transport credentials (if any)
+	// override this default.
+	all := make([]grpc.DialOption, 0, len(opts)+1)
+	all = append(all, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	all = append(all, opts...)
+	conn, err := grpc.NewClient(addr, all...)
+	if err != nil && len(opts) > 0 && strings.Contains(err.Error(), "credentials.Bundle") {
+		// The caller supplied grpc.WithCredentialsBundle, which cannot be
+		// combined with transport credentials: use their options as-is.
+		conn, err = grpc.NewClient(addr, opts...)
 	}
-	conn, err := grpc.NewClient(addr, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +77,55 @@ func NewClient(addr string, opts ...grpc.DialOption) (*Client, error) {
 		conn: conn,
 		stub: pb.NewKowitoDBClient(conn),
 	}, nil
+}
+
+// apiKeyCredentials attaches the API key to every RPC as
+// "authorization: Bearer <key>" (the format the server's --api-key check
+// accepts).
+type apiKeyCredentials struct {
+	key string
+}
+
+func (c apiKeyCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + c.key}, nil
+}
+
+// RequireTransportSecurity is false so the key can also be used over a
+// plaintext connection (e.g. inside a trusted network or behind a
+// TLS-terminating proxy). Prefer TLS whenever the key crosses an untrusted
+// network.
+func (apiKeyCredentials) RequireTransportSecurity() bool { return false }
+
+var _ credentials.PerRPCCredentials = apiKeyCredentials{}
+
+// WithAPIKey returns a DialOption that sends key as
+// "authorization: Bearer <key>" metadata on every RPC. It must match the
+// server's --api-key / KOWITODB_API_KEY. An empty key adds no metadata.
+func WithAPIKey(key string) grpc.DialOption {
+	if key == "" {
+		return grpc.EmptyDialOption{}
+	}
+	return grpc.WithPerRPCCredentials(apiKeyCredentials{key: key})
+}
+
+// WithDefaultTimeout returns a DialOption that applies a deadline of d to
+// every unary RPC whose context has no deadline yet. A context deadline set
+// by the caller always takes precedence. d <= 0 disables it.
+func WithDefaultTimeout(d time.Duration) grpc.DialOption {
+	if d <= 0 {
+		return grpc.EmptyDialOption{}
+	}
+	return grpc.WithChainUnaryInterceptor(func(
+		ctx context.Context, method string, req, reply any,
+		cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption,
+	) error {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	})
 }
 
 // Close releases the underlying gRPC connection.
@@ -169,13 +235,23 @@ type Relationship struct {
 
 // InsertItem describes a single object to store via BatchInsert. Only Content
 // is required; the remaining fields are optional. Importance defaults to 0.5
-// when left as the zero value.
+// when left as the zero value. ID optionally assigns the object id (a UUID
+// string); when empty the server generates one.
 type InsertItem struct {
+	ID            string
 	Content       string
 	Keywords      []string
 	Metadata      map[string]string
 	Importance    float32
 	Relationships []Relationship
+}
+
+// optionalID maps "" to nil (server-assigned id).
+func optionalID(id string) *string {
+	if id == "" {
+		return nil
+	}
+	return &id
 }
 
 func (it InsertItem) toProto() *pb.InsertRequest {
@@ -191,6 +267,7 @@ func (it InsertItem) toProto() *pb.InsertRequest {
 		})
 	}
 	return &pb.InsertRequest{
+		Id:            optionalID(it.ID),
 		Content:       it.Content,
 		Keywords:      it.Keywords,
 		Metadata:      it.Metadata,
@@ -203,6 +280,7 @@ func (it InsertItem) toProto() *pb.InsertRequest {
 
 // writeOptions collects the optional parameters shared by Remember/Insert.
 type writeOptions struct {
+	id            string
 	keywords      []string
 	metadata      map[string]string
 	importance    float32
@@ -211,6 +289,12 @@ type writeOptions struct {
 
 // WriteOption configures Remember and Insert calls.
 type WriteOption func(*writeOptions)
+
+// WithID assigns the stored object's id (a UUID string) instead of letting
+// the server generate one.
+func WithID(id string) WriteOption {
+	return func(o *writeOptions) { o.id = id }
+}
 
 // WithKeywords attaches keywords to a stored object.
 func WithKeywords(keywords ...string) WriteOption {
@@ -318,6 +402,7 @@ func newQueryOptions(opts []QueryOption) queryOptions {
 func (c *Client) Remember(ctx context.Context, content string, opts ...WriteOption) (string, error) {
 	o := newWriteOptions(opts)
 	resp, err := c.stub.Remember(ctx, &pb.RememberRequest{
+		Id:         optionalID(o.id),
 		Content:    content,
 		Keywords:   o.keywords,
 		Metadata:   o.metadata,
@@ -371,6 +456,7 @@ func (c *Client) Insert(ctx context.Context, content string, opts ...WriteOption
 		})
 	}
 	resp, err := c.stub.Insert(ctx, &pb.InsertRequest{
+		Id:            optionalID(o.id),
 		Content:       content,
 		Keywords:      o.keywords,
 		Metadata:      o.metadata,

@@ -60,6 +60,37 @@ impl GraphIndex {
         );
     }
 
+    /// Add a single edge without disturbing the source's other edges. A
+    /// duplicate (same source, type and target) is ignored.
+    pub fn add_relationship(&self, source_id: ObjectId, relationship: Relationship) {
+        let mut forward = self.forward.write();
+        let mut reverse = self.reverse.write();
+
+        let edges = forward.entry(source_id).or_default();
+        if edges.iter().any(|r| {
+            r.target_id == relationship.target_id && r.relation_type == relationship.relation_type
+        }) {
+            return;
+        }
+        reverse
+            .entry(relationship.target_id)
+            .or_default()
+            .push((relationship.relation_type.clone(), source_id));
+        edges.push(relationship);
+    }
+
+    /// Remove only the outgoing edges of `id`, keeping edges other objects
+    /// have pointing at it (used when an object is re-indexed in place).
+    pub fn remove_out_edges(&self, id: ObjectId) {
+        let mut forward = self.forward.write();
+        let mut reverse = self.reverse.write();
+        if let Some(rels) = forward.remove(&id) {
+            for rel in &rels {
+                Self::remove_reverse_edge(&mut reverse, rel.target_id, id);
+            }
+        }
+    }
+
     fn remove_reverse_edge(
         reverse: &mut HashMap<ObjectId, Vec<(String, ObjectId)>>,
         target_id: ObjectId,
@@ -126,7 +157,9 @@ impl GraphIndex {
         let mut queue: VecDeque<(ObjectId, usize)> = VecDeque::new();
 
         for seed in seeds {
-            visited.insert(*seed, 0);
+            if visited.insert(*seed, 0).is_some() {
+                continue;
+            }
             queue.push_back((*seed, 0));
             results.push((*seed, 0));
         }
@@ -212,7 +245,7 @@ impl GraphIndex {
 
         // Also traverse reverse edges (incoming)
         let mut results = forward_results.clone();
-        let visited: HashMap<ObjectId, usize> =
+        let mut visited: HashMap<ObjectId, usize> =
             forward_results.iter().map(|(id, d)| (*id, *d)).collect();
         let mut queue: VecDeque<(ObjectId, usize)> = forward_results
             .into_iter()
@@ -237,6 +270,7 @@ impl GraphIndex {
                     let next_depth = depth + 1;
                     if let Some(&existing) = visited.get(source_id) {
                         if next_depth < existing {
+                            visited.insert(*source_id, next_depth);
                             if let Some((_, d)) =
                                 results.iter_mut().find(|(id, _)| *id == *source_id)
                             {
@@ -245,6 +279,7 @@ impl GraphIndex {
                             queue.push_back((*source_id, next_depth));
                         }
                     } else {
+                        visited.insert(*source_id, next_depth);
                         results.push((*source_id, next_depth));
                         queue.push_back((*source_id, next_depth));
                     }
@@ -406,6 +441,60 @@ impl Default for GraphIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn edge(t: ObjectId) -> Relationship {
+        Relationship {
+            relation_type: "links".into(),
+            target_id: t,
+            weight: None,
+        }
+    }
+
+    #[test]
+    fn bidirectional_traverse_returns_each_node_once() {
+        let graph = GraphIndex::new();
+        let (x, y, d1, d2, r) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        graph.insert_relationships(d1, &[edge(x), edge(y)]);
+        graph.insert_relationships(d2, &[edge(x)]);
+        graph.insert_relationships(r, &[edge(d1), edge(d2)]);
+
+        let found = graph.bidirectional_traverse(&[x, y, x], 2, None);
+        let mut ids: Vec<_> = found.iter().map(|(id, _)| *id).collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(total, ids.len(), "duplicate ids in {found:?}");
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn add_relationship_keeps_existing_edges() {
+        let graph = GraphIndex::new();
+        let (a, b, c) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        graph.insert_relationships(a, &[edge(b)]);
+        graph.add_relationship(a, edge(c));
+        graph.add_relationship(a, edge(c));
+        let targets: Vec<_> = graph.out_edges(a).iter().map(|r| r.target_id).collect();
+        assert_eq!(targets, vec![b, c]);
+        assert_eq!(graph.in_edges(c).len(), 1);
+
+        // Dropping a's outgoing edges keeps edges that point at a.
+        graph.add_relationship(b, edge(a));
+        graph.remove_out_edges(a);
+        assert!(graph.out_edges(a).is_empty());
+        assert!(graph.in_edges(b).is_empty());
+        assert_eq!(graph.in_edges(a).len(), 1);
+    }
 
     #[test]
     fn test_detect_communities() {

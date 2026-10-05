@@ -3,6 +3,7 @@ mod graph;
 mod hnsw;
 mod metadata;
 mod multivector;
+mod persist;
 mod sharded_hnsw;
 mod time_index;
 mod vector;

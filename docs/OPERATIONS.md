@@ -135,7 +135,7 @@ very large instances during low-traffic windows to absorb the reindex time.
     `{index-path}/tantivy/` and re-ingest).
 - **Recommended upgrade flow:** back up → deploy new version to a staging copy of
   the data directory → verify it opens and `ask`/`sql_select` behave → cut over.
-- **Proto/SDK changes.** If you change `proto/kowitodb.proto`, regenerate SDK
+- **Proto/SDK changes.** If you change `kowitodb-server/proto/kowitodb.proto`, regenerate SDK
   stubs (see [SDKS.md](SDKS.md)) and roll clients and server together; there is
   no negotiated API versioning.
 
@@ -150,7 +150,7 @@ fields) is resolved.
 | `total_objects` | storage `count()` | Number of stored objects. |
 | `vector_count` | HNSW index `len()` | Vectors in the in-memory HNSW index. After a restart this should match `total_objects` (minus any objects with no embedding) once the reindex pass completes — a useful warm-up indicator. |
 | `graph_nodes` / `graph_edges` | graph index | Nodes/edges in the relationship graph. |
-| `active_agent_sessions` | agent memory | Live conversation sessions (in-memory; reset on restart). |
+| `active_agent_sessions` | agent memory | Conversation sessions held by agent memory (persisted under `{index-path}/sessions` and reloaded on restart). |
 | `total_cost_usd` | cost tracker | Running estimated USD cost (see below). |
 | `cache_entries` / `cache_hit_rate` | plan cache | Plan-cache size and hit rate. |
 | `index_size_bytes` | — | Currently always `0`; **not** a real byte size — ignore it. |
@@ -241,10 +241,10 @@ State these honestly when planning a deployment:
   always-on gRPC health/reflection services and the `--metrics-addr` HTTP
   endpoint do not honor the API key, so probes and tooling work without
   credentials. Keep them off the public internet.
-- **Agent memory is in-memory and not persisted.** `RecordTurn`/`GetSession`
-  expose conversation sessions over gRPC and they count toward
-  `active_agent_sessions`, but all sessions are lost on restart. Do not treat
-  them as durable storage.
+- **Agent memory is persisted per node.** `RecordTurn`/`GetSession` sessions
+  are written to a sled store at `{index-path}/sessions` and reloaded on
+  startup (they count toward `active_agent_sessions`). Back up
+  `{index-path}` together with `{storage-path}` to keep them.
 - **Default embeddings are a deterministic proxy**, not a semantic model. Set
   `KOWITODB_EMBEDDING_PROVIDER` (openai/ollama) before relying on vector
   relevance in production. Token counts are heuristic (~4 chars/token).

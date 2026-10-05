@@ -49,6 +49,11 @@ export interface InsertRequest {
   keywords?: string[];
   relationships?: RelationshipInput[];
   importance?: number;
+  /**
+   * Optional caller-assigned id (a UUID string). If empty/omitted, the server
+   * generates one.
+   */
+  id?: string;
 }
 
 export interface InsertResponse {
@@ -154,6 +159,8 @@ export interface RememberRequest {
   metadata?: Record<string, string>;
   keywords?: string[];
   importance?: number;
+  /** Optional caller-assigned id (see InsertRequest.id). */
+  id?: string;
 }
 
 export interface RememberResponse {
@@ -245,9 +252,13 @@ export interface RememberOptions {
   keywords?: string[];
   metadata?: Record<string, string>;
   importance?: number;
+  /** Assign the object id (a UUID string); otherwise the server generates one. */
+  id?: string;
 }
 
 export interface InsertOptions {
+  /** Assign the object id (a UUID string); otherwise the server generates one. */
+  id?: string;
   keywords?: string[];
   metadata?: Record<string, string>;
   /** Tuples of [relation_type, target_id]. */

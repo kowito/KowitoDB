@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use kowitodb_core::{KowitoError, ObjectId, Result};
 use parking_lot::RwLock;
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::collector::{DocSetCollector, TopDocs};
+use tantivy::query::{AllQuery, QueryParser};
 use tantivy::schema::*;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy};
 use tracing::{debug, info};
@@ -74,6 +75,10 @@ impl FullTextIndex {
     }
 
     /// Insert or update a document in the index.
+    ///
+    /// The change is staged in the writer; call [`Self::commit`] to make it
+    /// durable and visible to searches. Batching several inserts before one
+    /// commit is much cheaper than committing each.
     pub fn insert(
         &self,
         id: ObjectId,
@@ -90,10 +95,6 @@ impl FullTextIndex {
         let id_term = tantivy::Term::from_field_text(self.id_field, &id.to_string());
         writer.delete_term(id_term);
 
-        // Insert new document
-        // Build the full searchable text
-        let full_text = format!("{} {}", content, keywords.join(" "));
-        let _ = full_text; // Used implicitly via field tokenization
         writer
             .add_document(doc!(
                 self.id_field => id.to_string(),
@@ -103,12 +104,14 @@ impl FullTextIndex {
             ))
             .map_err(|e| KowitoError::Index(e.to_string()))?;
 
-        let _ = writer.commit();
-        debug!("Full-text indexed object {}", id);
+        debug!("Full-text staged object {}", id);
         Ok(())
     }
 
     /// Remove a document from the index.
+    ///
+    /// Like [`Self::insert`], the change is staged: it becomes durable and
+    /// visible to searches after [`Self::commit`].
     pub fn remove(&self, id: ObjectId) -> Result<()> {
         let mut writer_guard = self.writer.write();
         let writer = writer_guard
@@ -116,12 +119,29 @@ impl FullTextIndex {
             .ok_or_else(|| KowitoError::Internal("FullTextIndex writer already closed".into()))?;
         let id_term = tantivy::Term::from_field_text(self.id_field, &id.to_string());
         writer.delete_term(id_term);
-        let _ = writer.commit();
         Ok(())
     }
 
     /// Search the index and return top-k matching object IDs with BM25 scores.
+    ///
+    /// `query_str` is treated as plain text, not Tantivy query syntax:
+    /// punctuation (`:`, quotes, parentheses, `-`, ...) and the `AND`/`OR`/`NOT`
+    /// operators are neutralised, so natural-language questions always search
+    /// their words instead of failing to parse.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<(ObjectId, f32)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // The default tokenizer lowercases and splits on non-alphanumerics, so
+        // this keeps every searchable term while removing query syntax.
+        let query_str: String = query_str
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .to_lowercase();
+        if query_str.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let reader = self.reader.searcher();
 
         let query_parser = QueryParser::for_index(
@@ -129,9 +149,10 @@ impl FullTextIndex {
             vec![self.content_field, self.keywords_field, self.metadata_field],
         );
 
-        let query = query_parser
-            .parse_query(query_str)
-            .map_err(|e| KowitoError::Index(format!("Query parse error: {}", e)))?;
+        let (query, errors) = query_parser.parse_query_lenient(&query_str);
+        if !errors.is_empty() {
+            debug!("Lenient query parse of {:?}: {:?}", query_str, errors);
+        }
 
         let top_docs = reader
             .search(&query, &TopDocs::with_limit(limit))
@@ -154,6 +175,29 @@ impl FullTextIndex {
         Ok(results)
     }
 
+    /// Ids of every live document in the index (used to reconcile the index
+    /// against storage after an unclean shutdown).
+    pub fn ids(&self) -> Result<HashSet<ObjectId>> {
+        let searcher = self.reader.searcher();
+        let addresses = searcher
+            .search(&AllQuery, &DocSetCollector)
+            .map_err(|e| KowitoError::Index(e.to_string()))?;
+        let mut ids = HashSet::with_capacity(addresses.len());
+        for address in addresses {
+            let doc = searcher
+                .doc::<TantivyDocument>(address)
+                .map_err(|e| KowitoError::Index(e.to_string()))?;
+            if let Some(id) = doc
+                .get_first(self.id_field)
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            {
+                ids.insert(id);
+            }
+        }
+        Ok(ids)
+    }
+
     /// Commit pending writes and reload the reader.
     pub fn commit(&self) -> Result<()> {
         let mut writer_guard = self.writer.write();
@@ -167,5 +211,51 @@ impl FullTextIndex {
             .reload()
             .map_err(|e| KowitoError::Index(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp() -> FullTextIndex {
+        let dir = std::env::temp_dir().join(format!("kowitodb-ft-{}", uuid::Uuid::new_v4()));
+        FullTextIndex::open(&dir).unwrap()
+    }
+
+    #[test]
+    fn staged_changes_become_visible_on_commit() {
+        let idx = open_temp();
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        idx.insert(a, "rust vector database", &[], "{}").unwrap();
+        idx.insert(b, "python notebook", &[], "{}").unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.search("vector", 10).unwrap()[0].0, a);
+        assert_eq!(idx.ids().unwrap(), HashSet::from([a, b]));
+
+        idx.remove(a).unwrap();
+        idx.commit().unwrap();
+        assert!(idx.search("vector", 10).unwrap().is_empty());
+        assert_eq!(idx.ids().unwrap(), HashSet::from([b]));
+    }
+
+    #[test]
+    fn natural_language_queries_do_not_fail_to_parse() {
+        let idx = open_temp();
+        let a = uuid::Uuid::new_v4();
+        idx.insert(a, "error timeout while connecting", &[], "{}")
+            .unwrap();
+        idx.commit().unwrap();
+        for q in [
+            "error: timeout",
+            "what about \"timeout",
+            "(timeout",
+            "http://x/y",
+            "NOT AND",
+        ] {
+            assert!(idx.search(q, 10).is_ok(), "query {q:?} failed");
+        }
+        assert_eq!(idx.search("error: timeout", 10).unwrap()[0].0, a);
+        assert!(idx.search("timeout", 0).unwrap().is_empty());
     }
 }

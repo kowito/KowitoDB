@@ -136,7 +136,7 @@ impl Reranker {
         let max_score = ranked
             .iter()
             .map(|r| r.score)
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.total_cmp(b))
             .unwrap_or(1.0);
 
         if max_score > 0.0 {
@@ -146,11 +146,7 @@ impl Reranker {
         }
 
         // Sort by descending score
-        ranked.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        ranked.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
 
         debug!(
             "Reranker: {} raw results -> {} ranked (multi-source: {})",

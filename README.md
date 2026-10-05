@@ -169,7 +169,7 @@ Every advanced capability is backed by published research:
 
 ```python
 # Conversations become searchable knowledge automatically
-session_id = db.record_turn(
+turn_count = db.record_turn(  # returns the session's new turn count
     session_id="session-123",
     role="user",
     content="The Acme deal closed at $2.4M ARR."
@@ -188,8 +188,9 @@ documents. Runnable demo (embedded, no server):
 
 ```sql
 SELECT COUNT(*) FROM knowledge WHERE importance > 0.8;
+-- `metadata` is the object's metadata as a JSON string
 SELECT content, created_at FROM knowledge
-  WHERE metadata.stage = 'series_a'
+  WHERE metadata LIKE '%"stage":"series_a"%'
   ORDER BY importance DESC LIMIT 10;
 ```
 
@@ -352,7 +353,9 @@ Full benchmarks, quantization comparisons, and recall/latency trade-offs:
 | **Go** | `github.com/kowito/kowitodb/sdk/go` | `google.golang.org/grpc` |
 
 All three expose the same surface: `remember`, `ask`, `forget`, `insert`, `get`,
-`update`, `search`, `sql`, `record_turn`, `get_session`, and `stats`.
+`update`, `search`, `sql`, `record_turn`, `get_session`, and `stats`, and accept
+an API key (sent as `authorization: Bearer <key>`), a default per-call deadline,
+and TLS settings — see [`docs/SDKS.md`](docs/SDKS.md#authentication-deadlines-and-tls).
 
 ---
 
@@ -397,7 +400,7 @@ and the full retrieval pipeline.
 
 ## gRPC API
 
-The complete service definition is in [`proto/kowitodb.proto`](proto/kowitodb.proto).
+The complete service definition is in [`kowitodb-server/proto/kowitodb.proto`](kowitodb-server/proto/kowitodb.proto).
 
 | RPC | What it does |
 |---|---|
@@ -411,7 +414,10 @@ The complete service definition is in [`proto/kowitodb.proto`](proto/kowitodb.pr
 | `RecordTurn` / `GetSession` | Agent conversation memory |
 | `Stats` | Object counts, index sizes, graph metrics, cost tracking, cache hit rate |
 
-Health-checking, gRPC reflection, and Prometheus metrics are always on.
+gRPC health-checking and reflection are always on (and unauthenticated).
+Prometheus `/metrics` and HTTP `/healthz` are served only when `--metrics-addr`
+(or `KOWITODB_METRICS_ADDR`) is set, e.g. `--metrics-addr 0.0.0.0:9090` (the
+Docker image's default command sets it).
 
 ---
 
